@@ -6324,6 +6324,81 @@ void ggml_compute_forward_rope_back(
     }
 }
 
+// ggml_compute_forward_rope_table
+
+// Same arithmetic as the decomposition it replaces: RMS_NORM (+ MUL) as ggml_compute_forward_rms_norm_f32 computes it,
+// then every product and every sum rounded to F32 on its own (the products go through memory, so they cannot be
+// contracted into fused multiply-adds), then the F32 -> F16 conversion of ggml_cast.
+void ggml_compute_forward_rope_table(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * pe   = dst->src[1];
+    const ggml_tensor * w    = dst->src[2];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float));
+    GGML_ASSERT(pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+
+    const bool  has_norm = ggml_get_op_params_i32(dst, 0) != 0;
+    const float eps      = ggml_get_op_params_f32(dst, 1);
+    GGML_ASSERT(!has_norm || (w != nullptr && w->type == GGML_TYPE_F32 && ggml_is_contiguous(w)));
+
+    const int64_t d  = src0->ne[0];
+    const int64_t H  = src0->ne[1];
+    const int64_t L  = src0->ne[2];
+    const int64_t N  = src0->ne[3];
+    GGML_ASSERT(dst->ne[0] == d && dst->ne[1] == L && dst->ne[2] == H && dst->ne[3] == N);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    float * xn = (float *) params->wdata + (3*d + CACHE_LINE_SIZE_F32) * ith;
+    float * p0 = xn + d;  // x[2j] * m[r][0]
+    float * p1 = p0 + d;  // x[2j + 1] * m[r][1]
+
+    const int64_t nrows = H*L*N;
+    for (int64_t ir = ith; ir < nrows; ir += nth) {
+        const int64_t h = ir % H;
+        const int64_t l = (ir / H) % L;
+        const int64_t n = ir / (H*L);
+
+        const float * x = (const float *) ((const char *) src0->data + h*src0->nb[1] + l*src0->nb[2] + n*src0->nb[3]);
+        if (has_norm) {
+            ggml_float sum = 0.0;
+            for (int64_t i = 0; i < d; i++) {
+                sum += (ggml_float)(x[i] * x[i]);
+            }
+            const float mean  = sum/d;
+            const float scale = 1.0f/sqrtf(mean + eps);
+            const float * wd  = (const float *) w->data;
+            for (int64_t i = 0; i < d; i++) {
+                xn[i] = x[i] * scale * wd[i];
+            }
+            x = xn;
+        }
+
+        const float * m = (const float *) pe->data + 2*d*l;  // [2, 2, d/2] of token l: m[r][c] = m[4j + 2r + c]
+        for (int64_t j = 0; j < d/2; j++) {
+            p0[2*j + 0] = x[2*j + 0] * m[4*j + 0];
+            p0[2*j + 1] = x[2*j + 0] * m[4*j + 2];
+            p1[2*j + 0] = x[2*j + 1] * m[4*j + 1];
+            p1[2*j + 1] = x[2*j + 1] * m[4*j + 3];
+        }
+
+        char * y = (char *) dst->data + l*dst->nb[1] + h*dst->nb[2] + n*dst->nb[3];
+        if (dst->type == GGML_TYPE_F32) {
+            ggml_vec_add_f32((int) d, (float *) y, p0, p1);
+        } else {
+            ggml_vec_add_f32((int) d, p0, p0, p1);
+            for (int64_t i = 0; i < d; i++) {
+                ((ggml_fp16_t *) y)[i] = GGML_CPU_FP32_TO_FP16(p0[i]);
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_conv_transpose_1d
 
 static void ggml_compute_forward_conv_transpose_1d_f16_f32(

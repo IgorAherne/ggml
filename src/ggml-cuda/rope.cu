@@ -939,3 +939,182 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+// GGML_OP_ROPE_TABLE (+ optional RMS_NORM and MUL in front)
+// One warp per row (head h, token l, batch n) of ncols <= 256 values; lane i holds columns i, i + 32, ...
+// Bit-identical to the ops it replaces:
+//  - the norm uses the reduction of rms_norm_f32<256> (norm.cu): there thread t = 32*k + i of a 256-thread block holds
+//    0 + x[t]^2 (0 when t >= ncols), each warp k sums its lanes with warp_reduce_sum, and lanes 0..7 of the final
+//    warp_reduce_sum hold the 8 warp sums; here lane i holds thread 32*k + i's value for each k, so the 8 warp sums
+//    and the final sum are the same additions in the same order; then scale = rsqrtf(tmp/ncols + eps) and
+//    (scale * x) * w as in rms_norm_f32<256, true>;
+//  - every product and the sum of the rotation are rounded on their own (__fmul_rn/__fadd_rn: no FMA contraction
+//    under -use_fast_math), like the separate MUL, MUL and ADD kernels; F16 output converts like the CPY kernel.
+template <int nc, bool has_norm, typename D>
+static __global__ void rope_table_f32(
+        const float * __restrict__ x, const float * __restrict__ pe, const float * __restrict__ w, D * __restrict__ dst,
+        const int ncols, const int nrows, const uint3 nheads_packed, const uint3 ntokens_packed,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const float eps) {
+    ggml_cuda_pdl_lc();
+    const int row  = blockIdx.x*blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    if (row >= nrows) {
+        return;  // the whole warp
+    }
+
+    // rows in x's memory order: row = h + nheads*(l + ntokens*n)
+    const uint2 h_div = fast_div_modulo(row, nheads_packed);
+    const uint2 l_div = fast_div_modulo(h_div.x, ntokens_packed);
+    const int64_t h = h_div.y;
+    const int64_t l = l_div.y;
+    const int64_t n = l_div.x;
+
+    x   += n*s03 + l*s02 + h*s01;
+    dst += n*s3  + h*s2  + l*s1;
+    pe  += l*2*ncols;  // [2, 2, ncols/2] of token l
+
+    ggml_cuda_pdl_sync();
+
+    float v[nc];
+#pragma unroll
+    for (int k = 0; k < nc; ++k) {
+        const int col = 32*k + lane;
+        v[k] = col < ncols ? x[col] : 0.0f;
+    }
+
+    if constexpr (has_norm) {
+        static_assert(nc <= 8, "the norm emulates rms_norm_f32<256>: at most 256 columns");
+        float s[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k < nc) {
+                float tmp = 0.0f;
+                if (32*k + lane < ncols) {
+                    const float xi = v[k];
+                    tmp += xi * xi;
+                }
+                s[k] = warp_reduce_sum(tmp);
+            } else {
+                s[k] = 0.0f;  // a warp of zeros sums to +0
+            }
+        }
+        float tmp = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (lane == k) {
+                tmp = s[k];
+            }
+        }
+        tmp = warp_reduce_sum(tmp);
+
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+        for (int k = 0; k < nc; ++k) {
+            const int col = 32*k + lane;
+            if (col < ncols) {
+                v[k] = scale * v[k] * w[col];
+            }
+        }
+    }
+
+    // column 2j + r = 32*k + lane: its pair partner is in lane ^ 1 of the same chunk
+    const bool odd = lane & 1;
+#pragma unroll
+    for (int k = 0; k < nc; ++k) {
+        const float other = __shfl_xor_sync(0xffffffff, v[k], 1);
+        const int   col   = 32*k + lane;
+        if (col < ncols) {
+            const float  xe = odd ? other : v[k];
+            const float  xo = odd ? v[k]  : other;
+            const float2 m  = *((const float2 *) pe + col);  // (pe[0, r, j, l], pe[1, r, j, l])
+            dst[col] = ggml_cuda_cast<D>(__fadd_rn(__fmul_rn(xe, m.x), __fmul_rn(xo, m.y)));
+        }
+    }
+}
+
+template <int nc, typename D>
+static void rope_table_cuda_nc(
+        const float * x, const float * pe, const float * w, D * dst,
+        const int ncols, const int nheads, const int ntokens, const int nsamples,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const float eps, cudaStream_t stream) {
+    const int  nrows        = nheads*ntokens*nsamples;
+    const int  rows_per_blk = 8;
+    const dim3 block_dims(WARP_SIZE, rows_per_blk, 1);
+    const dim3 blocks_num((nrows + rows_per_blk - 1)/rows_per_blk, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, (size_t) 0, stream};
+    const uint3 nheads_packed  = init_fastdiv_values(nheads);
+    const uint3 ntokens_packed = init_fastdiv_values(ntokens);
+    if (w != nullptr) {
+        ggml_cuda_kernel_launch(rope_table_f32<nc, true, D>, launch_params,
+            x, pe, w, dst, ncols, nrows, nheads_packed, ntokens_packed, s01, s02, s03, s1, s2, s3, eps);
+    } else {
+        ggml_cuda_kernel_launch(rope_table_f32<nc, false, D>, launch_params,
+            x, pe, w, dst, ncols, nrows, nheads_packed, ntokens_packed, s01, s02, s03, s1, s2, s3, eps);
+    }
+}
+
+template <typename D>
+static void rope_table_cuda(
+        const float * x, const float * pe, const float * w, D * dst,
+        const int ncols, const int nheads, const int ntokens, const int nsamples,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s1, const int64_t s2, const int64_t s3,
+        const float eps, cudaStream_t stream) {
+    if (ncols <= 64) {
+        rope_table_cuda_nc<2, D>(x, pe, w, dst, ncols, nheads, ntokens, nsamples, s01, s02, s03, s1, s2, s3, eps, stream);
+    } else if (ncols <= 128) {
+        rope_table_cuda_nc<4, D>(x, pe, w, dst, ncols, nheads, ntokens, nsamples, s01, s02, s03, s1, s2, s3, eps, stream);
+    } else {
+        GGML_ASSERT(ncols <= 256);
+        rope_table_cuda_nc<8, D>(x, pe, w, dst, ncols, nheads, ntokens, nsamples, s01, s02, s03, s1, s2, s3, eps, stream);
+    }
+}
+
+bool ggml_cuda_op_rope_table_supported(const ggml_tensor * op) {
+    const ggml_tensor * x  = op->src[0];
+    const ggml_tensor * pe = op->src[1];
+    const ggml_tensor * w  = op->src[2];
+    return x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[0] % 2 == 0 && x->ne[0] <= 256 &&
+           x->nb[1] % sizeof(float) == 0 && x->nb[2] % sizeof(float) == 0 && x->nb[3] % sizeof(float) == 0 &&
+           ggml_nrows(x) <= INT_MAX &&
+           pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe) &&
+           (w == nullptr || (w->type == GGML_TYPE_F32 && ggml_is_contiguous(w))) &&
+           (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+}
+
+void ggml_cuda_op_rope_table(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * pe = dst->src[1];
+    const bool  has_norm   = ggml_get_op_params_i32(dst, 0) != 0;
+    const float eps        = ggml_get_op_params_f32(dst, 1);
+    const ggml_tensor * w  = has_norm ? dst->src[2] : nullptr;
+    GGML_ASSERT(!has_norm || w != nullptr);
+    GGML_ASSERT(ggml_cuda_op_rope_table_supported(dst));
+
+    const size_t ts_x = sizeof(float);
+    const int64_t s01 = x->nb[1] / ts_x;
+    const int64_t s02 = x->nb[2] / ts_x;
+    const int64_t s03 = x->nb[3] / ts_x;
+
+    const size_t ts_dst = ggml_type_size(dst->type);
+    const int64_t s1 = dst->nb[1] / ts_dst;
+    const int64_t s2 = dst->nb[2] / ts_dst;
+    const int64_t s3 = dst->nb[3] / ts_dst;
+
+    const float * w_d = w != nullptr ? (const float *) w->data : nullptr;
+    cudaStream_t stream = ctx.stream();
+
+    if (dst->type == GGML_TYPE_F32) {
+        rope_table_cuda((const float *) x->data, (const float *) pe->data, w_d, (float *) dst->data,
+            x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps, stream);
+    } else {
+        rope_table_cuda((const float *) x->data, (const float *) pe->data, w_d, (half *) dst->data,
+            x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps, stream);
+    }
+}

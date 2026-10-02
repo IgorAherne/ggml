@@ -476,6 +476,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                         (convrot_group_size <= 256 && src0->ne[0] % convrot_group_size == 0));
             }
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+        case GGML_OP_ROPE_TABLE:
+            return src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) &&
+                   src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) &&
+                   (op->src[2] == nullptr || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]))) &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         case GGML_OP_QUANTIZE_I8_CONVROT: {
             const int group_size = ggml_get_op_params_i32(op, 0);
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I8 &&

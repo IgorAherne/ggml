@@ -1117,9 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QUANTIZE_I8_CONVROT",
     "SAGE_ATTN",
     "SOL_ATTN",
+    "ROPE_TABLE",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1236,9 +1237,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "quantize_i8_convrot(x)",
     "sage_attn(x,y,z)",
     "sol_attn(x,y,z)",
+    "rope_table(x,pe)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5675,6 +5677,58 @@ struct ggml_tensor* ggml_sol_attn(
     const float params[]       = {scale, tau};
     ggml_set_op_params(result, params, sizeof(params));
     return result;
+}
+
+// ggml_rope_table / ggml_rms_norm_mul_rope_table
+
+static struct ggml_tensor * ggml_rope_table_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        float                 eps,
+        struct ggml_tensor  * pe,
+        enum ggml_type        type) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float));
+    GGML_ASSERT(a->ne[0] % 2 == 0);
+    GGML_ASSERT(pe->type == GGML_TYPE_F32 && ggml_is_contiguous(pe));
+    GGML_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2 && pe->ne[2] == a->ne[0]/2 && pe->ne[3] == a->ne[2]);
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16);
+    if (w != NULL) {
+        GGML_ASSERT(w->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_nelements(w) == a->ne[0]);
+        GGML_ASSERT(eps >= 0.0f);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, a->ne[0], a->ne[2], a->ne[1], a->ne[3]);
+
+    const int32_t params[2] = { w != NULL ? 1 : 0, 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_ROPE_TABLE;
+    result->src[0] = a;
+    result->src[1] = pe;
+    result->src[2] = w;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rope_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * pe,
+        enum ggml_type        type) {
+    return ggml_rope_table_impl(ctx, a, NULL, 0.0f, pe, type);
+}
+
+struct ggml_tensor * ggml_rms_norm_mul_rope_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * w,
+        float                 eps,
+        struct ggml_tensor  * pe,
+        enum ggml_type        type) {
+    GGML_ASSERT(w != NULL);
+    return ggml_rope_table_impl(ctx, a, w, eps, pe, type);
 }
 
 void ggml_flash_attn_ext_set_prec(

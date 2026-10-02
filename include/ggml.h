@@ -606,6 +606,7 @@ extern "C" {
         GGML_OP_QUANTIZE_I8_CONVROT,
         GGML_OP_SAGE_ATTN,
         GGML_OP_SOL_ATTN,
+        GGML_OP_ROPE_TABLE,
 
         GGML_OP_COUNT,
     };
@@ -2538,6 +2539,31 @@ extern "C" {
         struct ggml_tensor* v,
         float scale,
         float tau);
+
+    // Rotary embedding from a precomputed rotation table (the "pe" of Flux / Qwen-Image style models), written in the
+    // per-head layout attention takes, in one op instead of permute copies, repeats, two muls and an add:
+    //   a:      [d, n_head, L, N] F32, rows contiguous (nb[0] == sizeof(float)), d even
+    //   pe:     [2, 2, d/2, L] F32 contiguous, shared by all heads and batches; for pair j of token l the 2x2 matrix
+    //           m[r][c] = pe[c, r, j, l] (torch layout [L, d/2, 2, 2], e.g. [[cos, -sin], [sin, cos]])
+    //   result: [d, L, n_head, N] contiguous, F32 or F16:
+    //           result[2j + r, l, h, n] = a[2j, h, l, n] * m[r][0] + a[2j + 1, h, l, n] * m[r][1]   (r = 0, 1)
+    // Each product and the sum are rounded to F32 separately (no fused multiply-add), so the result is bit-identical
+    // to the ggml_mul/ggml_add decomposition; an F16 result is the F32 one converted like ggml_cast.
+    GGML_API struct ggml_tensor * ggml_rope_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe,
+            enum ggml_type        type);
+
+    // ggml_rope_table(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, a, eps), w), pe, type) in one op, with the backend's own
+    // RMS_NORM (+ MUL) arithmetic, so the result is bit-identical to the three ops; w: [d] F32 contiguous.
+    GGML_API struct ggml_tensor * ggml_rms_norm_mul_rope_table(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w,
+            float                 eps,
+            struct ggml_tensor  * pe,
+            enum ggml_type        type);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

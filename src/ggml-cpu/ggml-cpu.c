@@ -2089,6 +2089,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rope_back(params, tensor);
             } break;
+        case GGML_OP_ROPE_TABLE:
+            {
+                ggml_compute_forward_rope_table(params, tensor);
+            } break;
         case GGML_OP_CLAMP:
             {
                 ggml_compute_forward_clamp(params, tensor);
@@ -2552,6 +2556,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
+        case GGML_OP_ROPE_TABLE:
         case GGML_OP_ADD_REL_POS:
             {
                 n_tasks = n_threads;
@@ -3104,6 +3109,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_ROPE_BACK:
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                    } break;
+                case GGML_OP_ROPE_TABLE:
+                    {
+                        // per thread: the normalized row, then the two rows of products
+                        cur = ggml_type_size(GGML_TYPE_F32) * (3 * node->ne[0] + CACHE_LINE_SIZE_F32) * n_tasks;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
