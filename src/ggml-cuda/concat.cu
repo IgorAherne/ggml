@@ -139,9 +139,47 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// The contiguous kernels move whole elements of type T; the widest unit (up to 16 bytes) that divides every row of
+// src0, src1 and dst and aligns every base address moves the same bytes with fewer threads and index divisions.
+static size_t concat_cont_unit_bytes(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    size_t unit = 16;
+    for (const ggml_tensor * t : {src0, src1, dst}) {
+        const size_t row = ggml_row_size(t->type, t->ne[0]);
+        for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+            const uintptr_t base = (uintptr_t) t->data + (uintptr_t) (i3*t->nb[3]);
+            while (unit > 1 && (row % unit != 0 || base % unit != 0)) {
+                unit /= 2;
+            }
+        }
+    }
+    return unit;
+}
+
+template <typename V>
+static void concat_cont_cuda_units(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
+        concat_cont_cuda(
+                (const V *) ((const char *) src0->data + i3*src0->nb[3]),
+                (const V *) ((const char *) src1->data + i3*src1->nb[3]),
+                (V *)       ((char *)       dst->data  + i3*dst->nb[3]),
+                ggml_row_size(src0->type, src0->ne[0])/sizeof(V), src0->ne[1], src0->ne[2],
+                ggml_row_size(dst->type,  dst->ne[0])/sizeof(V),  dst->ne[1],  dst->ne[2], dim, stream);
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
+        const size_t unit = concat_cont_unit_bytes(src0, src1, dst);
+        if (unit > sizeof(T)) {
+            switch (unit) {
+                case 16: concat_cont_cuda_units<uint4>(src0, src1, dst, dim, stream); return;
+                case  8: concat_cont_cuda_units<uint2>(src0, src1, dst, dim, stream); return;
+                case  4: concat_cont_cuda_units<uint32_t>(src0, src1, dst, dim, stream); return;
+                case  2: concat_cont_cuda_units<uint16_t>(src0, src1, dst, dim, stream); return;
+                default: break;
+            }
+        }
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;
