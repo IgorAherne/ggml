@@ -1,5 +1,7 @@
 #include "norm.cuh"
 #include "mmq.cuh"
+#include "unary.cuh"
+#include <climits>
 #include <cstdint>
 
 // norm_f32's statistics as they come out of its compiled code (sm_86 SASS: MUFU.RCP of ncols, mean = sum * rcp,
@@ -353,6 +355,88 @@ static __global__ void rms_norm_f32(const float * x,
         } else {
             dst[col] = scale * x[col];
         }
+    }
+}
+
+// RMS norm over the channels of a channel-major tensor (e.g. a VAE's [W, H, T, C] activations) with its gamma
+// multiply and optionally a SiLU, as one kernel: dst[c*npix + p] = silu?((scale_p * x[c*npix + p]) * w[c]). It replaces
+// cont(permute) -> RMS_NORM -> MUL -> cont(permute back) [-> SILU] and gives the same bits: one thread per pixel p
+// replays rms_norm_f32<block_size> for that pixel's row of ncols channels exactly - virtual thread t of the block sums
+// the squares of channels t, t + block_size, ... in order (FFMA, as `tmp += xi * xi` compiles), each virtual warp's
+// 32 sums go through warp_reduce_sum's butterfly (offsets 16..1), and the warp sums (0 beyond the block's warps)
+// through block_reduce's second butterfly; scale = rsqrt(fma(sum, rcp(ncols), eps)) as rms_norm_f32's compiled code
+// computes it (sm_86 SASS: MUFU.RCP of the column count, FFMA with eps, MUFU.RSQ), then the two multiplies of the
+// separate RMS_NORM and MUL kernels and SiLU's ggml_cuda_op_silu_single. Each thread reads only its own pixel's
+// channels before writing them, so dst may be x itself (but must not overlap it otherwise).
+template <int block_size, bool do_silu>
+static __global__ void __launch_bounds__(128) rms_norm_cf_f32(const float * x, const float * __restrict__ w, float * dst,
+                                                              const int ncols, const int64_t npix, const float eps) {
+    const int64_t p = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= npix) {
+        return;
+    }
+    x   += p;
+    dst += p;
+
+    constexpr int nwarps = block_size / WARP_SIZE;
+    const int nrounds = (ncols + block_size - 1) / block_size;
+
+    float ws[WARP_SIZE];  // the block's warp sums; block_reduce's sentinel 0 beyond its warps
+#pragma unroll
+    for (int wi = 0; wi < WARP_SIZE; ++wi) {
+        ws[wi] = 0.0f;
+        if (wi >= nwarps) {
+            continue;
+        }
+        float v[WARP_SIZE];
+#pragma unroll
+        for (int l = 0; l < WARP_SIZE; ++l) {
+            v[l] = 0.0f;
+        }
+        for (int r = 0; r < nrounds; ++r) {
+#pragma unroll
+            for (int l = 0; l < WARP_SIZE; ++l) {
+                const int col = r*block_size + wi*WARP_SIZE + l;
+                if (col < ncols) {
+                    const float xi = x[(int64_t) col*npix];
+                    v[l] = __fmaf_rn(xi, xi, v[l]);
+                }
+            }
+        }
+#pragma unroll
+        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+#pragma unroll
+            for (int l = 0; l < offset; ++l) {
+                v[l] = __fadd_rn(v[l], v[l + offset]);
+            }
+        }
+        ws[wi] = v[0];
+    }
+    if constexpr (nwarps > 1) {
+#pragma unroll
+        for (int offset = WARP_SIZE/2; offset > 0; offset >>= 1) {
+#pragma unroll
+            for (int l = 0; l < offset; ++l) {
+                ws[l] = __fadd_rn(ws[l], ws[l + offset]);
+            }
+        }
+    }
+
+    float scale;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    float rcp;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"((float) ncols));
+    scale = rsqrtf(__fmaf_rn(ws[0], rcp, eps));
+#else
+    scale = rsqrtf(ws[0] / ncols + eps);
+#endif
+
+    for (int col = 0; col < ncols; ++col) {
+        float r = __fmul_rn(__fmul_rn(scale, x[(int64_t) col*npix]), w[col]);
+        if constexpr (do_silu) {
+            r = ggml_cuda_op_silu_single(r);
+        }
+        dst[(int64_t) col*npix] = r;
     }
 }
 
@@ -847,6 +931,37 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+                                    const float eps, ggml_tensor * dst, const bool silu) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_is_contiguous(dst));
+    const int     ncols = (int) x->ne[3];
+    const int64_t npix  = x->ne[0]*x->ne[1]*x->ne[2];
+    GGML_ASSERT(ggml_nelements(w) == ncols && ggml_nelements(dst) == ggml_nelements(x));
+
+    const float * x_d   = (const float *) x->data;
+    const float * w_d   = (const float *) w->data;
+    float *       dst_d = (float *) dst->data;
+    cudaStream_t  stream = ctx.stream();
+
+    const int64_t nblocks = (npix + 127) / 128;
+    GGML_ASSERT(nblocks <= INT_MAX);
+    // the block size rms_norm_f32_cuda would launch for rows of ncols
+    if (ncols < 1024) {
+        if (silu) {
+            rms_norm_cf_f32<256, true><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+        } else {
+            rms_norm_cf_f32<256, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+        }
+    } else {
+        if (silu) {
+            rms_norm_cf_f32<1024, true><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+        } else {
+            rms_norm_cf_f32<1024, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+        }
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

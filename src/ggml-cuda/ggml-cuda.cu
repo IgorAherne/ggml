@@ -4247,6 +4247,122 @@ static bool ggml_cuda_can_fuse_mul_add_norm_mul(const ggml_cgraph * cgraph, int 
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// cont(permute x) -> RMS_NORM -> MUL (gamma) -> cont(permute back) [-> SILU]: an RMS norm over the channels (dim 3)
+// of a contiguous F32 x (e.g. the Wan VAE's RMS_norm block on [W, H, T, C]), as one kernel that reads x in place and
+// writes the last node (ggml_cuda_op_rms_norm_cf_fused, same bits). View nodes between them (the gamma reshape, the
+// permute back) are skipped as the graph loop would; every intermediate must feed only the next node of the chain.
+// Returns the number of nodes after i that the fused kernel covers, 0 if the pattern does not match.
+static int ggml_cuda_try_fuse_rms_norm_cf(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (a->op != GGML_OP_CONT || a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a)) {
+        return 0;
+    }
+    const ggml_tensor * v = a->src[0];
+    if (v == nullptr || v->op != GGML_OP_PERMUTE) {
+        return 0;
+    }
+    const ggml_tensor * x = v->src[0];
+    if (x == nullptr || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[3] < 1) {
+        return 0;
+    }
+    // v[c, i0, i1, i2] = x[i0, i1, i2, c]
+    if (v->ne[0] != x->ne[3] || v->nb[0] != x->nb[3]) {
+        return 0;
+    }
+    for (int d = 0; d < 3; ++d) {
+        if (v->ne[d + 1] != x->ne[d] || v->nb[d + 1] != x->nb[d]) {
+            return 0;
+        }
+    }
+
+    auto next_compute = [&](int j) {
+        for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        }
+        return j;
+    };
+    auto only_use = [&](const ggml_tensor * t, int j_t) {  // t = nodes[j_t] feeds exactly one node and is no output
+        return ggml_node_get_use_count(cgraph, j_t) == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+               (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    };
+
+    const int jb = next_compute(i);
+    if (jb >= cgraph->n_nodes || !only_use(a, i)) {
+        return 0;
+    }
+    const ggml_tensor * b = cgraph->nodes[jb];
+    if (b->op != GGML_OP_RMS_NORM || b->src[0] != a || b->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    const int jm = next_compute(jb);
+    if (jm >= cgraph->n_nodes || !only_use(b, jb)) {
+        return 0;
+    }
+    const ggml_tensor * m = cgraph->nodes[jm];
+    if (m->op != GGML_OP_MUL || m->type != GGML_TYPE_F32 || !ggml_are_same_shape(m, b) ||
+        (m->src[0] != b && m->src[1] != b)) {
+        return 0;
+    }
+    const ggml_tensor * g = m->src[0] == b ? m->src[1] : m->src[0];
+    if (g == b || g->type != GGML_TYPE_F32 || !ggml_is_contiguous(g) || g->ne[0] != b->ne[0] || ggml_nelements(g) != g->ne[0]) {
+        return 0;
+    }
+    const int jd = next_compute(jm);
+    if (jd >= cgraph->n_nodes || !only_use(m, jm)) {
+        return 0;
+    }
+    ggml_tensor * d = cgraph->nodes[jd];
+    if (d->op != GGML_OP_CONT || d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || !ggml_are_same_shape(d, x)) {
+        return 0;
+    }
+    const ggml_tensor * v2 = d->src[0];
+    int jv2 = -1;
+    for (int j = jm + 1; j < jd; ++j) {
+        if (cgraph->nodes[j] == v2) {
+            jv2 = j;
+        }
+    }
+    if (v2 == nullptr || v2->op != GGML_OP_PERMUTE || v2->src[0] != m || jv2 < 0 || ggml_node_get_use_count(cgraph, jv2) != 1) {
+        return 0;
+    }
+    // v2[i0, i1, i2, c] = m[c, i0, i1, i2]
+    if (v2->ne[3] != m->ne[0] || v2->nb[3] != m->nb[0]) {
+        return 0;
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (v2->ne[k] != m->ne[k + 1] || v2->nb[k] != m->nb[k + 1]) {
+            return 0;
+        }
+    }
+
+    // optionally the SILU of the result
+    ggml_tensor * out  = d;
+    bool          silu = false;
+    int           last = jd;
+    const int     js   = next_compute(jd);
+    if (js < cgraph->n_nodes && only_use(d, jd)) {
+        ggml_tensor * s = cgraph->nodes[js];
+        if (s->op == GGML_OP_UNARY && ggml_get_unary_op(s) == GGML_UNARY_OP_SILU && s->src[0] == d &&
+            s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) && ggml_are_same_shape(s, d)) {
+            out  = s;
+            silu = true;
+            last = js;
+        }
+    }
+
+    // the kernel reads x while writing out: out may be x exactly, but must not overlap x (or gamma) otherwise
+    auto overlaps = [](const ggml_tensor * p, const ggml_tensor * q) {
+        const char * p0 = (const char *) p->data;
+        const char * q0 = (const char *) q->data;
+        return p0 < q0 + ggml_nbytes(q) && q0 < p0 + ggml_nbytes(p);
+    };
+    if ((overlaps(out, x) && out->data != x->data) || overlaps(out, g)) {
+        return 0;
+    }
+
+    ggml_cuda_op_rms_norm_cf_fused(*cuda_ctx, x, g, ggml_get_op_params_f32(b, 0), out, silu);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4255,6 +4371,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CONT) {
+        const int n_fused = ggml_cuda_try_fuse_rms_norm_cf(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;

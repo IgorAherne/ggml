@@ -19,6 +19,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
 
+// cont(permute) -> RMS_NORM -> MUL by a [C] gamma -> cont(permute back) [-> SILU] over the channels (dim 3) of a
+// contiguous F32 x [W, H, T, C], written to dst (same shape) in one kernel with the separate kernels' exact arithmetic;
+// dst may be x itself but must not overlap it otherwise
+void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+                                    float eps, ggml_tensor * dst, bool silu);
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
