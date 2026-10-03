@@ -3,6 +3,7 @@
 #include "common.cuh"
 
 #include <climits>
+#include <cmath>
 #include <cstdint>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
@@ -959,7 +960,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int tile_group) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1063,9 +1064,22 @@ static __global__ void mul_mat_q(
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
 
+    // tile_group > 0: one CUDA block per output tile (gridDim.x == number of tiles, one channel, one sample), visited
+    // in groups of tile_group src0 tile rows. Within a group the src0 tile row index runs fastest, so the blocks that
+    // are resident at the same time share their src1 tiles through the L2 cache instead of each streaming its own.
+    // Every block still computes one whole tile, so the results are the same as with tile_group == 0.
+    int bidx = blockIdx.x;
+    if (tile_group > 0) {
+        const int group_size = tile_group*ntx.z;
+        const int group      = bidx / group_size;
+        const int rows_group = min(tile_group, int(nty) - group*tile_group);
+        const int l          = bidx - group*group_size;
+        bidx = (group*tile_group + l % rows_group)*ntx.z + l / rows_group;
+    }
+
     // kbc == k block continuous, current index in continuous ijk space.
-    int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
-    int kbc_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    int kbc      = int64_t(bidx)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    int kbc_stop = int64_t(bidx + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
 
     kbc      -= fastmodulo(kbc,      blocks_per_ne00) % blocks_per_iter;
     kbc_stop -= fastmodulo(kbc_stop, blocks_per_ne00) % blocks_per_iter;
@@ -1392,8 +1406,9 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// tile_group > 0 (see ggml_cuda_mmq_get_tile_group): one CUDA block per output tile in grouped order.
 template <ggml_type type, int J, bool fallback>
-static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const int tile_group) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -1432,7 +1447,20 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, 0);
+        return;
+    }
+
+    if (tile_group > 0) {
+        GGML_ASSERT(ntzw == 1 && args.ids_dst == nullptr);
+        const dim3 block_nums_tiles(nty*ntx, 1, 1);
+        GGML_ASSERT(int64_t(nty*ntx) * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+        mul_mat_q<type, J, fallback><<<block_nums_tiles, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+             blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+             ntx_fd, tile_group);
         return;
     }
 
@@ -1461,7 +1489,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, 0);
 
     if (!fixup_needed) {
         return;
@@ -1472,6 +1500,33 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
+}
+
+// Grouped tile order for large matrix multiplications on sm_86 (returns the number of src0 tile rows per group, or 0
+// for the default launch). It is used only where the default launch already runs one whole output tile per CUDA block
+// (stream-k config with >= 90% tile efficiency on NVIDIA: no K split, no fixup), so every output is computed by the
+// same block code as before and the results do not change; only the order in which the tiles are visited does.
+// Measured kernel times on an RTX 3060 (28 SMs, 3 MB L2), 4096 src1 columns: -1.4 to -2.5% for a 4096 x 24576 Q4_K
+// weight, -0.8 to -1.7% for 12288 x 4096 (Q4_K, Q5_K), but +0.4 to +2% for 4096 x 4096 weights (Q4_K/Q5_K/Q6_K/Q8_0)
+// and up to +1% at 1024-2048 columns, hence the thresholds.
+static int ggml_cuda_mmq_get_tile_group(const ggml_cuda_mmq_config & config, const mmq_args & args, const int cc, const int nsm) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc != 860 || !config.stream_k || args.ids_dst != nullptr || args.y_scale != nullptr ||
+            args.nchannels_y != 1 || args.nsamples_y != 1) {
+        return 0;
+    }
+    if (args.ncols_max < 3072 || int64_t(args.nrows_x)*args.ncols_x < (int64_t(1) << 25)) {
+        return 0;
+    }
+    const int nty    = (args.nrows_x   + config.I - 1) / config.I;
+    const int ntx    = (args.ncols_max + config.J - 1) / config.J;
+    const int ntiles = nty*ntx;
+    const int nwaves = (ntiles + nsm - 1) / nsm;
+    if (100*ntiles / (nsm*nwaves) < 90) {
+        return 0; // the default launch splits tiles along K (stream-k): keep it, its sums differ from whole tiles
+    }
+    // about sqrt(1.3 * resident blocks) rows per group: 6 for 28 SMs, the measured optimum (4-8 were within 0.7%)
+    const int group = std::max(1, (int) std::lround(std::sqrt(1.3*nsm*config.occupancy)));
+    return std::min(group, nty);
 }
 
 template <ggml_type type, bool fallback>
@@ -1501,54 +1556,57 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         }
     }
 
+    const int tile_group = ggml_cuda_mmq_get_tile_group(
+        ggml_cuda_mmq_get_config(type, J_best, fallback, cc), args, cc, ggml_cuda_info().devices[id].nsm);
+
     switch (J_best) {
         case   8:
-            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream, tile_group);
             break;
         case  16:
-            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream, tile_group);
             break;
         case  24:
-            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream, tile_group);
             break;
         case  32:
-            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream, tile_group);
             break;
         case  40:
-            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream, tile_group);
             break;
         case  48:
-            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream, tile_group);
             break;
         case  56:
-            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream, tile_group);
             break;
         case  64:
-            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream, tile_group);
             break;
         case  72:
-            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream, tile_group);
             break;
         case  80:
-            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream, tile_group);
             break;
         case  88:
-            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream, tile_group);
             break;
         case  96:
-            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream, tile_group);
             break;
         case 104:
-            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream, tile_group);
             break;
         case 112:
-            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream, tile_group);
             break;
         case 120:
-            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream, tile_group);
             break;
         case 128:
-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream, tile_group);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
