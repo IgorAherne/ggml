@@ -3958,6 +3958,28 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // NORM (layer norm without affine) followed by a MUL with a broadcast F32 operand (e.g. adaLN-style modulation)
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        const ggml_tensor * norm  = cgraph->nodes[node_idx];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * other = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+        if (other == norm || norm->src[0]->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+            other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (norm->src[0]->nb[0] != sizeof(float) || other->nb[0] != sizeof(float)) {
+            return false;
+        }
+        // the kernel writes the product in the norm's (contiguous) layout and broadcasts `other` over it
+        if (!ggml_is_contiguous(mul) || !ggml_can_repeat(other, mul)) {
+            return false;
+        }
+        // it reads the norm's input row by row while writing the product: no input may share memory with it
+        int out_nodes[] = { node_idx + 1 };
+        return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -4796,6 +4818,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
