@@ -276,6 +276,133 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
+// ---- [gate | up] MUL_MAT -> SWIGLU -> quantized MUL_MAT (mul_mat_q_glu_q8_1, mmq-async.cuh) -----------------------------
+
+// Whether ggml_cuda_mul_mat_q would compute every output of src0 x src1 (no ids, one channel and sample) with J = 128
+// and one CUDA block per whole output tile (no stream-k split along K), which is what the SwiGLU kernel does: then its
+// sums are the same.
+static bool ggml_cuda_mul_mat_q_whole_tiles_J128(const ggml_type type, const int64_t nrows_x, const int64_t ncols, const int cc,
+                                                  const int nsm, const size_t smpbo) {
+    const bool fallback = nrows_x % 128 != 0;
+    int J_best        = 0;
+    int ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) { // as mul_mat_q_switch_J chooses J
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    if (J_best != 128) {
+        return false;
+    }
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, 128, fallback, cc);
+    if (!ggml_cuda_mmq_get_stream_k(type, 128, fallback, cc)) {
+        return true;
+    }
+    // launch_mul_mat_q_impl: stream-k kernel with one block per tile when the tiles fill >= 90% of the waves (NVIDIA)
+    const int64_t nty    = (nrows_x + config.I - 1) / config.I;
+    const int64_t ntx    = (ncols   + config.J - 1) / config.J;
+    const int64_t ntiles = nty*ntx;
+    const int64_t nwaves = (ntiles + nsm - 1) / nsm;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && 100*ntiles / (nsm*nwaves) >= 90;
+}
+
+bool ggml_cuda_mul_mat_q_glu_supported(const ggml_tensor * mm, const ggml_tensor * mm_out) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        mm->src[2] != nullptr || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        src0->ne[1] % 128 != 0 || src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) ||
+        (uintptr_t) src0->data % 16 != 0 || src0->nb[1] % 16 != 0) {
+        return false;
+    }
+    // the second MUL_MAT's src1 rows: the SWIGLU's ne01/2 values, no padding (the epilogue writes every q8_1 block)
+    if (mm_out->src[1]->ne[0] != src0->ne[1]/2 || (src0->ne[1]/2) % MATRIX_ROW_PADDING != 0 || mm_out->src[1]->ne[1] != src1->ne[1]) {
+        return false;
+    }
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, 128, false, cc);
+    if (!ggml_cuda_mmq_async_available(config, cc, ggml_cuda_info().devices[id].smpbo)) {
+        return false;
+    }
+    return ggml_cuda_mul_mat_q_whole_tiles_J128(src0->type, src0->ne[1], src1->ne[1], cc, ggml_cuda_info().devices[id].nsm,
+                                                ggml_cuda_info().devices[id].smpbo);
+}
+
+template <ggml_type type, int qlayout>
+static void ggml_cuda_mul_mat_q_glu_launch(ggml_backend_cuda_context & ctx, const char * x, const int * y, void * vq,
+                                           const int64_t ne00, const int64_t ne01, const int64_t stride_row_x, const int64_t ne11,
+                                           cudaStream_t stream) {
+    const int id  = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[id].cc;
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, 128, false, cc);
+    const int nbytes_shared = (int) ggml_cuda_mmq_async_nbytes_shared(config);
+    GGML_ASSERT(nbytes_shared >= int(128*sizeof(int) + 128*(128 + 4)*sizeof(float))); // the epilogue's [token][row] buffer
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_glu_q8_1<type, qlayout>), nbytes_shared);
+
+    const int ntx = (int) ((ne11 + 127) / 128);
+    const int nty = (int) (ne01 / 128);
+    // the grouped tile order of the default launch (same groups as ggml_cuda_mmq_get_tile_group would give)
+    mmq_args args = {};
+    args.type_x = type; args.ncols_x = ne00; args.nrows_x = ne01; args.nchannels_y = 1; args.nsamples_y = 1;
+    args.ncols_max = ne11; args.ncols_opt = ne11;
+    const int tile_group = ggml_cuda_mmq_get_tile_group(config, args, cc, nsm);
+
+    GGML_ASSERT(int64_t(nty)*ntx < INT_MAX);
+    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMQ_ASYNC_NTHREADS/WARP_SIZE, 1);
+    mul_mat_q_glu_q8_1<type, qlayout><<<nty*ntx, block_dims, nbytes_shared, stream>>>(
+        x, y, vq, (int) (ne00 / ggml_cuda_type_traits<type>::qk), (int) stride_row_x, (int) ne11, (int) (ne01/2), ntx, nty, tile_group);
+}
+
+void ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, char * src1_q8_1_given, bool src1_q8_1_filled,
+                             void * vq_out, int out_layout) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    char * y = src1_q8_1_given;
+    if (y == nullptr) {
+        y = src1_q8_1.alloc(ggml_cuda_mul_mat_q_src1_q8_1_bytes(src0, src1));
+    }
+    if (!src1_q8_1_filled) {
+        const int64_t s11 = src1->nb[1] / sizeof(float);
+        const int64_t s12 = src1->nb[2] / sizeof(float);
+        const int64_t s13 = src1->nb[3] / sizeof(float);
+        quantize_mmq_q8_1_cuda((const float *) src1->data, nullptr, y, src0->type, src1->ne[0], s11, s12, s13, ne10_padded,
+                               src1->ne[1], 1, 1, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    GGML_ASSERT((uintptr_t) y % 16 == 0 && (uintptr_t) vq_out % 16 == 0);
+
+    const int64_t stride_row_x = src0->nb[1] / ggml_type_size(src0->type);
+#define GLU_LAUNCH(T, L) ggml_cuda_mul_mat_q_glu_launch<T, L>(ctx, (const char *) src0->data, (const int *) y, vq_out, \
+        src0->ne[0], src0->ne[1], stride_row_x, src1->ne[1], stream)
+    switch (out_layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            if (src0->type == GGML_TYPE_Q4_K) { GLU_LAUNCH(GGML_TYPE_Q4_K, MMQ_Q8_1_DS_LAYOUT_D4); } else { GLU_LAUNCH(GGML_TYPE_Q5_K, MMQ_Q8_1_DS_LAYOUT_D4); }
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            if (src0->type == GGML_TYPE_Q4_K) { GLU_LAUNCH(GGML_TYPE_Q4_K, MMQ_Q8_1_DS_LAYOUT_DS4); } else { GLU_LAUNCH(GGML_TYPE_Q5_K, MMQ_Q8_1_DS_LAYOUT_DS4); }
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            if (src0->type == GGML_TYPE_Q4_K) { GLU_LAUNCH(GGML_TYPE_Q4_K, MMQ_Q8_1_DS_LAYOUT_D2S6); } else { GLU_LAUNCH(GGML_TYPE_Q5_K, MMQ_Q8_1_DS_LAYOUT_D2S6); }
+            break;
+        default:
+            GGML_ABORT("unknown q8_1 layout %d", out_layout);
+    }
+#undef GLU_LAUNCH
+    CUDA_CHECK(cudaGetLastError());
+}
+
 size_t ggml_cuda_mul_mat_q_src1_q8_1_bytes(const ggml_tensor * src0, const ggml_tensor * src1) {
     // as ggml_cuda_mul_mat_q computes nbytes_src1_q8_1 without ids and with q8_1 activations
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

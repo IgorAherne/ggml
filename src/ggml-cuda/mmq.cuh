@@ -1706,4 +1706,14 @@ void ggml_cuda_mul_mat_q(
 // The bytes ggml_cuda_mul_mat_q (no ids, q8_1 activations) allocates for src1's quantized copy.
 size_t ggml_cuda_mul_mat_q_src1_q8_1_bytes(const ggml_tensor * src0, const ggml_tensor * src1);
 
+// mm (a MUL_MAT of a [gate | up] weight, gate rows first) -> SWIGLU of it -> mm_out (a quantized MUL_MAT of the SWIGLU):
+// whether ggml_cuda_mul_mat_q_glu can compute mm_out's q8_1 input directly (Q4_K / Q5_K mm on sm_80+ with the
+// asynchronous MMQ pipeline, where ggml_cuda_mul_mat_q would compute mm in whole tiles with J = 128: same sums).
+bool ggml_cuda_mul_mat_q_glu_supported(const ggml_tensor * mm, const ggml_tensor * mm_out);
+// mm's product with silu(gate) * up applied in the kernel's epilogue, written to vq_out as the q8_1 data (layout
+// out_layout) that quantizing the SWIGLU's output for mm_out would give; mm's src1 is quantized into src1_q8_1_given
+// (or a pool buffer) unless src1_q8_1_filled. mm's F32 output is not written.
+void ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, char * src1_q8_1_given, bool src1_q8_1_filled,
+                             void * vq_out, int out_layout);
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

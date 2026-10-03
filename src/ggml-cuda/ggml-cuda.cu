@@ -4247,6 +4247,52 @@ static bool ggml_cuda_can_fuse_mul_add_norm_mul(const ggml_cgraph * cgraph, int 
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// nodes[mm_idx] = a quantized MUL_MAT of a [gate | up] weight, then (view nodes skipped) a one-tensor SWIGLU of it
+// (gate first) and a quantized MUL_MAT of that (e.g. a transformer MLP's down projection): the first product runs with
+// the SwiGLU and the second product's q8_1 quantization in its epilogue (ggml_cuda_mul_mat_q_glu, same values), the
+// F32 product and the SWIGLU output are never written. src1_q8_1 / filled: as for ggml_cuda_mul_mat_q (mm's src1).
+// Returns the index of the second MUL_MAT when done, -1 when the pattern does not apply (nothing was run).
+static int ggml_cuda_try_mul_mat_glu(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int mm_idx,
+                                     char * src1_q8_1, const bool src1_q8_1_filled) {
+    const ggml_tensor * mm = cgraph->nodes[mm_idx];
+    if (mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_node_get_use_count(cgraph, mm_idx) != 1 ||
+        (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, mm)) {
+        return -1;
+    }
+    auto next_compute = [&](int j) {
+        for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        }
+        return j;
+    };
+    const int jg = next_compute(mm_idx);
+    if (jg >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * glu = cgraph->nodes[jg];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[0] != mm || glu->src[1] != nullptr ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+        (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (glu->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_node_get_use_count(cgraph, jg) != 1 || glu->ne[0]*2 != mm->ne[0] || glu->ne[1] != mm->ne[1] ||
+        !ggml_is_contiguous(mm)) {
+        return -1;
+    }
+    const int jo = next_compute(jg);
+    if (jo >= cgraph->n_nodes) {
+        return -1;
+    }
+    ggml_tensor * mm_out = cgraph->nodes[jo];
+    if (mm_out->op != GGML_OP_MUL_MAT || mm_out->src[1] != glu || mm_out->src[0] == glu ||
+        (mm_out->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, mm_out) ||
+        !ggml_cuda_mul_mat_q_glu_supported(mm, mm_out)) {
+        return -1;
+    }
+    const int layout = mmq_get_q8_1_ds_layout(mm_out->src[0]->type);
+    ggml_cuda_pool_alloc<char> glu_q8_1(cuda_ctx->pool(), ggml_cuda_mul_mat_q_src1_q8_1_bytes(mm_out->src[0], glu));
+    ggml_cuda_mul_mat_q_glu(*cuda_ctx, mm, src1_q8_1, src1_q8_1_filled, glu_q8_1.get(), layout);
+    ggml_cuda_mul_mat_q(*cuda_ctx, mm_out->src[0], glu, nullptr, mm_out, nullptr, glu_q8_1.get(), /*src1_q8_1_filled =*/ true);
+    return jo;
+}
+
 // cont(permute x) -> RMS_NORM -> MUL (gamma) -> cont(permute back) [-> SILU]: an RMS norm over the channels (dim 3)
 // of a contiguous F32 x (e.g. the Wan VAE's RMS_norm block on [W, H, T, C]), as one kernel that reads x in place and
 // writes the last node (ggml_cuda_op_rms_norm_cf_fused, same bits). View nodes between them (the gamma reshape, the
@@ -4702,6 +4748,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // [gate | up] mul_mat + swiglu + mul_mat: the SwiGLU and the second product's quantization in the first's epilogue
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int last = ggml_cuda_try_mul_mat_glu(cuda_ctx, cgraph, i, nullptr, false);
+        if (last >= 0) {
+            return last - i;
+        }
+    }
+
     // mul_mat x2..4 with one src1 (e.g. an attention's q, k and v projections of the same tokens, built one after the
     // other): src1 is quantized to q8_1 once and every product reads that copy, instead of each quantizing it again.
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, node)) {
@@ -4740,6 +4794,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_op_mul_add_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
                                                 src1_q8_1.get(), layout);
             for (int j = 0; j < n_mm; j++) {
+                if (j == n_mm - 1) { // the last product may be a [gate | up] one followed by SWIGLU + MUL_MAT
+                    const int last = ggml_cuda_try_mul_mat_glu(cuda_ctx, cgraph, i + 4 + j, src1_q8_1.get(), true);
+                    if (last >= 0) {
+                        return last - i;
+                    }
+                }
                 ggml_tensor * mm = cgraph->nodes[i + 4 + j];
                 ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, src1_q8_1.get(), /*src1_q8_1_filled =*/ true);
             }
@@ -5318,6 +5378,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), ggml_cuda_consumers_q8_1_bytes(cgraph, i + 1, n_mm));
             ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], src1_q8_1.get(), layout);
             for (int j = 0; j < n_mm; j++) {
+                if (j == n_mm - 1) { // the last product may be a [gate | up] one followed by SWIGLU + MUL_MAT
+                    const int last = ggml_cuda_try_mul_mat_glu(cuda_ctx, cgraph, i + 2 + j, src1_q8_1.get(), true);
+                    if (last >= 0) {
+                        return last - i;
+                    }
+                }
                 ggml_tensor * mm = cgraph->nodes[i + 2 + j];
                 ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, src1_q8_1.get(), /*src1_q8_1_filled =*/ true);
             }

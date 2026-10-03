@@ -14,6 +14,7 @@
 // and the float accumulation is the unchanged loop of ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma (same order, same operations).
 
 #include "cp-async.cuh"
+#include "unary.cuh"
 
 #define GGML_CUDA_MMQ_ASYNC_I        128
 #define GGML_CUDA_MMQ_ASYNC_J        128
@@ -68,10 +69,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_wait() {
 }
 
 // Raw weight blocks of one K step (one block per row) -> shared memory. Rows beyond i_max (fallback) copy row i_max,
-// like the default loader, whose results for those rows are never written back.
-template <ggml_type type, bool fallback>
+// like the default loader, whose results for those rows are never written back. glu: tile rows I/2.. are read
+// glu_shift rows further on (the up rows matching the tile's gate rows 0..I/2-1, see ggml_cuda_mmq_glu_args).
+template <ggml_type type, bool fallback, bool glu = false>
 static __device__ __forceinline__ void ggml_cuda_mmq_async_load_x(
-        int * __restrict__ rx, const char * __restrict__ x, const int kbx0, const int i_max, const int stride) {
+        int * __restrict__ rx, const char * __restrict__ x, const int kbx0, const int i_max, const int stride,
+        const int glu_shift = 0) {
     constexpr int I        = GGML_CUDA_MMQ_ASYNC_I;
     constexpr int nthreads = GGML_CUDA_MMQ_ASYNC_NTHREADS;
     constexpr int row_ints = ggml_cuda_mmq_async_raw_ints(type);
@@ -86,7 +89,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_load_x(
         if (c0 + nthreads <= I*nchunk || c < I*nchunk) {
             const int i  = c / nchunk;
             const int ch = c % nchunk;
-            const int is = fallback ? min(i, i_max) : i;
+            const int is = (fallback ? min(i, i_max) : i) + (glu && i >= I/2 ? glu_shift : 0);
             const char * src = x + (int64_t(kbx0) + int64_t(is)*stride)*block_size + 16*ch;
             cp_async_cg_16<0>(base + i*(4*row_ints) + 16*ch, src);
         }
@@ -248,18 +251,148 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
     }
 }
 
+// The SwiGLU epilogue (ggml_cuda_mmq_async_process_tile with glu_qlayout >= 0): the tile's rows 0..I/2-1 are I/2
+// consecutive gate rows (features feat0..) of a [gate | up] weight and rows I/2..I-1 the matching up rows (shift rows
+// further on); instead of the F32 products, silu(gate)*up of the tile's I/2 features and J tokens is written to vq as
+// the q8_1 data the quantization with the SWIGLU pre-op writes for the following quantized MUL_MAT (ntok rows).
+struct ggml_cuda_mmq_glu_args {
+    void * vq    = nullptr;
+    int    shift = 0;
+    int    feat0 = 0;
+    int    tok0  = 0;
+    int    ntok  = 0;
+};
+
+// quantize_mmq_q8_1's arithmetic and writes for the four values of columns 4*group .. 4*group+3 of row `row` (of
+// nrows), as in norm.cu's norm_store_q8_1 (lanes 8k .. 8k+7 of a warp hold one 32-value block; every lane of the warp
+// must call it); write == false: shuffle only.
+template <int qlayout>
+static __device__ __forceinline__ void ggml_cuda_mmq_async_store_q8_1(
+        const float4 xi, void * __restrict__ vq, const int64_t group, const int row, const int nrows, const bool write) {
+    constexpr mmq_q8_1_ds_layout ds_layout = (mmq_q8_1_ds_layout) qlayout;
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vq;
+    const int64_t i0      = 4*group;
+    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
+    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Exchange max. abs. value between vals_per_scale/4 threads.
+#pragma unroll
+    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+
+        // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    if (!write) {
+        return;
+    }
+
+    const int64_t ib = k_block*nrows + row;
+
+    // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[iqs/4] = q;
+
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs/16] = sum;
+            if (iqs % 64 == 0) {
+                y[ib].d2s6[iqs/64] = d;
+            }
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32]  = d;
+        }
+    }
+}
+
+// The SwiGLU epilogue: the accumulators (whole K) go to shared memory as [token][row], then each warp takes two tokens
+// per pass, lanes 16t .. 16t+15 the 64 features of token t in groups of 4 (8 lanes per 32-value q8_1 block):
+// silu(gate) * up as quantize_mmq_q8_1's SWIGLU pre-op computes it, then its quantization.
+template <ggml_type type, int J, int qlayout>
+static __device__ __forceinline__ void ggml_cuda_mmq_async_glu_q8_1(
+        const float * __restrict__ sum, float * __restrict__ tbuf, const ggml_cuda_mmq_glu_args & glu, const int tile_y_max_j) {
+    typedef tile<16, 8, int> tile_C;
+    constexpr int I             = GGML_CUDA_MMQ_ASYNC_I;
+    constexpr int nwarps        = GGML_CUDA_MMQ_ASYNC_NTHREADS / WARP_SIZE;
+    constexpr int pitch         = I + 4; // floats per token row: conflict-free stores, 16-byte aligned float4 loads
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, false);
+    constexpr int ntx           = rows_per_warp/tile_C::I;
+    static_assert(J % (2*nwarps) == 0 && I/2 == 4*16, "two tokens of 64 features per warp and pass");
+
+    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                tbuf[j*pitch + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+            }
+        }
+    }
+    __syncthreads();
+
+    const int f = 4*(threadIdx.x % 16);
+#pragma unroll 2
+    for (int p = 0; p < J/(2*nwarps); ++p) {
+        const int j = 2*(p*nwarps + threadIdx.y) + threadIdx.x / 16;
+        const float4 g = *(const float4 *) (tbuf + j*pitch + f);
+        const float4 u = *(const float4 *) (tbuf + j*pitch + I/2 + f);
+        float4 xi;
+        xi.x = __fmul_rn(ggml_cuda_op_silu_single(g.x), u.x);
+        xi.y = __fmul_rn(ggml_cuda_op_silu_single(g.y), u.y);
+        xi.z = __fmul_rn(ggml_cuda_op_silu_single(g.z), u.z);
+        xi.w = __fmul_rn(ggml_cuda_op_silu_single(g.w), u.w);
+        ggml_cuda_mmq_async_store_q8_1<qlayout>(xi, glu.vq, (glu.feat0 + f)/4, glu.tok0 + j, glu.ntok, j <= tile_y_max_j);
+    }
+}
+
 // Drop-in for mul_mat_q_process_tile (same arguments and results). Pipeline per K step kb (buffers b = step parity):
 //   vec_dot half 0 (x[kb] raw + scales, y half 0)        | in flight: y half 1 of kb, raw x of kb + 1
 //   wait, barrier; copy y half 0 of kb + 1; scales of kb + 1 from its raw x
 //   vec_dot half 1 (x[kb], y half 1)                     | in flight: y half 0 of kb + 1
 //   wait, barrier; copy y half 1 of kb + 1 and the raw x of kb + 2 (into the buffer of kb)
-template <ggml_type type, int J, bool fallback, bool fixup>
+// glu_qlayout >= 0: the SwiGLU epilogue (see ggml_cuda_mmq_glu_args) writing q8_1 of that layout instead of dst.
+template <ggml_type type, int J, bool fallback, bool fixup, int glu_qlayout = -1>
 static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const ggml_cuda_mmq_glu_args glu = ggml_cuda_mmq_glu_args()) {
+    constexpr bool is_glu  = glu_qlayout >= 0;
     constexpr int nthreads = GGML_CUDA_MMQ_ASYNC_NTHREADS;
     constexpr int I        = GGML_CUDA_MMQ_ASYNC_I;
     constexpr int qk       = ggml_cuda_type_traits<type>::qk;
@@ -283,12 +416,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
     // prologue: x and both y halves of kb0_start, then the raw x of kb0_start + 1
     {
         const int * by = y + ncols_y*((kb0_start*qk/ne_block)*sz);
-        ggml_cuda_mmq_async_load_x<type, fallback>(rx0, x, offset_x + kb0_start, tile_x_max_i, stride_row_x);
+        ggml_cuda_mmq_async_load_x<type, fallback, is_glu>(rx0, x, offset_x + kb0_start, tile_x_max_i, stride_row_x, glu.shift);
         ggml_cuda_mmq_async_load_y<J>(ty0, by);
         ggml_cuda_mmq_async_load_y<J>(ty1, by + ncols_y*sz);
         ggml_cuda_mmq_async_commit();
         if (kb0_start + 1 < kb0_stop) {
-            ggml_cuda_mmq_async_load_x<type, fallback>(rx0 + rx_size, x, offset_x + kb0_start + 1, tile_x_max_i, stride_row_x);
+            ggml_cuda_mmq_async_load_x<type, fallback, is_glu>(rx0 + rx_size, x, offset_x + kb0_start + 1, tile_x_max_i, stride_row_x, glu.shift);
         }
         ggml_cuda_mmq_async_commit();
         ggml_cuda_mmq_async_wait<1>();
@@ -321,14 +454,19 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
         if (has_next) {
             ggml_cuda_mmq_async_load_y<J>(ty1, by_next + ncols_y*sz);
             if (kb0 + 2 < kb0_stop) {
-                ggml_cuda_mmq_async_load_x<type, fallback>(rx0 + b*rx_size, x, offset_x + kb0 + 2, tile_x_max_i, stride_row_x);
+                ggml_cuda_mmq_async_load_x<type, fallback, is_glu>(rx0 + b*rx_size, x, offset_x + kb0 + 2, tile_x_max_i, stride_row_x, glu.shift);
             }
             ggml_cuda_mmq_async_commit();
         }
         b ^= 1;
     }
 
-    if (fixup) {
+    if constexpr (is_glu) {
+        static_assert(!fixup && !fallback, "the SwiGLU epilogue needs whole tiles");
+        // the loop's last barrier came after the last shared memory reads: the tile buffers can be reused
+        ggml_cuda_mmq_async_glu_q8_1<type, J, glu_qlayout>(sum, (float *) rx0, glu, tile_y_max_j);
+        GGML_UNUSED(write_back);
+    } else if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
     } else {
         write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
@@ -336,3 +474,47 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
 }
 
 #endif // GGML_CUDA_MMQ_ASYNC_DEVICE
+
+// [gate | up] MUL_MAT -> SWIGLU -> quantized MUL_MAT: the first product with the SwiGLU epilogue, one CUDA block per
+// output tile (I/2 features x J tokens, whole K: the same sums as the default launch in tiling mode), visited in groups
+// of tile_group row tiles like mul_mat_q's grouped order. nfeat = rows/2, ntx = token tiles, nty = nfeat/(I/2).
+template <ggml_type type, int qlayout>
+static __global__ void __launch_bounds__(GGML_CUDA_MMQ_ASYNC_NTHREADS, 1) mul_mat_q_glu_q8_1(
+        const char * __restrict__ x, const int * __restrict__ y, void * __restrict__ vq,
+        const int blocks_per_ne00, const int stride_row_x, const int ncols_y, const int nfeat,
+        const int ntx, const int nty, const int tile_group) {
+#ifdef GGML_CUDA_MMQ_ASYNC_DEVICE
+    constexpr int J = GGML_CUDA_MMQ_ASYNC_J;
+    constexpr int I = GGML_CUDA_MMQ_ASYNC_I;
+
+    extern __shared__ int ids_dst_shared[]; // the layout of process_tile starts after J ids (unused here)
+
+    int bidx = blockIdx.x;
+    if (tile_group > 0) {
+        const int group_size = tile_group*ntx;
+        const int group      = bidx / group_size;
+        const int rows_group = min(tile_group, nty - group*tile_group);
+        const int l          = bidx - group*group_size;
+        bidx = (group*tile_group + l % rows_group)*ntx + l / rows_group;
+    }
+    const int it = bidx / ntx;
+    const int jt = bidx - it*ntx;
+
+    ggml_cuda_mmq_glu_args glu;
+    glu.vq    = vq;
+    glu.shift = nfeat - I/2;
+    glu.feat0 = it*(I/2);
+    glu.tok0  = jt*J;
+    glu.ntok  = ncols_y;
+
+    const int offset_x = it*(I/2)*stride_row_x;
+    const int offset_y = jt*J*(sizeof(block_q8_1_mmq)/sizeof(int));
+    ggml_cuda_mmq_async_process_tile<type, J, false, false, qlayout>
+        (x, offset_x, y + offset_y, ids_dst_shared, nullptr, nullptr, nullptr,
+         stride_row_x, ncols_y, 0, I - 1, ncols_y - jt*J - 1, 0, blocks_per_ne00, glu);
+#else
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(vq); GGML_UNUSED(blocks_per_ne00); GGML_UNUSED(stride_row_x);
+    GGML_UNUSED(ncols_y); GGML_UNUSED(nfeat); GGML_UNUSED(ntx); GGML_UNUSED(nty); GGML_UNUSED(tile_group);
+    NO_DEVICE_CODE;
+#endif // GGML_CUDA_MMQ_ASYNC_DEVICE
+}
