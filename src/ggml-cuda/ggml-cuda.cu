@@ -4336,8 +4336,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_node_has_n_uses(cgraph, i, 1) && node->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(node) && ggml_is_contiguous(x) && ggml_are_same_shape(node, x) &&
             (uintptr_t) x->data % sizeof(float4) == 0 && ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, mm)) {
-            const float scale_bias[2] = { ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1) };
-            ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], x, nullptr, mm, scale_bias);
+            ggml_cuda_quantize_pre_op pre;
+            pre.type  = GGML_CUDA_QUANTIZE_PRE_SCALE;
+            pre.x     = (const float *) x->data;
+            pre.s01   = x->nb[1] / sizeof(float);
+            pre.s02   = x->nb[2] / sizeof(float);
+            pre.s03   = x->nb[3] / sizeof(float);
+            pre.scale = ggml_get_op_params_f32(node, 0);
+            pre.bias  = ggml_get_op_params_f32(node, 1);
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], node, nullptr, mm, &pre);
+            return 1;
+        }
+    }
+
+    // swiglu + mul_mat: likewise for a SWIGLU of one tensor ([gate | up] halves) feeding a quantized MUL_MAT (e.g. a
+    // transformer MLP's down projection): silu(gate) * up is computed while quantizing, the SWIGLU output never written
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == node && mm->src[0] != node && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_node_has_n_uses(cgraph, i, 1) && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->src[1] == nullptr &&
+            node->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+            x->nb[0] == sizeof(float) && x->ne[0] == 2 * node->ne[0] && node->ne[0] % 4 == 0 &&
+            x->ne[1] == node->ne[1] && x->ne[2] == node->ne[2] && x->ne[3] == node->ne[3] &&
+            x->nb[1] % sizeof(float4) == 0 && x->nb[2] % sizeof(float4) == 0 && x->nb[3] % sizeof(float4) == 0 &&
+            (uintptr_t) x->data % sizeof(float4) == 0 && ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, mm)) {
+            const int64_t nc      = node->ne[0];
+            const bool    swapped = ggml_get_op_params_i32(node, 1) != 0;
+            ggml_cuda_quantize_pre_op pre;
+            pre.type      = GGML_CUDA_QUANTIZE_PRE_SWIGLU;
+            pre.x         = (const float *) x->data + (swapped ? nc : 0);  // the gate half
+            pre.up_offset = swapped ? -nc : nc;
+            pre.s01       = x->nb[1] / sizeof(float);
+            pre.s02       = x->nb[2] / sizeof(float);
+            pre.s03       = x->nb[3] / sizeof(float);
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], node, nullptr, mm, &pre);
             return 1;
         }
     }

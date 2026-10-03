@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -454,14 +455,17 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-// scale_x: x is the input of a GGML_OP_SCALE whose output this quantizes (fused): each value is first made into what
-// that op writes, x_scale * x + x_bias as one FMA like scale_f32 (__fmaf_rn: the same rounding, flushing included).
-template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool scale_x = false>
+// pre_op (ggml_cuda_quantize_pre_op_type): x is the input of an elementwise op whose output this quantizes (fused):
+// each value is first made into what that op writes, with the op's own arithmetic:
+//   SCALE:  x_scale * x + x_bias as one FMA like scale_f32 (__fmaf_rn: the same rounding, flushing included);
+//   SWIGLU: silu(x) * x[up_offset] like unary_gated_op_kernel<op_silu> (the same silu; the product with __fmul_rn so
+//           that it is rounded on its own and never merged into an FMA with the sums below).
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, int pre_op = GGML_CUDA_QUANTIZE_PRE_NONE>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2, const int n_expert_used,
-        const float x_scale = 1.0f, const float x_bias = 0.0f) {
+        const float x_scale = 1.0f, const float x_bias = 0.0f, const int64_t up_offset = 0) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -493,12 +497,20 @@ static __global__ void quantize_mmq_q8_1(
 
     // Load 4 floats per thread and calculate max. abs. value between them:
     float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if constexpr (scale_x) {
+    if constexpr (pre_op == GGML_CUDA_QUANTIZE_PRE_SCALE) {
         if (i0 < ne00) {  // the row padding stays 0, as when the SCALE output was read
             xi.x = __fmaf_rn(x_scale, xi.x, x_bias);
             xi.y = __fmaf_rn(x_scale, xi.y, x_bias);
             xi.z = __fmaf_rn(x_scale, xi.z, x_bias);
             xi.w = __fmaf_rn(x_scale, xi.w, x_bias);
+        }
+    } else if constexpr (pre_op == GGML_CUDA_QUANTIZE_PRE_SWIGLU) {
+        if (i0 < ne00) {  // the row padding stays 0, as when the SWIGLU output was read
+            const float4 up = x4[(base_idx + up_offset + i00)/4];
+            xi.x = __fmul_rn(ggml_cuda_op_silu_single(xi.x), up.x);
+            xi.y = __fmul_rn(ggml_cuda_op_silu_single(xi.y), up.y);
+            xi.z = __fmul_rn(ggml_cuda_op_silu_single(xi.z), up.z);
+            xi.w = __fmul_rn(ggml_cuda_op_silu_single(xi.w), up.w);
         }
     }
     float amax = fabsf(xi.x);
@@ -613,29 +625,46 @@ void quantize_mmq_q8_1_cuda(
     }
 }
 
-void quantize_mmq_q8_1_scaled_cuda(
-        const float * x, void * vy, const ggml_type type_src0,
-        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
-        const float x_scale, const float x_bias, cudaStream_t stream) {
-    GGML_ASSERT(ne00 % 4 == 0);
-    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
-
+template <int pre_op>
+static void quantize_mmq_q8_1_pre_op_cuda_t(
+        const ggml_cuda_quantize_pre_op & pre, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>
-                <<<num_blocks, block_size, 0, stream>>>(x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, x_scale, x_bias);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, pre_op><<<num_blocks, block_size, 0, stream>>>(
+                pre.x, nullptr, vy, ne00, pre.s01, pre.s02, pre.s03, ne0, ne1, ne2, 0, pre.scale, pre.bias, pre.up_offset);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
-                <<<num_blocks, block_size, 0, stream>>>(x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, x_scale, x_bias);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, pre_op><<<num_blocks, block_size, 0, stream>>>(
+                pre.x, nullptr, vy, ne00, pre.s01, pre.s02, pre.s03, ne0, ne1, ne2, 0, pre.scale, pre.bias, pre.up_offset);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, true>
-                <<<num_blocks, block_size, 0, stream>>>(x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, x_scale, x_bias);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, pre_op><<<num_blocks, block_size, 0, stream>>>(
+                pre.x, nullptr, vy, ne00, pre.s01, pre.s02, pre.s03, ne0, ne1, ne2, 0, pre.scale, pre.bias, pre.up_offset);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
+void quantize_mmq_q8_1_pre_op_cuda(
+        const ggml_cuda_quantize_pre_op & pre, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    // float4 loads of the input (and of the up values)
+    GGML_ASSERT((uintptr_t) pre.x % sizeof(float4) == 0 && pre.s01 % 4 == 0 && pre.s02 % 4 == 0 && pre.s03 % 4 == 0);
+    GGML_ASSERT(pre.up_offset % 4 == 0);
+    switch (pre.type) {
+        case GGML_CUDA_QUANTIZE_PRE_SCALE:
+            quantize_mmq_q8_1_pre_op_cuda_t<GGML_CUDA_QUANTIZE_PRE_SCALE>(pre, vy, type_src0, ne00, ne0, ne1, ne2, ne3, stream);
+            break;
+        case GGML_CUDA_QUANTIZE_PRE_SWIGLU:
+            quantize_mmq_q8_1_pre_op_cuda_t<GGML_CUDA_QUANTIZE_PRE_SWIGLU>(pre, vy, type_src0, ne00, ne0, ne1, ne2, ne3, stream);
             break;
         default:
             GGML_ABORT("fatal error");
