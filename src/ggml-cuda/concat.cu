@@ -12,8 +12,16 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
                                                                              int64_t   ne02,
                                                                              int64_t   ne0,
                                                                              int64_t   ne1,
-                                                                             int64_t   ne2) {
+                                                                             int64_t   ne2,
+                                                                             int64_t   s03,
+                                                                             int64_t   s13,
+                                                                             int64_t   s3) {
     static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
+
+    // blockIdx.y: the dim-3 slice (strides s03 / s13 / s3 of src0 / src1 / dst in units of T)
+    x   += blockIdx.y * s03;
+    y   += blockIdx.y * s13;
+    dst += blockIdx.y * s3;
 
     const int64_t n = ne0 * ne1 * ne2;
 
@@ -63,20 +71,29 @@ static void concat_cont_cuda(const T * x,
                              int64_t   ne1,
                              int64_t   ne2,
                              int       dim,
-                             cudaStream_t stream) {
+                             cudaStream_t stream,
+                             int64_t   ne3 = 1,
+                             int64_t   s03 = 0,
+                             int64_t   s13 = 0,
+                             int64_t   s3  = 0) {
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
-    if (dim == 0) {
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
-        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
-        return;
+    // all ne3 slices in one launch (grid.y), in chunks of at most 65535 slices
+    for (int64_t i3 = 0; i3 < ne3; i3 += 65535) {
+        const dim3 grid(num_blocks, (unsigned int) std::min<int64_t>(ne3 - i3, 65535), 1);
+        const T * xi = x + i3*s03;
+        const T * yi = y + i3*s13;
+        T *       di = dst + i3*s3;
+        if (dim == 0) {
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
+            ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, xi, yi, di, ne00, ne01, ne02, ne0, ne1, ne2, s03, s13, s3);
+        } else if (dim == 1) {
+            concat_cont<T, 1><<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(xi, yi, di, ne00, ne01, ne02, ne0, ne1, ne2, s03, s13, s3);
+        } else {
+            concat_cont<T, 2><<<grid, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(xi, yi, di, ne00, ne01, ne02, ne0, ne1, ne2, s03, s13, s3);
+        }
     }
-    if (dim == 1) {
-        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
-        return;
-    }
-    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
 // non-contiguous kernel (slow)
@@ -157,14 +174,13 @@ static size_t concat_cont_unit_bytes(const ggml_tensor * src0, const ggml_tensor
 
 template <typename V>
 static void concat_cont_cuda_units(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
-    for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
-        concat_cont_cuda(
-                (const V *) ((const char *) src0->data + i3*src0->nb[3]),
-                (const V *) ((const char *) src1->data + i3*src1->nb[3]),
-                (V *)       ((char *)       dst->data  + i3*dst->nb[3]),
-                ggml_row_size(src0->type, src0->ne[0])/sizeof(V), src0->ne[1], src0->ne[2],
-                ggml_row_size(dst->type,  dst->ne[0])/sizeof(V),  dst->ne[1],  dst->ne[2], dim, stream);
-    }
+    // concat_cont_unit_bytes checked that every dim-3 slice base is aligned to sizeof(V), so the slice strides are
+    // whole units: one launch for all slices
+    concat_cont_cuda(
+            (const V *) src0->data, (const V *) src1->data, (V *) dst->data,
+            ggml_row_size(src0->type, src0->ne[0])/sizeof(V), src0->ne[1], src0->ne[2],
+            ggml_row_size(dst->type,  dst->ne[0])/sizeof(V),  dst->ne[1],  dst->ne[2], dim, stream,
+            dst->ne[3], src0->nb[3]/sizeof(V), src1->nb[3]/sizeof(V), dst->nb[3]/sizeof(V));
 }
 
 template <typename T>
@@ -184,14 +200,12 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         const T * src1_d = (const T *) src1->data;
         T *       dst_d  = (T *) dst->data;
 
-        for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
-            concat_cont_cuda(
-                    src0_d + i3*(src0->nb[3] / sizeof(T)),
-                    src1_d + i3*(src1->nb[3] / sizeof(T)),
-                    dst_d  + i3*( dst->nb[3] / sizeof(T)),
-                    ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
-                    ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream);
-        }
+        // one launch for all dim-3 slices
+        concat_cont_cuda(
+                src0_d, src1_d, dst_d,
+                ggml_row_size(src0->type, src0->ne[0])/sizeof(T), src0->ne[1], src0->ne[2],
+                ggml_row_size(dst->type, dst->ne[0])/sizeof(T),  dst->ne[1],  dst->ne[2], dim, stream,
+                dst->ne[3], src0->nb[3] / sizeof(T), src1->nb[3] / sizeof(T), dst->nb[3] / sizeof(T));
     } else if (dim == 3 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
         const size_t size0 = ggml_nbytes(src0);
         const size_t size1 = ggml_nbytes(src1);
