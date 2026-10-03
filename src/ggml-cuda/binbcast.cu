@@ -542,6 +542,57 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
     }
 }
 
+// GGML_OP_MUL followed by a GGML_OP_ADD of its product (e.g. a gated residual x + h * g) in one pass:
+// dst = x + a * b, a, x and dst contiguous with the same shape, b broadcast over a. The product is rounded to F32 on its
+// own before the sum (__fmul_rn / __fadd_rn: no FMA contraction under -use_fast_math), exactly like the two kernels.
+static __global__ void k_mul_add_f32(const float * a, const float * __restrict__ b, const float * x, float * dst,
+                                     const uint32_t n, const uint3 ne0, const uint3 ne1, const uint3 ne2,
+                                     const uint3 b_ne0, const uint3 b_ne1, const uint3 b_ne2, const uint3 b_ne3,
+                                     const uint32_t b_s1, const uint32_t b_s2, const uint32_t b_s3) {
+    const uint32_t stride = blockDim.x * gridDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const uint32_t r01 = fastdiv(i, ne0);
+        const uint32_t i0  = i - r01 * ne0.z;
+        const uint32_t r12 = fastdiv(r01, ne1);
+        const uint32_t i1  = r01 - r12 * ne1.z;
+        const uint32_t i3  = fastdiv(r12, ne2);
+        const uint32_t i2  = r12 - i3 * ne2.z;
+        const uint32_t ib  = fastmodulo(i0, b_ne0) + fastmodulo(i1, b_ne1) * b_s1 + fastmodulo(i2, b_ne2) * b_s2 +
+                             fastmodulo(i3, b_ne3) * b_s3;
+        dst[i] = __fadd_rn(x[i], __fmul_rn(a[i], b[ib]));
+        if (n - i <= stride) {  // protect i from overflow
+            break;
+        }
+    }
+}
+
+void ggml_cuda_op_mul_add_fused(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * b = mul->src[1];
+    const ggml_tensor * x = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32);
+    GGML_ASSERT(mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(x) && ggml_is_contiguous(add));
+    GGML_ASSERT(ggml_are_same_shape(a, add) && ggml_are_same_shape(x, add));
+    GGML_ASSERT(b->nb[0] == sizeof(float) && ggml_can_repeat(b, a));
+    GGML_ASSERT(ggml_nelements(add) < INT32_MAX);
+
+    const uint32_t n = (uint32_t) ggml_nelements(add);
+    if (n == 0) {
+        return;
+    }
+    const int block_size = 256;
+    const int64_t blocks_needed = ((int64_t) n + block_size - 1) / block_size;
+    const int64_t blocks        = blocks_needed < 65535LL * 16 ? blocks_needed : 65535LL * 16;
+    k_mul_add_f32<<<(unsigned) blocks, block_size, 0, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (const float *) x->data, (float *) add->data, n,
+        init_fastdiv_values((uint32_t) add->ne[0]), init_fastdiv_values((uint32_t) add->ne[1]), init_fastdiv_values((uint32_t) add->ne[2]),
+        init_fastdiv_values((uint32_t) b->ne[0]), init_fastdiv_values((uint32_t) b->ne[1]),
+        init_fastdiv_values((uint32_t) b->ne[2]), init_fastdiv_values((uint32_t) b->ne[3]),
+        (uint32_t) (b->nb[1] / sizeof(float)), (uint32_t) (b->nb[2] / sizeof(float)), (uint32_t) (b->nb[3] / sizeof(float)));
+}
+
 void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 

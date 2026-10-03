@@ -3980,6 +3980,41 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
     }
 
+    // MUL followed by an ADD of its product and another tensor (e.g. a gated residual x + h * g), all F32
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_ADD) {
+        const ggml_tensor * mul = cgraph->nodes[node_idx];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * a   = mul->src[0];
+        const ggml_tensor * b   = mul->src[1];
+        const ggml_tensor * x   = add->src[0] == mul ? add->src[1] : add->src[0];
+
+        if (x == mul || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // a, x and the result element by element in the same (contiguous) layout, b broadcast over them
+        if (!ggml_is_contiguous(a) || !ggml_is_contiguous(x) || !ggml_is_contiguous(add) ||
+            !ggml_are_same_shape(a, add) || !ggml_are_same_shape(x, add) ||
+            b->nb[0] != sizeof(float) || !ggml_can_repeat(b, a) || ggml_nelements(add) >= INT32_MAX) {
+            return false;
+        }
+        // Each thread reads a[i], x[i] and b's element, then writes the result's element i: the result may be exactly
+        // a or x (in place), but must not overlap b or any of them otherwise.
+        auto overlaps = [](const ggml_tensor * t0, const ggml_tensor * t1) {
+            const int64_t s0 = (int64_t) t0->data;
+            const int64_t e0 = s0 + ggml_backend_buft_get_alloc_size(t0->buffer->buft, t0);
+            const int64_t s1 = (int64_t) t1->data;
+            const int64_t e1 = s1 + ggml_backend_buft_get_alloc_size(t1->buffer->buft, t1);
+            return s0 < e1 && s1 < e0;
+        };
+        if (overlaps(add, b) ||
+            (overlaps(add, a) && a->data != add->data) ||
+            (overlaps(add, x) && x->data != add->data)) {
+            return false;
+        }
+        return true;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_UNARY
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
         const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
@@ -4263,6 +4298,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
         }
+    }
+
+    // mul + add (dst = x + a * b)
+    if (node->op == GGML_OP_MUL && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_mul_add_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
     }
 
     // multi-(add or mul)
