@@ -4375,6 +4375,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // mul_mat x2..4 with one src1 (e.g. an attention's q, k and v projections of the same tokens, built one after the
+    // other): src1 is quantized to q8_1 once and every product reads that copy, instead of each quantizing it again.
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, node)) {
+        const ggml_tensor * src1   = node->src[1];
+        const auto          layout = mmq_get_q8_1_ds_layout(node->src[0]->type);
+        int n = 1;
+        while (n < 4 && i + n < cgraph->n_nodes) {
+            const ggml_tensor * next = cgraph->nodes[i + n];
+            if (next->op != GGML_OP_MUL_MAT || next->src[1] != src1 || (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                mmq_get_q8_1_ds_layout(next->src[0]->type) != layout || !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, next)) {
+                break;
+            }
+            n++;
+        }
+        if (n > 1) {
+            size_t nbytes = 0;
+            for (int j = 0; j < n; j++) {
+                nbytes = std::max(nbytes, ggml_cuda_mul_mat_q_src1_q8_1_bytes(cgraph->nodes[i + j]->src[0], src1));
+            }
+            ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), nbytes);
+            for (int j = 0; j < n; j++) {
+                ggml_tensor * mm = cgraph->nodes[i + j];
+                ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], src1, nullptr, mm, nullptr, src1_q8_1.get(), /*src1_q8_1_filled =*/ j > 0);
+            }
+            return n - 1;
+        }
+    }
+
     // mul + add (dst = x + a * b)
     if (node->op == GGML_OP_MUL && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_mul_add_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);

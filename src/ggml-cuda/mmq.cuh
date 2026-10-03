@@ -1603,8 +1603,14 @@ struct ggml_cuda_quantize_pre_op;
 
 // src1_pre_op (optional, no ids, not the native FP4 path): src1 is the output of an elementwise op that was not run
 // (fused): its values are computed from the op's input while quantizing them (src1's shape still describes them).
+// src1_q8_1 (optional, no ids, not the native FP4 path): a device buffer of at least
+// ggml_cuda_mul_mat_q_src1_q8_1_bytes(src0, src1) bytes to quantize src1 into instead of a pool allocation, or, with
+// src1_q8_1_filled, that already holds src1 quantized for a src0 type with the same q8_1 layout (no quantization).
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_quantize_pre_op * src1_pre_op = nullptr);
+        const ggml_cuda_quantize_pre_op * src1_pre_op = nullptr, char * src1_q8_1 = nullptr, bool src1_q8_1_filled = false);
+
+// The bytes ggml_cuda_mul_mat_q (no ids, q8_1 activations) allocates for src1's quantized copy.
+size_t ggml_cuda_mul_mat_q_src1_q8_1_bytes(const ggml_tensor * src0, const ggml_tensor * src1);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
