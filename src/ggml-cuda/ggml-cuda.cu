@@ -4538,6 +4538,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // scale + im2col (2D): the IM2COL reads the SCALE's input and applies the scale itself (e.g. sd.cpp's convolution
+    // input scale against FP16 overflow); the scaled copy is never written. Not when the im2col's output overlaps x.
+    if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            j++;
+        }
+        const ggml_tensor * x = node->src[0];
+        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_IM2COL && cgraph->nodes[j]->src[1] == node &&
+            cgraph->nodes[j]->src[0] != node && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_node_has_n_uses(cgraph, i, 1) && ggml_is_contiguous(node) && ggml_is_contiguous(x) &&
+            ggml_are_same_shape(node, x)) {
+            ggml_tensor * im2col = cgraph->nodes[j];
+            const char * x0 = (const char *) x->data;
+            const char * d0 = (const char *) im2col->data;
+            const bool overlap = x0 < d0 + ggml_nbytes(im2col) && d0 < x0 + ggml_nbytes(x);
+            if (!overlap && ggml_cuda_op_im2col_scaled(*cuda_ctx, im2col, x, ggml_get_op_params_f32(node, 0),
+                                                       ggml_get_op_params_f32(node, 1))) {
+                return j - i;
+            }
+        }
+    }
+
     // scale + mul_mat: the MUL_MAT's src1 is a SCALE output used by nothing else, and the product goes through
     // ggml_cuda_mul_mat_q: the scale is applied while quantizing src1 (the same FMA per value as scale_f32), so the
     // scaled copy of src1 is never written (e.g. Linear's input scale against overflow in sd.cpp)

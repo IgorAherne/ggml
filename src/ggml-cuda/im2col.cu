@@ -58,11 +58,14 @@ static  __global__ void im2col_kernel(
 #define IM2COL_TILED_ROWS      4
 #define IM2COL_TILED_COLS    160
 
-template <typename T>
+// scaled: x is a SCALE's input and the values are its output, scale*x + bias with scale_f32's FFMA (the padding
+// stays 0, as when the SCALE's output was read)
+template <typename T, bool scaled>
 static __global__ void __launch_bounds__(IM2COL_TILED_THREADS) im2col_tiled_kernel(
         const float * x, T * dst, const int IC, const int IW, const int IH, const int OW, const int OH,
         const int KW, const int KH, const int64_t s_c, const int64_t s_n, const int TC, const int SW,
-        const int s0, const int s1, const int p0, const int p1, const int d0, const int d1) {
+        const int s0, const int s1, const int p0, const int p1, const int d0, const int d1,
+        const float x_scale, const float x_bias) {
     extern __shared__ float im2col_tile[];  // [TC][KH][SW]
 
     // grid: x = column tile, y = image * output row, z = channel chunk
@@ -92,7 +95,11 @@ static __global__ void __launch_bounds__(IM2COL_TILED_THREADS) im2col_tiled_kern
             for (int jj = 0; jj < IM2COL_TILED_COLS/WARP_SIZE; ++jj) {
                 const int j  = lane + jj*WARP_SIZE;
                 const int iw = iw0 + j;
-                v[q][jj] = row_ok && j < SW && iw >= 0 && iw < IW ? xrow[iw] : 0.0f;
+                if (row_ok && j < SW && iw >= 0 && iw < IW) {
+                    v[q][jj] = scaled ? __fmaf_rn(x_scale, xrow[iw], x_bias) : xrow[iw];
+                } else {
+                    v[q][jj] = 0.0f;
+                }
             }
         }
 #pragma unroll
@@ -131,15 +138,23 @@ static __global__ void __launch_bounds__(IM2COL_TILED_THREADS) im2col_tiled_kern
     }
 }
 
+static bool im2col_tiled_fits(int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
+        int64_t N, int s0, int s1, int d0, int d1) {
+    const int64_t SW = (IM2COL_TILED_TW - 1)*(int64_t) s0 + (KW - 1)*(int64_t) d0 + 1;
+    return KH*KW <= IM2COL_TILED_THREADS && N*OH <= 65535 && SW <= IM2COL_TILED_COLS && s0 >= 1 && s1 >= 1 && d0 >= 1 &&
+           d1 >= 1 && IW <= INT_MAX/2 && IH <= INT_MAX/2 && OW <= INT_MAX/2 && IC <= INT_MAX/2 &&
+           KH*SW*(int64_t) sizeof(float) <= IM2COL_TILED_SMEM;
+}
+
 // the tiled kernel for a 2D im2col when its tiles fit; false: use the plain kernel
-template <typename T>
+template <typename T, bool scaled = false>
 static bool im2col_tiled_cuda(const float * x, T * dst,
         int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
-        int64_t N, int64_t s_c, int64_t s_n, int s0, int s1, int p0, int p1, int d0, int d1, cudaStream_t stream) {
+        int64_t N, int64_t s_c, int64_t s_n, int s0, int s1, int p0, int p1, int d0, int d1, cudaStream_t stream,
+        float x_scale = 1.0f, float x_bias = 0.0f) {
     const int64_t KHKW = KH*KW;
     const int64_t SW   = (IM2COL_TILED_TW - 1)*(int64_t) s0 + (KW - 1)*(int64_t) d0 + 1;
-    if (KHKW > IM2COL_TILED_THREADS || N*OH > 65535 || SW > IM2COL_TILED_COLS || s0 < 1 || s1 < 1 || d0 < 1 || d1 < 1 ||
-        IW > INT_MAX/2 || IH > INT_MAX/2 || OW > INT_MAX/2 || IC > INT_MAX/2 || KH*SW*(int64_t) sizeof(float) > IM2COL_TILED_SMEM) {
+    if (!im2col_tiled_fits(IW, IH, OW, OH, KW, KH, IC, N, s0, s1, d0, d1)) {
         return false;
     }
     // channels per block: as many as the threads (one value each per position) and the shared memory allow, evened
@@ -154,8 +169,8 @@ static bool im2col_tiled_cuda(const float * x, T * dst,
     const int  threads = (int) ((IM2COL_TILED_THREADS / (TC*KHKW)) * (TC*KHKW));
     const dim3 grid((unsigned) ((OW + IM2COL_TILED_TW - 1) / IM2COL_TILED_TW), (unsigned) (N*OH), (unsigned) nchunks);
     const size_t smem = (size_t) (TC*KH*SW) * sizeof(float);
-    im2col_tiled_kernel<T><<<grid, threads, smem, stream>>>(x, dst, (int) IC, (int) IW, (int) IH, (int) OW, (int) OH,
-        (int) KW, (int) KH, s_c, s_n, (int) TC, (int) SW, s0, s1, p0, p1, d0, d1);
+    im2col_tiled_kernel<T, scaled><<<grid, threads, smem, stream>>>(x, dst, (int) IC, (int) IW, (int) IH, (int) OW, (int) OH,
+        (int) KW, (int) KH, s_c, s_n, (int) TC, (int) SW, s0, s1, p0, p1, d0, d1, x_scale, x_bias);
     return true;
 }
 
@@ -194,6 +209,45 @@ static void im2col_cuda_f32(const float * x, float * dst,
     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
 
     im2col_cuda<float>(x, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+}
+
+// the 2D IM2COL dst of a SCALE output used by nothing else: true when its tiled kernel applies, which then reads x (the
+// SCALE's contiguous input of the same shape) and applies scale*x + bias itself; the SCALE's output is never written
+bool ggml_cuda_op_im2col_scaled(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * x, float scale, float bias) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src1->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || !ggml_is_contiguous(x) ||
+        !ggml_are_same_shape(src1, x) || (dst->type != GGML_TYPE_F16 && dst->type != GGML_TYPE_F32) ||
+        ((const int32_t *) dst->op_params)[6] != 1) {
+        return false;
+    }
+    const int32_t s0 = ((const int32_t *) dst->op_params)[0];
+    const int32_t s1 = ((const int32_t *) dst->op_params)[1];
+    const int32_t p0 = ((const int32_t *) dst->op_params)[2];
+    const int32_t p1 = ((const int32_t *) dst->op_params)[3];
+    const int32_t d0 = ((const int32_t *) dst->op_params)[4];
+    const int32_t d1 = ((const int32_t *) dst->op_params)[5];
+
+    const int64_t IC = src1->ne[2];
+    const int64_t IH = src1->ne[1];
+    const int64_t IW = src1->ne[0];
+    const int64_t KH = src0->ne[1];
+    const int64_t KW = src0->ne[0];
+    const int64_t OH = dst->ne[2];
+    const int64_t OW = dst->ne[1];
+    const int64_t N  = src1->ne[3];
+    const int64_t s_c = x->nb[2] / 4;
+    const int64_t s_n = x->nb[3] / 4;
+    if (IH <= 1 || !im2col_tiled_fits(IW, IH, OW, OH, KW, KH, IC, N, s0, s1, d0, d1)) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    if (dst->type == GGML_TYPE_F16) {
+        return im2col_tiled_cuda<half, true>((const float *) x->data, (half *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, s_c, s_n,
+                                             s0, s1, p0, p1, d0, d1, stream, scale, bias);
+    }
+    return im2col_tiled_cuda<float, true>((const float *) x->data, (float *) dst->data, IW, IH, OW, OH, KW, KH, IC, N, s_c, s_n,
+                                          s0, s1, p0, p1, d0, d1, stream, scale, bias);
 }
 
 void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
