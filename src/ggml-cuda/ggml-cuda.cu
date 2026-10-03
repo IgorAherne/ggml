@@ -4247,6 +4247,110 @@ static bool ggml_cuda_can_fuse_mul_add_norm_mul(const ggml_cgraph * cgraph, int 
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// A ROPE_TABLE, or a cast (CPY of a tensor to a new type), whose output only feeds - directly or through a contiguous
+// view of all of it - the second part of the CONCAT right after it (view nodes skipped; e.g. K and V after a cached
+// prefix): the op writes its values straight into their place in the CONCAT's output and the first part is copied in
+// front of them, so the CONCAT does not copy the op's output again. Same bytes: the op's own kernel with the CONCAT's
+// strides, and a copy of the first part. Not fused when the CONCAT's output overlaps any input of the two.
+// Returns the number of nodes after i that this covers, 0 if it does not apply.
+static int ggml_cuda_try_fuse_into_concat(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    const bool is_rope = node->op == GGML_OP_ROPE_TABLE;
+    const bool is_cast = node->op == GGML_OP_CPY && node->src[1] == node && node->src[0]->type != node->type;
+    // (a cast's src[1] is the cast itself, which the graph counts as one more use)
+    if ((!is_rope && !is_cast) || ggml_node_get_use_count(cgraph, i) != (is_cast ? 2 : 1) || (node->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_is_contiguous(node) || (is_rope && !ggml_cuda_op_rope_table_supported(node))) {
+        return 0;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        j++;
+    }
+    if (j >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * c = cgraph->nodes[j];
+    if (c->op != GGML_OP_CONCAT || (c->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || c->type != node->type || !ggml_is_contiguous(c)) {
+        return 0;
+    }
+    const ggml_tensor * s0 = c->src[0];
+    const ggml_tensor * s1 = c->src[1];
+    if (s0 == nullptr || s1 == nullptr || s0 == node || s0->type != c->type || !ggml_is_contiguous(s0)) {
+        return 0;
+    }
+    if (s1 != node) {
+        // a contiguous view of all of node's output that only the CONCAT reads
+        bool ok = s1->data == node->data && ggml_is_contiguous(s1) && ggml_nelements(s1) == ggml_nelements(node) &&
+                  s1->type == node->type && (s1->view_src == node || (node->view_src != nullptr && s1->view_src == node->view_src));
+        bool found = false;
+        for (int k = i + 1; ok && k < j; ++k) {
+            if (cgraph->nodes[k] == s1) {
+                found = true;
+                ok = ggml_node_get_use_count(cgraph, k) == 1 && (s1->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+            }
+        }
+        if (!ok || !found) {
+            return 0;
+        }
+    }
+    const int dim = ggml_get_op_params_i32(c, 0);
+    if (dim < 0 || dim > 3) {
+        return 0;
+    }
+    // the second part of the CONCAT's output starts at s0->ne[dim] along dim
+    const size_t offset = (size_t) s0->ne[dim] * c->nb[dim];
+    if (is_rope) {
+        // rope_table writes [ncols, ntokens, nheads, nsamples] through its dst strides: the CONCAT along the tokens
+        if (dim != 1 || node->ne[3] != 1 || s1->ne[0] != node->ne[0] || s1->ne[1] != node->ne[1] || s1->ne[2] != node->ne[2] ||
+            s1->ne[3] != 1) {
+            return 0;
+        }
+    } else {
+        // a contiguous cast fills one contiguous block: every dim above the CONCAT's must be 1
+        for (int d = dim + 1; d < GGML_MAX_DIMS; ++d) {
+            if (c->ne[d] != 1) {
+                return 0;
+            }
+        }
+    }
+    auto overlaps = [](const ggml_tensor * p, const ggml_tensor * q) {
+        const char * p0 = (const char *) p->data;
+        const char * q0 = (const char *) q->data;
+        return p0 < q0 + ggml_nbytes(q) && q0 < p0 + ggml_nbytes(p);
+    };
+    if (overlaps(c, s0)) {
+        return 0;
+    }
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        const ggml_tensor * src = node->src[k];
+        if (src != nullptr && src != node && overlaps(c, src)) {
+            return 0;
+        }
+    }
+
+    // the first part: s0 copied into c with c's strides
+    ggml_tensor first = *s0;
+    first.data = c->data;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        first.nb[d] = c->nb[d];
+    }
+    ggml_cuda_cpy(*cuda_ctx, s0, &first);
+
+    // the second part: the op itself, writing at its place in c
+    ggml_tensor second = *node;
+    second.data = (char *) c->data + offset;
+    if (is_rope) {
+        second.nb[1] = c->nb[1];
+        second.nb[2] = c->nb[2];
+        second.nb[3] = c->nb[2]*c->ne[2];
+        ggml_cuda_op_rope_table(*cuda_ctx, &second);
+    } else {
+        second.src[1] = &second;
+        ggml_cuda_cpy(*cuda_ctx, node->src[0], &second);
+    }
+    return j - i;
+}
+
 // nodes[mm_idx] = a quantized MUL_MAT of a [gate | up] weight, then (view nodes skipped) a one-tensor SWIGLU of it
 // (gate first) and a quantized MUL_MAT of that (e.g. a transformer MLP's down projection): the first product runs with
 // the SwiGLU and the second product's q8_1 quantization in its epilogue (ggml_cuda_mul_mat_q_glu, same values), the
@@ -4443,6 +4547,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_CONT) {
         const int n_fused = ggml_cuda_try_fuse_rms_norm_cf(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
+
+    if (node->op == GGML_OP_ROPE_TABLE || node->op == GGML_OP_CPY) {
+        const int n_fused = ggml_cuda_try_fuse_into_concat(cuda_ctx, cgraph, i);
         if (n_fused > 0) {
             return n_fused;
         }
