@@ -1599,7 +1599,10 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+// src1_scale_bias (optional, no ids, not the native FP4 path): {scale, bias} of a GGML_OP_SCALE that src1 is the input
+// of; the product is then computed with that op's output (scale * src1 + bias), applied while quantizing src1.
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const float * src1_scale_bias = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
