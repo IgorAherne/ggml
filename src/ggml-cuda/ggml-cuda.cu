@@ -4334,11 +4334,13 @@ static int ggml_cuda_try_fuse_rms_norm_cf(ggml_backend_cuda_context * cuda_ctx, 
         }
     }
 
-    // optionally the SILU of the result
-    ggml_tensor * out  = d;
-    bool          silu = false;
-    int           last = jd;
-    const int     js   = next_compute(jd);
+    // optionally the SILU of the result, and then a SCALE of that (directly or through a contiguous view of all of
+    // it, e.g. the convolution input scale in sd.cpp after a reshape)
+    ggml_tensor *       out   = d;
+    bool                silu  = false;
+    const ggml_tensor * scale = nullptr;
+    int                 last  = jd;
+    const int           js    = next_compute(jd);
     if (js < cgraph->n_nodes && only_use(d, jd)) {
         ggml_tensor * s = cgraph->nodes[js];
         if (s->op == GGML_OP_UNARY && ggml_get_unary_op(s) == GGML_UNARY_OP_SILU && s->src[0] == d &&
@@ -4346,6 +4348,27 @@ static int ggml_cuda_try_fuse_rms_norm_cf(ggml_backend_cuda_context * cuda_ctx, 
             out  = s;
             silu = true;
             last = js;
+            const int jc = next_compute(js);
+            if (jc < cgraph->n_nodes && only_use(s, js)) {
+                ggml_tensor *       c  = cgraph->nodes[jc];
+                const ggml_tensor * cs = c->src[0];
+                // cs: s itself, or a view of all of s in the same layout that only c reads
+                bool cs_ok = cs == s;
+                if (!cs_ok && cs != nullptr && cs->view_src == s && cs->data == s->data && ggml_is_contiguous(cs) &&
+                    ggml_nelements(cs) == ggml_nelements(s) && cs->type == GGML_TYPE_F32) {
+                    for (int k = js + 1; k < jc; ++k) {
+                        if (cgraph->nodes[k] == cs) {
+                            cs_ok = ggml_node_get_use_count(cgraph, k) == 1 && (cs->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+                        }
+                    }
+                }
+                if (c->op == GGML_OP_SCALE && cs_ok && c->type == GGML_TYPE_F32 && ggml_is_contiguous(c) &&
+                    ggml_nelements(c) == ggml_nelements(s) && (c->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                    out   = c;
+                    scale = c;
+                    last  = jc;
+                }
+            }
         }
     }
 
@@ -4359,7 +4382,7 @@ static int ggml_cuda_try_fuse_rms_norm_cf(ggml_backend_cuda_context * cuda_ctx, 
         return 0;
     }
 
-    ggml_cuda_op_rms_norm_cf_fused(*cuda_ctx, x, g, ggml_get_op_params_f32(b, 0), out, silu);
+    ggml_cuda_op_rms_norm_cf_fused(*cuda_ctx, x, g, ggml_get_op_params_f32(b, 0), out, silu, scale);
     return last - i;
 }
 

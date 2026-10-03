@@ -367,10 +367,12 @@ static __global__ void rms_norm_f32(const float * x,
 // through block_reduce's second butterfly; scale = rsqrt(fma(sum, rcp(ncols), eps)) as rms_norm_f32's compiled code
 // computes it (sm_86 SASS: MUFU.RCP of the column count, FFMA with eps, MUFU.RSQ), then the two multiplies of the
 // separate RMS_NORM and MUL kernels and SiLU's ggml_cuda_op_silu_single. Each thread reads only its own pixel's
-// channels before writing them, so dst may be x itself (but must not overlap it otherwise).
-template <int block_size, bool do_silu>
+// channels before writing them, so dst may be x itself (but must not overlap it otherwise). do_scale (with do_silu):
+// a following SCALE too, out_scale*silu + out_bias with scale_f32's FFMA.
+template <int block_size, bool do_silu, bool do_scale>
 static __global__ void __launch_bounds__(128) rms_norm_cf_f32(const float * x, const float * __restrict__ w, float * dst,
-                                                              const int ncols, const int64_t npix, const float eps) {
+                                                              const int ncols, const int64_t npix, const float eps,
+                                                              const float out_scale, const float out_bias) {
     const int64_t p = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= npix) {
         return;
@@ -435,6 +437,9 @@ static __global__ void __launch_bounds__(128) rms_norm_cf_f32(const float * x, c
         float r = __fmul_rn(__fmul_rn(scale, x[(int64_t) col*npix]), w[col]);
         if constexpr (do_silu) {
             r = ggml_cuda_op_silu_single(r);
+        }
+        if constexpr (do_scale) {
+            r = __fmaf_rn(out_scale, r, out_bias);  // scale_f32's FFMA
         }
         dst[(int64_t) col*npix] = r;
     }
@@ -934,7 +939,7 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
-                                    const float eps, ggml_tensor * dst, const bool silu) {
+                                    const float eps, ggml_tensor * dst, const bool silu, const ggml_tensor * scale) {
     GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_is_contiguous(dst));
     const int     ncols = (int) x->ne[3];
@@ -948,18 +953,25 @@ void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_
 
     const int64_t nblocks = (npix + 127) / 128;
     GGML_ASSERT(nblocks <= INT_MAX);
+    GGML_ASSERT(scale == nullptr || silu);
+    const float sc = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+    const float sb = scale ? ggml_get_op_params_f32(scale, 1) : 0.0f;
     // the block size rms_norm_f32_cuda would launch for rows of ncols
     if (ncols < 1024) {
-        if (silu) {
-            rms_norm_cf_f32<256, true><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+        if (scale) {
+            rms_norm_cf_f32<256, true, true><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps, sc, sb);
+        } else if (silu) {
+            rms_norm_cf_f32<256, true, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps, sc, sb);
         } else {
-            rms_norm_cf_f32<256, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+            rms_norm_cf_f32<256, false, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps, sc, sb);
         }
     } else {
-        if (silu) {
-            rms_norm_cf_f32<1024, true><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+        if (scale) {
+            rms_norm_cf_f32<1024, true, true><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps, sc, sb);
+        } else if (silu) {
+            rms_norm_cf_f32<1024, true, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps, sc, sb);
         } else {
-            rms_norm_cf_f32<1024, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps);
+            rms_norm_cf_f32<1024, false, false><<<(int) nblocks, 128, 0, stream>>>(x_d, w_d, dst_d, ncols, npix, eps, sc, sb);
         }
     }
 }
