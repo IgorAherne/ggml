@@ -1,5 +1,8 @@
 #include "im2col.cuh"
 
+#include <algorithm>
+#include <climits>
+
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
 
@@ -44,12 +47,127 @@ static  __global__ void im2col_kernel(
     }
 }
 
+// The same 2D im2col in tiles, for speed (the plain kernel above does 64-bit divisions per value and reads the input
+// scattered): a block takes TW consecutive output columns of one output row and image and TC input channels, stages the
+// KH input rows they read into shared memory (rows loaded coalesced, each warp's loads issued together, 0 for the
+// padding), then writes every output position's TC*KH*KW consecutive values with consecutive threads. Each value and
+// its conversion to T are exactly the plain kernel's (a copy of x, or 0 for the padding).
+#define IM2COL_TILED_TW       64
+#define IM2COL_TILED_THREADS 256
+#define IM2COL_TILED_SMEM    (32*1024)
+#define IM2COL_TILED_ROWS      4
+#define IM2COL_TILED_COLS    160
+
+template <typename T>
+static __global__ void __launch_bounds__(IM2COL_TILED_THREADS) im2col_tiled_kernel(
+        const float * x, T * dst, const int IC, const int IW, const int IH, const int OW, const int OH,
+        const int KW, const int KH, const int64_t s_c, const int64_t s_n, const int TC, const int SW,
+        const int s0, const int s1, const int p0, const int p1, const int d0, const int d1) {
+    extern __shared__ float im2col_tile[];  // [TC][KH][SW]
+
+    // grid: x = column tile, y = image * output row, z = channel chunk
+    const int ow0 = blockIdx.x * IM2COL_TILED_TW;
+    const int n   = blockIdx.y / OH;
+    const int oh  = blockIdx.y - n*OH;
+    const int ic0 = blockIdx.z * TC;
+    const int tc  = min(TC, IC - ic0);
+    const int iw0 = ow0*s0 - p0;
+
+    // each warp loads IM2COL_TILED_ROWS tile rows (of SW <= IM2COL_TILED_COLS columns) at a time, all loads first
+    const int warp   = threadIdx.x / WARP_SIZE;
+    const int lane   = threadIdx.x % WARP_SIZE;
+    const int nwarps = blockDim.x / WARP_SIZE;  // full warps (a last partial warp does not load)
+    const int nrows  = warp < nwarps ? tc*KH : 0;
+    for (int r0 = warp*IM2COL_TILED_ROWS; r0 < nrows; r0 += nwarps*IM2COL_TILED_ROWS) {
+        float v[IM2COL_TILED_ROWS][IM2COL_TILED_COLS/WARP_SIZE];
+#pragma unroll
+        for (int q = 0; q < IM2COL_TILED_ROWS; ++q) {
+            const int  r  = r0 + q;
+            const int  c  = r / KH;
+            const int  kh = r - c*KH;
+            const int  ih = oh*s1 + kh*d1 - p1;
+            const bool row_ok = r < nrows && ih >= 0 && ih < IH;
+            const float * xrow = x + n*s_n + (ic0 + (row_ok ? c : 0))*s_c + (int64_t) (row_ok ? ih : 0)*IW;
+#pragma unroll
+            for (int jj = 0; jj < IM2COL_TILED_COLS/WARP_SIZE; ++jj) {
+                const int j  = lane + jj*WARP_SIZE;
+                const int iw = iw0 + j;
+                v[q][jj] = row_ok && j < SW && iw >= 0 && iw < IW ? xrow[iw] : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < IM2COL_TILED_ROWS; ++q) {
+#pragma unroll
+            for (int jj = 0; jj < IM2COL_TILED_COLS/WARP_SIZE; ++jj) {
+                const int j = lane + jj*WARP_SIZE;
+                if (r0 + q < nrows && j < SW) {
+                    im2col_tile[(r0 + q)*SW + j] = v[q][jj];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    const int KHKW = KH*KW;
+    const int L    = TC*KHKW;          // values of one position in a full channel chunk
+    const int ppb  = blockDim.x / L;   // positions per pass
+    if ((int) threadIdx.x >= ppb*L) {
+        return;
+    }
+    const int e  = threadIdx.x % L;
+    const int c  = e / KHKW;
+    const int k  = e - c*KHKW;
+    const int kh = k / KW;
+    const int kw = k - kh*KW;
+    if (c >= tc) {
+        return;
+    }
+    const int     tw  = min(IM2COL_TILED_TW, OW - ow0);
+    const int64_t row = (int64_t) IC*KHKW;
+    T * d = dst + ((int64_t) (n*OH + oh)*OW + ow0)*row + (int64_t) ic0*KHKW + e;
+    const float * t = im2col_tile + (c*KH + kh)*SW + kw*d0;
+    for (int pos = threadIdx.x / L; pos < tw; pos += ppb) {
+        d[pos*row] = t[pos*s0];
+    }
+}
+
+// the tiled kernel for a 2D im2col when its tiles fit; false: use the plain kernel
+template <typename T>
+static bool im2col_tiled_cuda(const float * x, T * dst,
+        int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
+        int64_t N, int64_t s_c, int64_t s_n, int s0, int s1, int p0, int p1, int d0, int d1, cudaStream_t stream) {
+    const int64_t KHKW = KH*KW;
+    const int64_t SW   = (IM2COL_TILED_TW - 1)*(int64_t) s0 + (KW - 1)*(int64_t) d0 + 1;
+    if (KHKW > IM2COL_TILED_THREADS || N*OH > 65535 || SW > IM2COL_TILED_COLS || s0 < 1 || s1 < 1 || d0 < 1 || d1 < 1 ||
+        IW > INT_MAX/2 || IH > INT_MAX/2 || OW > INT_MAX/2 || IC > INT_MAX/2 || KH*SW*(int64_t) sizeof(float) > IM2COL_TILED_SMEM) {
+        return false;
+    }
+    // channels per block: as many as the threads (one value each per position) and the shared memory allow, evened
+    // out over the chunks
+    int64_t tc_max = std::min<int64_t>(IM2COL_TILED_THREADS / KHKW, IM2COL_TILED_SMEM / (KH*SW*(int64_t) sizeof(float)));
+    tc_max = std::max<int64_t>(1, std::min<int64_t>(tc_max, IC));
+    const int64_t nchunks = (IC + tc_max - 1) / tc_max;
+    const int64_t TC      = (IC + nchunks - 1) / nchunks;
+    if (nchunks > 65535) {
+        return false;
+    }
+    const int  threads = (int) ((IM2COL_TILED_THREADS / (TC*KHKW)) * (TC*KHKW));
+    const dim3 grid((unsigned) ((OW + IM2COL_TILED_TW - 1) / IM2COL_TILED_TW), (unsigned) (N*OH), (unsigned) nchunks);
+    const size_t smem = (size_t) (TC*KH*SW) * sizeof(float);
+    im2col_tiled_kernel<T><<<grid, threads, smem, stream>>>(x, dst, (int) IC, (int) IW, (int) IH, (int) OW, (int) OH,
+        (int) KW, (int) KH, s_c, s_n, (int) TC, (int) SW, s0, s1, p0, p1, d0, d1);
+    return true;
+}
+
 // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
 template <typename T>
 static void im2col_cuda(const float * x, T* dst,
     int64_t IW, int64_t IH, int64_t OW, int64_t OH, int64_t KW, int64_t KH, int64_t IC,
     int64_t N, int64_t IC_IH_IW, int64_t IH_IW,
     int s0,int s1,int p0,int p1,int d0,int d1, cudaStream_t stream) {
+    if (IH > 1 && im2col_tiled_cuda<T>(x, dst, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream)) {
+        return;
+    }
     const int64_t IC_KH_KW = IC * KH * KW;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
