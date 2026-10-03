@@ -60,6 +60,62 @@ static __global__ void norm_f32(
     }
 }
 
+// MUL, ADD, NORM, MUL fused (e.g. a gated residual followed by the next layer norm and its modulation):
+//   xo  = x + a * b                (the residual, written: it is used again later)
+//   dst = norm(xo) * m
+// a, x, xo and dst contiguous with the same shape; b and m broadcast over it (fastmodulo, as in rms_norm_f32). The
+// residual's product and sum are rounded separately (__fmul_rn / __fadd_rn, like k_mul_add_f32 and the unfused
+// kernels); the norm part is norm_f32's code (same block size, same per-thread column order, same reduction) on those
+// values, and its result is multiplied like the NORM + MUL fusion.
+template <int block_size>
+static __global__ void mul_add_norm_mul_f32(
+        const float * a, const float * b, const float * x, float * xo, float * dst, const float * m,
+        const int ncols, const float eps,
+        const int64_t b_stride_row, const int64_t b_stride_channel, const int64_t b_stride_sample,
+        const uint3 b_ncols_packed, const uint3 b_nrows_packed, const uint3 b_nchannels_packed, const uint3 b_nsamples_packed,
+        const int64_t m_stride_row, const int64_t m_stride_channel, const int64_t m_stride_sample,
+        const uint3 m_ncols_packed, const uint3 m_nrows_packed, const uint3 m_nchannels_packed, const uint3 m_nsamples_packed) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    const int64_t offset = ((int64_t)(sample*nchannels + channel)*nrows + row)*ncols;
+    a   += offset;
+    x   += offset;
+    xo  += offset;
+    dst += offset;
+    b += fastmodulo(sample, b_nsamples_packed) * b_stride_sample + fastmodulo(channel, b_nchannels_packed) * b_stride_channel +
+         fastmodulo(row, b_nrows_packed) * b_stride_row;
+    m += fastmodulo(sample, m_nsamples_packed) * m_stride_sample + fastmodulo(channel, m_nchannels_packed) * m_stride_channel +
+         fastmodulo(row, m_nrows_packed) * m_stride_row;
+
+    float2 mean_var = make_float2(0.0f, 0.0f);
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = __fadd_rn(x[col], __fmul_rn(a[col], b[fastmodulo(col, b_ncols_packed)]));
+        xo[col] = xi;
+        mean_var.x += xi;
+        mean_var.y += xi * xi;
+    }
+
+    // sum up partial sums
+    extern __shared__ float2 s_sum2[];
+    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
+
+    const float mean = mean_var.x / ncols;
+    const float var = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = __fmul_rn((xo[col] - mean) * inv_std, m[fastmodulo(col, m_ncols_packed)]);
+    }
+}
+
 template <int block_size>
 static __global__ void group_norm_f32(const float * x, float * dst, const int group_size, const int ne_elements, const float eps) {
     // blockIdx.x: num_groups idx
@@ -538,6 +594,49 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                       norm_src->ne[0], norm_src->ne[1], norm_src->ne[2], norm_src->ne[3], s01, s02, s03,
                       mul_s01, mul_s02, mul_s03, mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
                       eps, ctx.stream());
+}
+
+void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * mul1, ggml_tensor * add,
+                                         ggml_tensor * norm, ggml_tensor * mul2) {
+    const ggml_tensor * a = mul1->src[0];
+    const ggml_tensor * b = mul1->src[1];
+    const ggml_tensor * x = add->src[0] == mul1 ? add->src[1] : add->src[0];
+    const ggml_tensor * m = mul2->src[0] == norm ? mul2->src[1] : mul2->src[0];
+    GGML_ASSERT(norm->src[0] == add);
+
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    GGML_ASSERT(b->nb[0] == sizeof(float) && m->nb[0] == sizeof(float));
+    const int64_t ncols = add->ne[0], nrows = add->ne[1], nchannels = add->ne[2], nsamples = add->ne[3];
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+
+    const float * a_d = (const float *) a->data;
+    const float * b_d = (const float *) b->data;
+    const float * x_d = (const float *) x->data;
+    const float * m_d = (const float *) m->data;
+    float * xo_d  = (float *) add->data;
+    float * dst_d = (float *) mul2->data;
+
+    const int64_t bs1 = b->nb[1] / sizeof(float), bs2 = b->nb[2] / sizeof(float), bs3 = b->nb[3] / sizeof(float);
+    const int64_t ms1 = m->nb[1] / sizeof(float), ms2 = m->nb[2] / sizeof(float), ms3 = m->nb[3] / sizeof(float);
+    const uint3 b0 = init_fastdiv_values(b->ne[0]), b1 = init_fastdiv_values(b->ne[1]);
+    const uint3 b2 = init_fastdiv_values(b->ne[2]), b3 = init_fastdiv_values(b->ne[3]);
+    const uint3 m0 = init_fastdiv_values(m->ne[0]), m1 = init_fastdiv_values(m->ne[1]);
+    const uint3 m2 = init_fastdiv_values(m->ne[2]), m3 = init_fastdiv_values(m->ne[3]);
+
+    cudaStream_t stream = ctx.stream();
+    // the block sizes of norm_f32_cuda, so the reduction runs in the same order
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        mul_add_norm_mul_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(a_d, b_d, x_d, xo_d, dst_d, m_d, ncols, eps,
+            bs1, bs2, bs3, b0, b1, b2, b3, ms1, ms2, ms3, m0, m1, m2, m3);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        mul_add_norm_mul_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
+            a_d, b_d, x_d, xo_d, dst_d, m_d, ncols, eps, bs1, bs2, bs3, b0, b1, b2, b3, ms1, ms2, ms3, m0, m1, m2, m3);
+    }
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

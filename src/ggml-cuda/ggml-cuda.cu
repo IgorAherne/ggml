@@ -4157,6 +4157,57 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// { MUL, ADD, NORM, MUL } at node_idx for ggml_cuda_op_mul_add_norm_mul_fused: mul1 = a * b, add = x + mul1 (kept: it
+// may have other uses), norm = NORM(add), mul2 = norm * m; all F32; a, x, add and mul2 contiguous with one shape; b and
+// m with contiguous rows, repeatable onto it. The kernel reads a, x and b of a row, writes add's row, then reads it
+// back and writes mul2's: add and mul2 may each be exactly a or x (in place), nothing else may overlap.
+static bool ggml_cuda_can_fuse_mul_add_norm_mul(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_op ops[4] = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_NORM, GGML_OP_MUL };
+    const int outputs[2] = { node_idx + 1, node_idx + 3 };
+    if (node_idx + 4 > cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, node_idx, 4, ops, outputs, 2)) {
+        return false;
+    }
+    const ggml_tensor * mul1 = cgraph->nodes[node_idx];
+    const ggml_tensor * add  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * norm = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * mul2 = cgraph->nodes[node_idx + 3];
+    if ((add->src[0] != mul1 && add->src[1] != mul1) || norm->src[0] != add || (mul2->src[0] != norm && mul2->src[1] != norm)) {
+        return false;
+    }
+    const ggml_tensor * a = mul1->src[0];
+    const ggml_tensor * b = mul1->src[1];
+    const ggml_tensor * x = add->src[0] == mul1 ? add->src[1] : add->src[0];
+    const ggml_tensor * m = mul2->src[0] == norm ? mul2->src[1] : mul2->src[0];
+    if (x == mul1 || m == norm) {
+        return false;
+    }
+    for (const ggml_tensor * t : { a, b, x, m, mul1, add, norm, mul2 }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(x) || !ggml_is_contiguous(add) || !ggml_is_contiguous(mul2) ||
+        !ggml_are_same_shape(a, add) || !ggml_are_same_shape(x, add) || !ggml_are_same_shape(mul2, add) ||
+        b->nb[0] != sizeof(float) || m->nb[0] != sizeof(float) || !ggml_can_repeat(b, a) || !ggml_can_repeat(m, add) ||
+        add->ne[1] > 65535 || add->ne[2] > 65535 || add->ne[3] > 65535 || add->ne[0] > INT32_MAX) {
+        return false;
+    }
+    auto overlaps = [](const ggml_tensor * t0, const ggml_tensor * t1) {
+        const int64_t s0 = (int64_t) t0->data;
+        const int64_t e0 = s0 + ggml_backend_buft_get_alloc_size(t0->buffer->buft, t0);
+        const int64_t s1 = (int64_t) t1->data;
+        const int64_t e1 = s1 + ggml_backend_buft_get_alloc_size(t1->buffer->buft, t1);
+        return s0 < e1 && s1 < e0;
+    };
+    for (const ggml_tensor * out : { add, mul2 }) {
+        if (overlaps(out, b) || overlaps(out, m) ||
+            (overlaps(out, a) && a->data != out->data) || (overlaps(out, x) && x->data != out->data)) {
+            return false;
+        }
+    }
+    return !overlaps(add, mul2);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4401,6 +4452,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             return n - 1;
         }
+    }
+
+    // mul + add + norm + mul (a gated residual, then the layer norm of its result and that norm's modulation)
+    if (node->op == GGML_OP_MUL && ggml_cuda_can_fuse_mul_add_norm_mul(cgraph, i)) {
+        ggml_cuda_op_mul_add_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     // mul + add (dst = x + a * b)
