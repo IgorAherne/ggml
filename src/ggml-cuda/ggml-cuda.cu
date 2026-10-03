@@ -4584,6 +4584,75 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // scale + add (+ add): a SCALE whose output only feeds an ADD (in place or not) of a repeatable F32 tensor, e.g. a
+    // convolution's output scale and bias in sd.cpp, and when that sum only feeds another ADD of a same-shape tensor
+    // (directly or through a contiguous view of all of it, e.g. a residual), that one too; one kernel, same arithmetic
+    if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(node) && ggml_is_contiguous(node->src[0]) && ggml_are_same_shape(node, node->src[0]) &&
+        ggml_nelements(node) < INT32_MAX && ggml_node_has_n_uses(cgraph, i, 1)) {
+        auto next_compute = [&](int j) {
+            for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+            }
+            return j;
+        };
+        auto overlaps = [](const ggml_tensor * p, const ggml_tensor * q) {
+            const char * p0 = (const char *) p->data;
+            const char * q0 = (const char *) q->data;
+            return p0 < q0 + ggml_nbytes(q) && q0 < p0 + ggml_nbytes(p);
+        };
+        const ggml_tensor * x  = node->src[0];
+        const int           ja = next_compute(i);
+        ggml_tensor *       a  = ja < cgraph->n_nodes ? cgraph->nodes[ja] : nullptr;
+        if (a && a->op == GGML_OP_ADD && (a->flags & GGML_TENSOR_FLAG_COMPUTE) && (a->src[0] == node) != (a->src[1] == node) &&
+            a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_are_same_shape(a, node)) {
+            const bool          y_first = a->src[1] == node;
+            const ggml_tensor * y       = y_first ? a->src[0] : a->src[1];
+            if (y->type == GGML_TYPE_F32 && y->nb[0] == sizeof(float) && ggml_can_repeat(y, a) &&
+                y->nb[1] % sizeof(float) == 0 && y->nb[2] % sizeof(float) == 0 && y->nb[3] % sizeof(float) == 0 &&
+                ggml_nbytes(y) < (size_t) INT32_MAX * sizeof(float)) {
+                // the second ADD: reads a (or a contiguous view of all of it that only it reads) and a same-shape z
+                ggml_tensor * out  = a;
+                const ggml_tensor * z = nullptr;
+                bool z_first = false;
+                int  last    = ja;
+                const int jb = next_compute(ja);
+                if (jb < cgraph->n_nodes && ggml_node_get_use_count(cgraph, ja) == 1 && (a->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                    ggml_tensor * b = cgraph->nodes[jb];
+                    if (b->op == GGML_OP_ADD && (b->flags & GGML_TENSOR_FLAG_COMPUTE) && b->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(b) && ggml_nelements(b) == ggml_nelements(a)) {
+                        for (int side = 0; side < 2 && z == nullptr; ++side) {
+                            const ggml_tensor * av = b->src[side];
+                            const ggml_tensor * zz = b->src[1 - side];
+                            bool av_ok = av == a;
+                            if (!av_ok && av != nullptr && av->data == a->data && ggml_is_contiguous(av) &&
+                                ggml_nelements(av) == ggml_nelements(a) && av->type == GGML_TYPE_F32 &&
+                                (av->view_src == a || (a->view_src != nullptr && av->view_src == a->view_src))) {
+                                for (int k = ja + 1; k < jb; ++k) {
+                                    if (cgraph->nodes[k] == av) {
+                                        av_ok = ggml_node_get_use_count(cgraph, k) == 1 && (av->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+                                    }
+                                }
+                            }
+                            if (av_ok && zz != nullptr && zz != av && zz->type == GGML_TYPE_F32 && ggml_is_contiguous(zz) &&
+                                ggml_are_same_shape(zz, b) && ggml_are_same_shape(av, b) &&
+                                (!overlaps(b, zz) || b->data == zz->data) && (!overlaps(b, x) || b->data == x->data) &&
+                                !overlaps(b, y)) {
+                                z       = zz;
+                                z_first = side == 1;
+                                out     = b;
+                                last    = jb;
+                            }
+                        }
+                    }
+                }
+                if ((!overlaps(out, x) || out->data == x->data) && !overlaps(out, y)) {
+                    ggml_cuda_op_scale_add_fused(*cuda_ctx, node, y, y_first, z, z_first, out);
+                    return last - i;
+                }
+            }
+        }
+    }
+
     // scale + mul_mat: the MUL_MAT's src1 is a SCALE output used by nothing else, and the product goes through
     // ggml_cuda_mul_mat_q: the scale is applied while quantizing src1 (the same FMA per value as scale_f32), so the
     // scaled copy of src1 is never written (e.g. Linear's input scale against overflow in sd.cpp)
