@@ -1,9 +1,94 @@
 #include "norm.cuh"
+#include "mmq.cuh"
 #include <cstdint>
+
+// norm_f32's statistics as they come out of its compiled code (sm_86 SASS: MUFU.RCP of ncols, mean = sum * rcp,
+// var = fma(sum_sq, rcp, -(mean * mean)), MUFU.RSQ(var + eps)), pinned with explicit roundings: ptxas may contract the
+// plain source differently in a kernel with different code around it (it did, for the q8_1 variants below).
+static __device__ __forceinline__ void norm_stats_pinned(const float2 mean_var, const int ncols, const float eps,
+                                                         float & mean, float & inv_std) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    float rcp;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"((float) ncols));
+    mean = __fmul_rn(mean_var.x, rcp);
+    inv_std = rsqrtf(__fadd_rn(__fmaf_rn(mean_var.y, rcp, -__fmul_rn(mean, mean)), eps));
+#else
+    mean = mean_var.x / ncols;
+    inv_std = rsqrtf(mean_var.y / ncols - mean * mean + eps);
+#endif
+}
+
+// A fused norm's output for a quantized MUL_MAT (no padding, one channel and sample): the four values of columns
+// 4*group .. 4*group+3 of row `row` (of nrows) written as quantize_mmq_q8_1 writes them, with its exact arithmetic
+// (lanes 8k .. 8k+7 of a warp hold one 32-value block, as there). Every lane of the warp must call it.
+template <int qlayout>
+static __device__ __forceinline__ void norm_store_q8_1(const float4 xi, void * vq, const int64_t group, const int row, const int nrows) {
+    constexpr mmq_q8_1_ds_layout ds_layout = (mmq_q8_1_ds_layout) qlayout;
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vq;
+    const int64_t i0      = 4*group;
+    const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
+    const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
+
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+
+    // Exchange max. abs. value between vals_per_scale/4 threads.
+#pragma unroll
+    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+
+        // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    const int64_t ib = k_block*nrows + row;
+
+    // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[iqs/4] = q;
+
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs/16] = sum;
+            if (iqs % 64 == 0) {
+                y[ib].d2s6[iqs/64] = d;
+            }
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32]  = d;
+        }
+    }
+}
 
 // do_multiply: NORM followed by a MUL with a broadcast operand (fused): dst = norm(x) * mul, the norm's value rounded
 // to F32 first and then multiplied (__fmul_rn), the same results as the two separate kernels.
-template <int block_size, bool do_multiply = false>
+// qlayout >= 0 (an mmq_q8_1_ds_layout; with do_multiply, ncols % 128 == 0, one channel and sample): the product goes
+// to vq as the q8_1 data quantize_mmq_q8_1 would make of it for the MUL_MATs that read it, instead of to dst.
+template <int block_size, bool do_multiply = false, int qlayout = -1>
 static __global__ void norm_f32(
         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
         const int64_t stride_sample, const float eps,
@@ -14,7 +99,9 @@ static __global__ void norm_f32(
         const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
         const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
         const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
-        const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0)) {
+        const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
+        void *        vq                   = nullptr) {
+    static_assert(qlayout < 0 || do_multiply, "quantized output only for the fused multiply");
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -50,6 +137,23 @@ static __global__ void norm_f32(
     const float var = mean_var.y / ncols - mean * mean;
     const float inv_std = rsqrtf(var + eps);
 
+    if constexpr (qlayout >= 0) {
+        // the statistics and the normalization pinned to norm_f32's compiled arithmetic (sub, mul, then the multiply)
+        float mean_p, inv_std_p;
+        norm_stats_pinned(mean_var, ncols, eps, mean_p, inv_std_p);
+        // four consecutive columns per thread here (the sums above keep norm_f32's own column order)
+        for (int group = tid; group < ncols/4; group += block_size) {
+            const int c = 4*group;
+            float4 xi;
+            xi.x = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(x[c + 0], mean_p)), mul[fastmodulo(c + 0, mul_ncols_packed)]);
+            xi.y = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(x[c + 1], mean_p)), mul[fastmodulo(c + 1, mul_ncols_packed)]);
+            xi.z = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(x[c + 2], mean_p)), mul[fastmodulo(c + 2, mul_ncols_packed)]);
+            xi.w = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(x[c + 3], mean_p)), mul[fastmodulo(c + 3, mul_ncols_packed)]);
+            norm_store_q8_1<qlayout>(xi, vq, group, row, nrows);
+        }
+        return;
+    }
+
     for (int col = tid; col < ncols; col += block_size) {
         if constexpr (do_multiply) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
@@ -67,14 +171,16 @@ static __global__ void norm_f32(
 // residual's product and sum are rounded separately (__fmul_rn / __fadd_rn, like k_mul_add_f32 and the unfused
 // kernels); the norm part is norm_f32's code (same block size, same per-thread column order, same reduction) on those
 // values, and its result is multiplied like the NORM + MUL fusion.
-template <int block_size>
+// qlayout >= 0: dst as q8_1 data for quantized MUL_MATs, as in norm_f32.
+template <int block_size, int qlayout = -1>
 static __global__ void mul_add_norm_mul_f32(
         const float * a, const float * b, const float * x, float * xo, float * dst, const float * m,
         const int ncols, const float eps,
         const int64_t b_stride_row, const int64_t b_stride_channel, const int64_t b_stride_sample,
         const uint3 b_ncols_packed, const uint3 b_nrows_packed, const uint3 b_nchannels_packed, const uint3 b_nsamples_packed,
         const int64_t m_stride_row, const int64_t m_stride_channel, const int64_t m_stride_sample,
-        const uint3 m_ncols_packed, const uint3 m_nrows_packed, const uint3 m_nchannels_packed, const uint3 m_nsamples_packed) {
+        const uint3 m_ncols_packed, const uint3 m_nrows_packed, const uint3 m_nchannels_packed, const uint3 m_nsamples_packed,
+        void * vq = nullptr) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -110,6 +216,24 @@ static __global__ void mul_add_norm_mul_f32(
     const float mean = mean_var.x / ncols;
     const float var = mean_var.y / ncols - mean * mean;
     const float inv_std = rsqrtf(var + eps);
+
+    if constexpr (qlayout >= 0) {
+        // the statistics and the normalization pinned to norm_f32's compiled arithmetic, as in norm_f32's q8_1 variant
+        float mean_p, inv_std_p;
+        norm_stats_pinned(mean_var, ncols, eps, mean_p, inv_std_p);
+        // four consecutive columns per thread: other threads wrote some of them to xo, so wait for all writes first
+        __syncthreads();
+        for (int group = tid; group < ncols/4; group += block_size) {
+            const int c = 4*group;
+            float4 xi;
+            xi.x = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 0], mean_p)), m[fastmodulo(c + 0, m_ncols_packed)]);
+            xi.y = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 1], mean_p)), m[fastmodulo(c + 1, m_ncols_packed)]);
+            xi.z = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 2], mean_p)), m[fastmodulo(c + 2, m_ncols_packed)]);
+            xi.w = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 3], mean_p)), m[fastmodulo(c + 3, m_ncols_packed)]);
+            norm_store_q8_1<qlayout>(xi, vq, group, row, nrows);
+        }
+        return;
+    }
 
     for (int col = tid; col < ncols; col += block_size) {
         dst[col] = __fmul_rn((xo[col] - mean) * inv_std, m[fastmodulo(col, m_ncols_packed)]);
@@ -374,12 +498,34 @@ static void norm_mul_f32_cuda(
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const uint32_t mul_ncols, const uint32_t mul_nrows, const uint32_t mul_nchannels, const uint32_t mul_nsamples,
-        const float eps, cudaStream_t stream) {
+        const float eps, cudaStream_t stream, void * vq = nullptr, const int qlayout = -1) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
     const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+    if (vq != nullptr) {
+        GGML_ASSERT(ncols % QK8_1_MMQ == 0 && nchannels == 1 && nsamples == 1);
+#define NORM_Q8_1_LAUNCH(bs, ql) \
+        norm_f32<bs, true, ql><<<blocks_num, dim3(bs, 1, 1), bs > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, \
+            stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel, mul_stride_sample, \
+            mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, vq)
+        switch (qlayout) {
+            case MMQ_Q8_1_DS_LAYOUT_D4:
+                if (ncols < 1024) { NORM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_D4); } else { NORM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_D4); }
+                break;
+            case MMQ_Q8_1_DS_LAYOUT_DS4:
+                if (ncols < 1024) { NORM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_DS4); } else { NORM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_DS4); }
+                break;
+            case MMQ_Q8_1_DS_LAYOUT_D2S6:
+                if (ncols < 1024) { NORM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_D2S6); } else { NORM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_D2S6); }
+                break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+#undef NORM_Q8_1_LAUNCH
+        return;
+    }
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
         norm_f32<WARP_SIZE, true><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
@@ -557,7 +703,7 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
-void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, void * q8_1, int q8_1_layout) {
     const ggml_tensor * norm_src = dst->src[0];
     float eps = 0.0f;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -593,11 +739,11 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
     norm_mul_f32_cuda((const float *) norm_src->data, (const float *) mul_src->data, (float *) mul_tensor->data,
                       norm_src->ne[0], norm_src->ne[1], norm_src->ne[2], norm_src->ne[3], s01, s02, s03,
                       mul_s01, mul_s02, mul_s03, mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
-                      eps, ctx.stream());
+                      eps, ctx.stream(), q8_1, q8_1_layout);
 }
 
 void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * mul1, ggml_tensor * add,
-                                         ggml_tensor * norm, ggml_tensor * mul2) {
+                                         ggml_tensor * norm, ggml_tensor * mul2, void * q8_1, int q8_1_layout) {
     const ggml_tensor * a = mul1->src[0];
     const ggml_tensor * b = mul1->src[1];
     const ggml_tensor * x = add->src[0] == mul1 ? add->src[1] : add->src[0];
@@ -628,6 +774,27 @@ void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_t
 
     cudaStream_t stream = ctx.stream();
     // the block sizes of norm_f32_cuda, so the reduction runs in the same order
+    if (q8_1 != nullptr) {
+        GGML_ASSERT(ncols % QK8_1_MMQ == 0 && nchannels == 1 && nsamples == 1);
+#define MANM_Q8_1_LAUNCH(bs, ql) \
+        mul_add_norm_mul_f32<bs, ql><<<blocks_num, dim3(bs, 1, 1), bs > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>( \
+            a_d, b_d, x_d, xo_d, dst_d, m_d, ncols, eps, bs1, bs2, bs3, b0, b1, b2, b3, ms1, ms2, ms3, m0, m1, m2, m3, q8_1)
+        switch (q8_1_layout) {
+            case MMQ_Q8_1_DS_LAYOUT_D4:
+                if (ncols < 1024) { MANM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_D4); } else { MANM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_D4); }
+                break;
+            case MMQ_Q8_1_DS_LAYOUT_DS4:
+                if (ncols < 1024) { MANM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_DS4); } else { MANM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_DS4); }
+                break;
+            case MMQ_Q8_1_DS_LAYOUT_D2S6:
+                if (ncols < 1024) { MANM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_D2S6); } else { MANM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_D2S6); }
+                break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+#undef MANM_Q8_1_LAUNCH
+        return;
+    }
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
         mul_add_norm_mul_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(a_d, b_d, x_d, xo_d, dst_d, m_d, ncols, eps,

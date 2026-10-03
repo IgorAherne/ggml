@@ -4157,6 +4157,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// The number of MUL_MAT nodes right after node t_idx (1..4) that use its output as src1 and are all of its uses, all
+// through ggml_cuda_mul_mat_q with q8_1 activations of one layout (returned in layout), when t (F32, contiguous,
+// ne0 % MATRIX_ROW_PADDING == 0, one channel and sample, not a graph output) can be handed to them as q8_1 data only;
+// else 0.
+static int ggml_cuda_quantized_consumers(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int t_idx, int & layout) {
+    const ggml_tensor * t = cgraph->nodes[t_idx];
+    // (rows a multiple of MATRIX_ROW_PADDING: mul_mat_q quantizes padded rows, the fused kernels write no padding)
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[0] % MATRIX_ROW_PADDING != 0 || t->ne[2] != 1 || t->ne[3] != 1 ||
+        (t->flags & GGML_TENSOR_FLAG_OUTPUT) || t->view_src != nullptr) {
+        return 0;
+    }
+    int n = 0;
+    while (n < 4 && t_idx + 1 + n < cgraph->n_nodes) {
+        const ggml_tensor * mm = cgraph->nodes[t_idx + 1 + n];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != t || mm->src[0] == t || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            !ggml_cuda_mul_mat_uses_mmq_q8_1(ctx, mm)) {
+            break;
+        }
+        const int l = mmq_get_q8_1_ds_layout(mm->src[0]->type);
+        if (n > 0 && l != layout) {
+            break;
+        }
+        layout = l;
+        n++;
+    }
+    return n > 0 && ggml_node_get_use_count(cgraph, t_idx) == n ? n : 0;
+}
+
+// The q8_1 buffer size for the n MUL_MATs after node t_idx (the largest any of them would allocate).
+static size_t ggml_cuda_consumers_q8_1_bytes(const ggml_cgraph * cgraph, int t_idx, int n) {
+    size_t nbytes = 0;
+    for (int j = 0; j < n; j++) {
+        const ggml_tensor * mm = cgraph->nodes[t_idx + 1 + j];
+        nbytes = std::max(nbytes, ggml_cuda_mul_mat_q_src1_q8_1_bytes(mm->src[0], mm->src[1]));
+    }
+    return nbytes;
+}
+
 // { MUL, ADD, NORM, MUL } at node_idx for ggml_cuda_op_mul_add_norm_mul_fused: mul1 = a * b, add = x + mul1 (kept: it
 // may have other uses), norm = NORM(add), mul2 = norm * m; all F32; a, x, add and mul2 contiguous with one shape; b and
 // m with contiguous rows, repeatable onto it. The kernel reads a, x and b of a row, writes add's row, then reads it
@@ -4454,8 +4492,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // mul + add + norm + mul (a gated residual, then the layer norm of its result and that norm's modulation)
+    // mul + add + norm + mul (a gated residual, then the layer norm of its result and that norm's modulation), and
+    // when the modulated result only feeds quantized MUL_MATs right after it: their q8_1 input written directly
     if (node->op == GGML_OP_MUL && ggml_cuda_can_fuse_mul_add_norm_mul(cgraph, i)) {
+        int layout = -1;
+        const int n_mm = ggml_cuda_quantized_consumers(*cuda_ctx, cgraph, i + 3, layout);
+        if (n_mm > 0) {
+            ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), ggml_cuda_consumers_q8_1_bytes(cgraph, i + 3, n_mm));
+            ggml_cuda_op_mul_add_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+                                                src1_q8_1.get(), layout);
+            for (int j = 0; j < n_mm; j++) {
+                ggml_tensor * mm = cgraph->nodes[i + 4 + j];
+                ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, src1_q8_1.get(), /*src1_q8_1_filled =*/ true);
+            }
+            return 3 + n_mm;
+        }
         ggml_cuda_op_mul_add_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
         return 3;
     }
@@ -5023,6 +5074,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+        int layout = -1;
+        const int n_mm = ggml_cuda_quantized_consumers(*cuda_ctx, cgraph, i + 1, layout);
+        if (n_mm > 0) {  // the product's q8_1 data for the quantized MUL_MATs right after it, see above
+            ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), ggml_cuda_consumers_q8_1_bytes(cgraph, i + 1, n_mm));
+            ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], src1_q8_1.get(), layout);
+            for (int j = 0; j < n_mm; j++) {
+                ggml_tensor * mm = cgraph->nodes[i + 2 + j];
+                ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, src1_q8_1.get(), /*src1_q8_1_filled =*/ true);
+            }
+            return 1 + n_mm;
+        }
         ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }

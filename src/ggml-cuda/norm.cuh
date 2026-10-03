@@ -2,12 +2,16 @@
 
 void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-// NORM (dst) followed by mul_tensor = dst * (broadcast F32 operand) in one kernel, written to mul_tensor
-void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
+// NORM (dst) followed by mul_tensor = dst * (broadcast F32 operand) in one kernel, written to mul_tensor; with q8_1,
+// written instead as the q8_1 data (mmq_q8_1_ds_layout q8_1_layout) quantize_mmq_q8_1 would make of mul_tensor
+// (requires ne0 % 128 == 0 and ne2 == ne3 == 1)
+void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+                             void * q8_1 = nullptr, int q8_1_layout = -1);
 
-// add = x + mul1 (mul1 = a * b) and mul2 = norm(add) * m in one kernel; writes add and mul2
+// add = x + mul1 (mul1 = a * b) and mul2 = norm(add) * m in one kernel; writes add and mul2 (or, with q8_1, mul2's
+// q8_1 data as above)
 void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * mul1, ggml_tensor * add,
-                                         ggml_tensor * norm, ggml_tensor * mul2);
+                                         ggml_tensor * norm, ggml_tensor * mul2, void * q8_1 = nullptr, int q8_1_layout = -1);
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
