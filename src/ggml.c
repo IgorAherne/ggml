@@ -5642,8 +5642,9 @@ struct ggml_tensor * ggml_sage_attn(
         struct ggml_tensor  * v,
         float                 scale,
         enum ggml_sage_attn_mode mode) {
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F16);
-    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v));
+    GGML_ASSERT((q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16) && (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
+                v->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(k) && v->nb[0] == ggml_type_size(GGML_TYPE_F16));
     GGML_ASSERT(q->ne[0] == k->ne[0] && ggml_are_same_shape(k, v));
     GGML_ASSERT(q->ne[2] % k->ne[2] == 0 && q->ne[3] == k->ne[3]);
     GGML_ASSERT(isfinite(scale) && scale > 0.0f);

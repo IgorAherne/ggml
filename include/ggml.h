@@ -2521,7 +2521,8 @@ extern "C" {
         GGML_SAGE_ATTN_2_PLUS_PLUS,
     };
 
-    // Q/K: contiguous F32 [D, tokens, heads, batch], V: contiguous F16 in the same layout.
+    // Q/K: contiguous F32 or F16 [D, tokens, heads, batch], V: F16 in the same shape, contiguous or any view whose rows
+    // (D values) are contiguous (e.g. a permuted [D, heads, tokens] tensor; CUDA: 16-byte aligned strides).
     // Output: F32 [D, query heads, query tokens, batch]. CUDA-only, unmasked inference.
     GGML_API struct ggml_tensor * ggml_sage_attn(
             struct ggml_context * ctx,

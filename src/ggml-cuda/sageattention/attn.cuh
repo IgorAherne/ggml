@@ -36,9 +36,79 @@ namespace sageattention {
 #define MMA_SV_N 16
 #define MMA_SV_K 16
 
+// ---- Spellcast3D (github.com/IgorAherne/SageAttention, README-round-j.md): the tuned launch of the per-warp int8 /
+// fp16 + fp32 head-128 kernel, measured -13 % a call on an RTX 3060 against the same kernel without it, with the same
+// bits (the same arithmetic instructions on the same values in the same order):
+//  - two blocks (16 warps) an SM instead of one: __launch_bounds__(256, 2), at most 128 registers a thread, so one
+//    block's softmax overlaps the other's MMAs;
+//  - the P.V step one 16-column output tile at a time (sage_tuned_sv: the tile's 16-key fp16 MMAs, then its fp32
+//    add) instead of all eight tiles' fp16 buffers at once: the same MMA chains, 32 fewer live registers.
+// `tuned` = false compiles the kernel exactly as before: __launch_bounds__(0, 0) emits no directive.
+template <bool tuned, uint32_t threads>
+struct sage_tuned_bounds
+{
+  static constexpr uint32_t max_threads = tuned ? threads : 0;
+  static constexpr uint32_t min_blocks = tuned ? 2 : 0;
+};
+
+// compute_fp16_sv_permuted_inst_buf (attn_utils.cuh) with its loops swapped: `group` output column tiles (fv) at a
+// time, each accumulating its 16-key steps (fk) in fp16 and then added into the fp32 accumulator. Every fv chain is
+// the same chain of mma instructions on the same data in the same order (fk 0 initialises, 1.. accumulate) followed by
+// the same fp32 adds, so the values are the same. The shared-memory offsets are the original walk in closed form
+// (k128B swizzle, 16 x 16-byte units a row): offset(fk, fv) = ((o + (fv / 4) * 8) ^ (2 * (fv % 4))) + fk * 16 *
+// stride; offset_V is left as it came, as the original leaves it.
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, SwizzleMode swizzle_mode, uint32_t stride, uint32_t group>
+__device__ __forceinline__ void sage_tuned_sv(const smem_t<swizzle_mode, stride> &smem_V, uint32_t RS_f16[][num_tiles_k][4], float RO[][num_tiles_v][8], const uint32_t offset_V)
+{
+  static_assert(swizzle_mode == SwizzleMode::k128B && stride == 16 && num_tiles_v == 8 && num_tiles_v % group == 0,
+                "written for head 128 fp16 V (k128B swizzle, 16 units a row)");
+#pragma unroll
+  for (uint32_t fv0 = 0; fv0 < num_tiles_v; fv0 += group)
+  {
+    uint32_t buf[group][num_tiles_q][4];
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < group; j++)
+      {
+        const uint32_t fv = fv0 + j;
+        uint32_t RV[4];
+        smem_V.ldmatrix_m8n8x4_trans(((offset_V + (fv / 4) * 8) ^ (2 * (fv % 4))) + fk * 16 * stride, RV);
+#pragma unroll
+        for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+        {
+          if (fk == 0)
+            mma::mma_sync_m16n16k16_row_col_f16f16f16<mma::MMAMode::kInit>(buf[j][fq], RS_f16[fq][fk], RV);
+          else
+            mma::mma_sync_m16n16k16_row_col_f16f16f16<mma::MMAMode::kInplaceUpdate>(buf[j][fq], RS_f16[fq][fk], RV);
+        }
+      }
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < group; j++)
+    {
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        const uint32_t fv = fv0 + j;
+        RO[fq][fv][0] += __half2float(((half2*)buf[j][fq])[0].x);
+        RO[fq][fv][1] += __half2float(((half2*)buf[j][fq])[0].y);
+        RO[fq][fv][2] += __half2float(((half2*)buf[j][fq])[1].x);
+        RO[fq][fv][3] += __half2float(((half2*)buf[j][fq])[1].y);
+        RO[fq][fv][4] += __half2float(((half2*)buf[j][fq])[2].x);
+        RO[fq][fv][5] += __half2float(((half2*)buf[j][fq])[2].y);
+        RO[fq][fv][6] += __half2float(((half2*)buf[j][fq])[3].x);
+        RO[fq][fv][7] += __half2float(((half2*)buf[j][fq])[3].y);
+      }
+    }
+  }
+}
+// ---- end of the Spellcast3D helpers
+
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
-        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_mean=false>
-__global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
+        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_mean=false, bool tuned = false>
+__global__ void __launch_bounds__((sage_tuned_bounds<tuned, 32 * (CTA_Q / WARP_Q) * (CTA_K / WARP_K)>::max_threads), (sage_tuned_bounds<tuned, 32 * (CTA_Q / WARP_Q) * (CTA_K / WARP_K)>::min_blocks)) qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, half *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, DTypeOut *__restrict__ V_mean,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
@@ -53,7 +123,9 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   static_assert(K_GRAN == QuantGranularity::kPerBlock || K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerBlock, kPerWarp or kPerThread");
   static_assert(std::is_same<DTypeSVAccum, float>::value || !use_inst_buffer, "use_inst_buffer only supports DTypeSVAccum as float");
   static_assert(std::is_same<DTypeSVAccum, float>::value || std::is_same<DTypeSVAccum, half>::value, "DTypeSVAccum must be float or half");
-  static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
+  static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value || std::is_same<DTypeOut, float>::value, "DTypeOut must be half, nv_bfloat16 or float");
+  static_assert(!std::is_same<DTypeOut, float>::value || (std::is_same<DTypeSVAccum, float>::value && !return_lse && !fuse_v_mean), "float output: float accumulation, no LSE, no fused V mean");
+  static_assert(!tuned || (head_dim == 128 && use_inst_buffer && std::is_same<DTypeSVAccum, float>::value), "the tuned launch is written for head 128 with the fp16 + fp32 P.V step");
   static_assert(head_dim % 64 == 0, "head_dim must be a multiple of 64");
   static_assert(!fuse_v_mean || std::is_same<DTypeSVAccum, half>::value, "fuse_v_mean only supports half");
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
@@ -336,8 +408,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
     else
     {
-      compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      if constexpr (tuned)
+      {
+        sage_tuned_sv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 1>(
+          smem_V, RS_f16, RO, V_smem_offset_mma);
+      }
+      else
+      {
+        compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+          smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      }
     }
 
     __syncthreads();
@@ -434,8 +514,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
     else
     {
-      compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      if constexpr (tuned)
+      {
+        sage_tuned_sv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 1>(
+          smem_V, RS_f16, RO, V_smem_offset_mma);
+      }
+      else
+      {
+        compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+          smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      }
     }
 
     __syncthreads();
@@ -522,8 +610,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     }
     else
     {
-      compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-        smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      if constexpr (tuned)
+      {
+        sage_tuned_sv<num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 1>(
+          smem_V, RS_f16, RO, V_smem_offset_mma);
+      }
+      else
+      {
+        compute_fp16_sv_permuted_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+          smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      }
     }
 
     __syncthreads();
@@ -533,6 +629,37 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   // TODO: thread block sync mdo state for num_warps_k > 0
 
   normalize_d<num_tiles_q, num_tiles_v, DenominatorAccumUnit>(RO, m, d);
+
+  if constexpr (std::is_same<DTypeOut, float>::value)
+  {
+    // Spellcast3D: the F32 output written straight from the accumulators (no fp16 rounding, no shared memory pass).
+    // Each (fq, fv) is a 16 x 16 tile of two m16n8 halves: RO[0..1] row lane/4, columns 2 * (lane % 4) + {0, 1};
+    // RO[2..3] the row 8 further; RO[4..7] the same for the columns 8 further - the layout the shared-memory path
+    // below stores (offset_O ^ 0x1 is the next 8 columns). Four lanes write 32 contiguous bytes of a row.
+    const uint32_t row_base = bx * CTA_Q + get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
+    float *O_lane_base = O + batch_id * stride_bz_o + head_id * stride_h_o + 2 * (lane_id % 4);
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+    {
+#pragma unroll
+      for (uint32_t r = 0; r < 2; r++)
+      {
+        const uint32_t row = row_base + fq * MMA_QK_M + 8 * r;
+        if (row < qo_len)
+        {
+          float *O_row = O_lane_base + row * stride_seq_o;
+#pragma unroll
+          for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+          {
+            *(float2*)(O_row + fv * MMA_SV_N) = make_float2(RO[fq][fv][2 * r + 0], RO[fq][fv][2 * r + 1]);
+            *(float2*)(O_row + fv * MMA_SV_N + 8) = make_float2(RO[fq][fv][4 + 2 * r + 0], RO[fq][fv][4 + 2 * r + 1]);
+          }
+        }
+      }
+    }
+  }
+  else
+  {
 
   // save the result
   // if (get_warp_idx_k<num_warps_q, num_warps_k>() == 0)
@@ -663,6 +790,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   }
 
   // }
+  } // the half / bf16 output
 }
 
 

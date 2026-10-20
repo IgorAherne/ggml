@@ -920,7 +920,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
     if (tensor->op == GGML_OP_SAGE_ATTN) {
-        size = ggml_cuda_sage_attn_get_alloc_size(tensor);
+        size = ggml_cuda_sage_attn_get_alloc_size(buft_ctx->device, tensor);
     }
     if (tensor->op == GGML_OP_SOL_ATTN) {
         size = ggml_cuda_sol_attn_get_alloc_size(tensor);
