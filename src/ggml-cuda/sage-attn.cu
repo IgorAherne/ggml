@@ -501,16 +501,19 @@ bool ggml_cuda_sage_attn_supported(int device, const ggml_tensor* op) {
             return false;
         }
     }
-    // V: contiguous for the FP8 paths; for the others any view whose rows are contiguous and 16-byte aligned (the
-    // kernels copy 16 bytes at a time) and whose strides fit their 32-bit arguments.
+    // V: contiguous for the FP8 paths (their V quantizers read it so; a view, e.g. Qwen-Image 2.1's permuted V, makes
+    // the op unsupported there and the caller falls back to its other attention); for the others any view whose rows
+    // are contiguous and 16-byte aligned (the kernels copy 16 bytes at a time) and whose last element's offset fits
+    // the 32-bit stride arithmetic.
     const sage_path path = sage_choose(device, op);
     if (path == SAGE_PATH_FP8 || path == SAGE_PATH_FP8_PLUS_PLUS) {
         if (!ggml_is_contiguous(v)) {
             return false;
         }
     } else {
+        const size_t v_last = (v->ne[1] - 1) * v->nb[1] + (v->ne[2] - 1) * v->nb[2] + (v->ne[3] - 1) * v->nb[3];
         if (v->nb[0] != sizeof(half) || v->nb[1] % 16 != 0 || v->nb[2] % 16 != 0 || v->nb[3] % 16 != 0 ||
-            uintptr_t(v->data) % 16 != 0 || v->nb[3] / sizeof(half) > UINT32_MAX) {
+            uintptr_t(v->data) % 16 != 0 || v_last / sizeof(half) > UINT32_MAX) {
             return false;
         }
     }

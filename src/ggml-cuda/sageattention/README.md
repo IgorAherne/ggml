@@ -46,7 +46,9 @@ through this op. Its changes, measured on an RTX 3060 12 GB (sm_86, 28 SMs, CUDA
   FP16 one was. Head 64 and cc 8.0 - 8.5 keep upstream's SM80 path. `GGML_CUDA_SAGE=tuned|sm80|fp8|fp8pp` in the
   environment picks a path where the card has it (for comparisons). Q and K are taken in F16 as well as F32, V as any
   F16 view whose rows are contiguous (read through its strides: e.g. a permuted [D, heads, tokens] tensor, without a
-  copy); the scratch (`SageWorkspace`) holds only what the chosen path uses.
+  copy) - except by the FP8 paths, which still read V contiguous: with such a view the op is unsupported for them and
+  stable-diffusion.cpp runs its other attention instead (so `GGML_CUDA_SAGE=fp8|fp8pp` does nothing for Qwen-Image
+  2.1's graph, which passes the view); the scratch (`SageWorkspace`) holds only what the chosen path uses.
 
 Measured, one call at Qwen-Image 2.1's shape (4,096 queries x 4,152 keys x 32 heads x 128, random inputs; medians):
 flash attention (`ggml_flash_attn_ext`, F16 K/V) 18.0 ms; upstream's SM80 path 7.62 ms; the tuned path 5.79 ms
