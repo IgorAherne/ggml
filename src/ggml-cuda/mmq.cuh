@@ -1518,9 +1518,9 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
          ntx_fd);
 }
 
-// Uses the asynchronous tile pipeline (mmq-async.cuh, same results) where the device code has it and the data is
-// aligned for 16 byte cp.async copies (always the case for ggml's own buffers). Only the Q4_K / Q5_K kernels with
-// J == 128 are instantiated a second time for it.
+// Uses the asynchronous tile pipeline (mmq-async.cuh, results within f32 rounding of the default one) where the device
+// code has it and the data is aligned for 16 byte cp.async copies (always the case for ggml's own buffers). Only the
+// Q4_K / Q5_K kernels with J == 128 are instantiated a second time for it.
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const int tile_group) {
     if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && J == GGML_CUDA_MMQ_ASYNC_J) {

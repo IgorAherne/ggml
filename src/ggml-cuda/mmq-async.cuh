@@ -9,9 +9,11 @@
 // right after ldmatrix, and the per sub-block scales are computed once per tile row into a float buffer, so the
 // global memory latency is hidden behind the MMA work and there are two barriers per K step.
 //
-// The results are bit-identical to the default path: the same int8 values reach the same mma instructions, every
-// per sub-block scale is computed with the same half precision operations and converted to float exactly as before,
-// and the float accumulation is the unchanged loop of ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma (same order, same operations).
+// The int8 values, the per sub-block scales (same half precision operations, same float conversion) and the d*C terms
+// of the float accumulation are those of the default path (ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma's loop, same order and
+// operations). The min terms (-dmin*m)*s are summed on the tensor cores instead (see ggml_cuda_mmq_async_vec_dot):
+// their products are exact in f32 as before, only the rounding of their accumulation differs (results within f32
+// rounding of the default path, not bit-identical).
 
 #include "cp-async.cuh"
 #include "unary.cuh"
@@ -19,7 +21,7 @@
 #define GGML_CUDA_MMQ_ASYNC_I        128
 #define GGML_CUDA_MMQ_ASYNC_J        128
 #define GGML_CUDA_MMQ_ASYNC_NTHREADS 256
-#define GGML_CUDA_MMQ_ASYNC_DM_ROW   8   // float2 scales per tile row (one per 32 values of the 256 value K step)
+#define GGML_CUDA_MMQ_ASYNC_DM_ROW   8   // scales per tile row (one per 32 values of the 256 value K step)
 
 // Shared memory row length of a raw weight block in ints (the block itself, 144 or 176 bytes). Consecutive rows then
 // start 4 or 12 banks apart, so the 8 rows of an ldmatrix 8x8 matrix hit different banks.
@@ -32,10 +34,15 @@ static constexpr __host__ __device__ bool ggml_cuda_mmq_async_config_ok(const gg
         c.nthreads == GGML_CUDA_MMQ_ASYNC_NTHREADS && c.K_vram == MMQ_ITER_K && c.sram_layout == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1;
 }
 
-// ids[J] | raw x: 2 buffers | y: 2 half tiles | scales: 2 buffers
+// Scale buffer of one K step: d*sc as float [I][DM_ROW], then -dmin*m as half [I][DM_ROW].
+static constexpr __host__ __device__ int ggml_cuda_mmq_async_dm_bytes() {
+    return GGML_CUDA_MMQ_ASYNC_I*GGML_CUDA_MMQ_ASYNC_DM_ROW*(sizeof(float) + sizeof(half));
+}
+
+// ids[J] | raw x: 2 buffers | y: 2 half tiles | scales: 2 buffers | y half 0's (d, s) for the min term (J*4 half2)
 static __host__ size_t ggml_cuda_mmq_async_nbytes_shared(const ggml_cuda_mmq_config & c) {
     return c.J*sizeof(int) + 2*c.I*ggml_cuda_mmq_async_raw_ints(c.type)*sizeof(int) + 2*c.J*MMQ_TILE_Y_K*sizeof(int) +
-        2*c.I*GGML_CUDA_MMQ_ASYNC_DM_ROW*sizeof(float2);
+        2*ggml_cuda_mmq_async_dm_bytes() + c.J*4*sizeof(half2);
 }
 
 // Whether the kernel compiled for this device contains the asynchronous path for this config.
@@ -113,16 +120,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_load_y(int * __restri
     }
 }
 
-// Position of the float2 scale of sub-block sb in tile row i: 4 chunks of 16 bytes (2 sub-blocks each) per row,
-// XOR swizzled so that the 8 rows read by one ldmatrix-style access pattern use 8 different groups of 4 banks.
-static __device__ __forceinline__ int ggml_cuda_mmq_async_dm_index(const int i, const int sb) {
-    return i*GGML_CUDA_MMQ_ASYNC_DM_ROW + 2*((sb/2) ^ ((i >> 1) & 3)) + sb % 2;
-}
-
 // The per row and sub-block (d*sc, -dmin*m) of ggml_cuda_mmq_load_tiles_q4_K / _q5_K (same half precision
-// operations), stored as float2 (the exact float values ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma converts them to).
+// operations): d*sc as float (the exact float value ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma converts it to) to dmd,
+// -dmin*m as half to dmm. Thread t writes row t/2, sub-blocks 4*(t%2) .. +3 (consecutive 16 / 8 byte stores).
 template <ggml_type type>
-static __device__ __forceinline__ void ggml_cuda_mmq_async_scales(float2 * __restrict__ dmf, const int * __restrict__ rx) {
+static __device__ __forceinline__ void ggml_cuda_mmq_async_scales(
+        float * __restrict__ dmd, half2 * __restrict__ dmm, const int * __restrict__ rx) {
     constexpr int I        = GGML_CUDA_MMQ_ASYNC_I;
     constexpr int nthreads = GGML_CUDA_MMQ_ASYNC_NTHREADS;
     constexpr int row_ints = ggml_cuda_mmq_async_raw_ints(type);
@@ -148,21 +151,44 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_scales(float2 * __res
         u.i = hdr.x;
         const half2 dm = u.h * make_half2(1.0f, -1.0f);
 
+        half2 v[4];
 #pragma unroll
-        for (int q = 0; q < 2; ++q) {
-            const float2 v0 = __half22float2(dm*make_half2(sc8[2*q + 0], m8[2*q + 0]));
-            const float2 v1 = __half22float2(dm*make_half2(sc8[2*q + 1], m8[2*q + 1]));
-            *(float4 *) (dmf + ggml_cuda_mmq_async_dm_index(i, 4*ksc + 2*q)) = make_float4(v0.x, v0.y, v1.x, v1.y);
+        for (int k = 0; k < 4; ++k) {
+            v[k] = dm*make_half2(sc8[k], m8[k]);
         }
+        *(float4 *) (dmd + i*GGML_CUDA_MMQ_ASYNC_DM_ROW + 4*ksc) =
+            make_float4(__low2float(v[0]), __low2float(v[1]), __low2float(v[2]), __low2float(v[3]));
+        half2 m[2] = {__highs2half2(v[0], v[1]), __highs2half2(v[2], v[3])};
+        *(int2 *) (dmm + i*(GGML_CUDA_MMQ_ASYNC_DM_ROW/2) + 2*ksc) = *(const int2 *) m;
     }
 }
 
 // ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma (NVIDIA path) for half h of the K step (x sub-blocks 4h..4h+3) against the y half
 // tile y, with the x tiles built from the raw blocks: the A fragments are ldmatrix loads of the raw 4 bit data split
 // into low and high nibbles (+ the 5th bit for Q5_K), i.e. the same ints the default loader stores to shared memory.
+//
+// The min term sum_b (-dmin*m)[i, b] * s[j, b] over the 8 sub-blocks b of a K step is not added per sub-block and
+// element with FFMAs but once per K step and 16x8 output tile with an f16 MMA m16n8k8 (f32 accumulation) into the same
+// sums: its f32 C fragment has tile_C's layout. A = the rows' -dmin*m (dmm: the half products themselves),
+// B = the columns' block sums s (the .y halves of y's ds4). Each lane's fragments hold sub-blocks 2*(lane%4) and
+// 2*(lane%4) + 1 (A: rows lane/4 and lane/4 + 8, B: column lane/4), which lie in half 0 for lane%4 < 2 and in half 1
+// otherwise. The MMAs run in half 1: A comes from dmm (valid for the whole K step), B from y half 1 or, for the half 0
+// sub-blocks, from ds_h0, where the warps copy those (d, s) pairs during half 0 (ty0 is refilled during half 1), so no
+// state stays in registers across the barrier. The tensor time is 1/8 of the int8 MMAs' on GeForce cards (f16 MMA
+// with f32 accumulation at a quarter of the int8 rate).
+
+// D += A*B, m16n8k8, A/B f16 (row/col), D f32 (sm_80+ only, see GGML_CUDA_MMQ_ASYNC_DEVICE).
+static __device__ __forceinline__ void ggml_cuda_mmq_async_mma_f16_f32(
+        float * __restrict__ D, const int A0, const int A1, const int B) {
+    asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+        : "+f"(D[0]), "+f"(D[1]), "+f"(D[2]), "+f"(D[3])
+        : "r"(A0), "r"(A1), "r"(B));
+}
+
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
-        const int * __restrict__ rx, const float2 * __restrict__ dmf, const int * __restrict__ y, float * __restrict__ sum, const int h) {
+        const int * __restrict__ rx, const float * __restrict__ dmd, const half2 * __restrict__ dmm,
+        const int * __restrict__ y, float * __restrict__ sum, int2 * __restrict__ ds_h0, const int h) {
     typedef tile<16,  8, int> tile_A;
     typedef tile< 8,  8, int> tile_B;
     typedef tile<16,  8, int> tile_C;
@@ -172,14 +198,19 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
     constexpr int row_ints      = ggml_cuda_mmq_async_raw_ints(type);
     constexpr int qs_off        = type == GGML_TYPE_Q4_K ? 4 : 12; // ints: dm + scales (+ qh for Q5_K)
     constexpr int qh_off        = 4;
+    constexpr int nwarps        = GGML_CUDA_MMQ_ASYNC_NTHREADS/WARP_SIZE;
+    static_assert(tile_C::ne == 4 && tile_C::J == 8 && nwarps % ntx == 0, "min term fragments");
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
+    // the (d, s) pairs of half 0 for this warp's column set: [column tile][column][pair 0/1 = sub-blocks 0, 1 / 2, 3]
+    ds_h0 += (threadIdx.y % ntx) * (J/ntx*2);
+    const int ty = threadIdx.x % 4; // the min term fragments' sub-blocks are 2*ty, 2*ty + 1
 
     const int   * y_qs = (const int   *) y + 4;
     const half2 * y_dm = (const half2 *) y;
 
     tile_A   A[ntx][MMQ_TILE_NE_K/QI8_1];
-    float2 dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1];
+    float  dmA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_1]; // d*sc of the rows get_i(2*l), sub-blocks 4h .. 4h + 3
 
     const int i0 = (threadIdx.y/ntx)*rows_per_warp;
 
@@ -211,21 +242,48 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
 #pragma unroll
         for (int l = 0; l < tile_C::ne/2; ++l) {
             const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+            const float4 v = *(const float4 *) (dmd + i*GGML_CUDA_MMQ_ASYNC_DM_ROW + 4*h);
+            dmA[n][l][0] = v.x;
+            dmA[n][l][1] = v.y;
+            dmA[n][l][2] = v.z;
+            dmA[n][l][3] = v.w;
+        }
+    }
+
+    // min term A (half 1): -dmin*m of rows lane/4 and lane/4 + 8, sub-blocks 2*ty, 2*ty + 1
+    int min_A[ntx][2];
+    if (h == 1) {
 #pragma unroll
-            for (int q = 0; q < 2; ++q) {
-                const float4 v = *(const float4 *) (dmf + ggml_cuda_mmq_async_dm_index(i, 4*h + 2*q));
-                dmA[n][l][2*q + 0] = make_float2(v.x, v.y);
-                dmA[n][l][2*q + 1] = make_float2(v.z, v.w);
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < 2; ++l) {
+                const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+                min_A[n][l] = *(const int *) (dmm + i*(GGML_CUDA_MMQ_ASYNC_DM_ROW/2) + ty);
             }
         }
     }
 
 #pragma unroll
     for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        const int jt = j0/(ntx*tile_C::J);
+        // min term B: s of column j0 + lane/4, sub-blocks 2*ty, 2*ty + 1. Half 0: the (d, s) pairs of sub-blocks 0 .. 3
+        // to ds_h0, column tile jt by the warp (threadIdx.y/ntx) == jt % (nwarps/ntx) of the column set.
+        int min_B = 0;
+        if (h == 0) {
+            if (ty < 2 && jt % (nwarps/ntx) == threadIdx.y/ntx) {
+                ds_h0[(jt*tile_C::J + threadIdx.x/4)*2 + ty] =
+                    *(const int2 *) (y_dm + (j0 + threadIdx.x/4)*MMQ_TILE_Y_K + 2*ty);
+            }
+        } else {
+            const int2 ds = ty < 2 ? ds_h0[(jt*tile_C::J + threadIdx.x/4)*2 + ty] :
+                                     *(const int2 *) (y_dm + (j0 + threadIdx.x/4)*MMQ_TILE_Y_K + 2*(ty - 2));
+            min_B = __byte_perm(ds.x, ds.y, 0x7632); // (ds.x.y, ds.y.y): the two s
+        }
+
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
             tile_B   B;
-            float2 dsB[tile_C::ne/2];
+            float    dB[tile_C::ne/2];
 
             load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
 
@@ -233,7 +291,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
             for (int l = 0; l < tile_C::ne/2; ++l) {
                 const int j = j0 + tile_C::get_j(l);
 
-                dsB[l] = __half22float2(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                dB[l] = __low2float(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
             }
 
 #pragma unroll
@@ -243,9 +301,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].x*dsB[l%2].x*C.x[l];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1].y*dsB[l%2].y;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1]*dB[l%2]*C.x[l];
                 }
+            }
+        }
+
+        if (h == 1) {
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                ggml_cuda_mmq_async_mma_f16_f32(sum + (j0/tile_C::J + n)*tile_C::ne, min_A[n][0], min_A[n][1], min_B);
             }
         }
     }
@@ -407,9 +471,13 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
     int    * rx0  = data_mul_mat_q + J;
     int    * ty0  = rx0 + 2*I*row_ints;
     int    * ty1  = ty0 + J*MMQ_TILE_Y_K;
-    float2 * dmf0 = (float2 *) (ty1 + J*MMQ_TILE_Y_K);
+    char   * dm0   = (char *) (ty1 + J*MMQ_TILE_Y_K); // 2 scale buffers (ggml_cuda_mmq_async_dm_bytes each)
+    int2   * ds_h0 = (int2 *) (dm0 + 2*ggml_cuda_mmq_async_dm_bytes());
     constexpr int rx_size  = I*row_ints;
-    constexpr int dmf_size = I*GGML_CUDA_MMQ_ASYNC_DM_ROW;
+    constexpr int dm_bytes = ggml_cuda_mmq_async_dm_bytes();
+    // d*sc and -dmin*m of scale buffer b
+    auto dmd = [&](const int b) { return (float *) (dm0 + b*dm_bytes); };
+    auto dmm = [&](const int b) { return (half2 *) (dm0 + b*dm_bytes + I*GGML_CUDA_MMQ_ASYNC_DM_ROW*sizeof(float)); };
 
     float sum[J*I / nthreads] = {0.0f};
 
@@ -426,7 +494,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
         ggml_cuda_mmq_async_commit();
         ggml_cuda_mmq_async_wait<1>();
         __syncthreads();
-        ggml_cuda_mmq_async_scales<type>(dmf0, rx0);
+        ggml_cuda_mmq_async_scales<type>(dmd(0), dmm(0), rx0);
         __syncthreads();
     }
 
@@ -435,7 +503,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
         const bool has_next = kb0 + 1 < kb0_stop;
         const int * by_next = y + ncols_y*(((kb0 + 1)*qk/ne_block)*sz);
 
-        ggml_cuda_mmq_async_vec_dot<type, J, fallback>(rx0 + b*rx_size, dmf0 + b*dmf_size, ty0, sum, 0);
+        ggml_cuda_mmq_async_vec_dot<type, J, fallback>(rx0 + b*rx_size, dmd(b), dmm(b), ty0, sum, ds_h0, 0);
 
         ggml_cuda_mmq_async_wait<0>();
         __syncthreads();
@@ -443,10 +511,10 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
         if (has_next) {
             ggml_cuda_mmq_async_load_y<J>(ty0, by_next);
             ggml_cuda_mmq_async_commit();
-            ggml_cuda_mmq_async_scales<type>(dmf0 + (b ^ 1)*dmf_size, rx0 + (b ^ 1)*rx_size);
+            ggml_cuda_mmq_async_scales<type>(dmd(b ^ 1), dmm(b ^ 1), rx0 + (b ^ 1)*rx_size);
         }
 
-        ggml_cuda_mmq_async_vec_dot<type, J, fallback>(rx0 + b*rx_size, dmf0 + b*dmf_size, ty1, sum, 1);
+        ggml_cuda_mmq_async_vec_dot<type, J, fallback>(rx0 + b*rx_size, dmd(b), dmm(b), ty1, sum, ds_h0, 1);
 
         ggml_cuda_mmq_async_wait<0>();
         __syncthreads();
