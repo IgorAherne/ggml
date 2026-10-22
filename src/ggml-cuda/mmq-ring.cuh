@@ -66,9 +66,12 @@ static __host__ size_t ggml_cuda_mmq_ring_nbytes_shared(const ggml_cuda_mmq_conf
 }
 
 // Whether the kernel compiled for this device contains the ring pipeline for this config (as the asynchronous one).
+// The sm_120 build of mul_mat_q has 1 KB of static shared memory (cuobjdump, CUDA 12.8), which the dynamic part must
+// leave room for there (Q5_K's 101,376 bytes would not fit; untested on such a card).
 static __host__ bool ggml_cuda_mmq_ring_available(const ggml_cuda_mmq_config & c, const int cc, const size_t smpbo) {
+    const size_t static_shared = ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_BLACKWELL ? 1024 : 0;
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE && c.use_mma_data_layout(cc) &&
-        ggml_cuda_mmq_async_config_ok(c) && ggml_cuda_mmq_ring_nbytes_shared(c) <= smpbo;
+        ggml_cuda_mmq_async_config_ok(c) && ggml_cuda_mmq_ring_nbytes_shared(c) + static_shared <= smpbo;
 }
 
 #ifdef GGML_CUDA_MMQ_ASYNC_DEVICE
