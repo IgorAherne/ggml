@@ -5,6 +5,8 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #define MMQ_DP4A_MAX_BATCH_SIZE 64 // Max. batch size to use for dp4a MMQ kernels when FP16 tensor cores are available.
 #define MMQ_ITER_K             256
@@ -20,7 +22,41 @@ enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
     MMQ_Q8_1_DS_LAYOUT_D2S6,
+    MMQ_Q8_1_DS_LAYOUT_DSY, // Q4_K / Q5_K for the ring pipeline only (mmq-ring.cuh), see block_q8_1_mmq
 };
+
+// MMQ_Q8_1_DS_LAYOUT_DSY: the integer sub-scales sy are fractions of GGML_CUDA_MMQ_DSY_MAX (8 bits).
+#define GGML_CUDA_MMQ_DSY_MAX 255
+
+// The tile pipeline of the Q4_K / Q5_K MMA kernels with J == 128 on sm_80+ (env GGML_CUDA_MMQ_PIPE = off | async | ring):
+// the default tile loop of mul_mat_q_process_tile, mmq-async.cuh, or mmq-ring.cuh (activations in the DSY layout).
+enum ggml_cuda_mmq_pipe {
+    GGML_CUDA_MMQ_PIPE_OFF   = 0,
+    GGML_CUDA_MMQ_PIPE_ASYNC = 1,
+    GGML_CUDA_MMQ_PIPE_RING  = 2,
+};
+#define GGML_CUDA_MMQ_PIPE_DEFAULT GGML_CUDA_MMQ_PIPE_ASYNC
+
+static int ggml_cuda_mmq_get_pipe() {
+    static const int pipe = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_PIPE");
+        if (env == nullptr || env[0] == 0) {
+            return (int) GGML_CUDA_MMQ_PIPE_DEFAULT;
+        }
+        if (strcmp(env, "ring") == 0) {
+            return (int) GGML_CUDA_MMQ_PIPE_RING;
+        }
+        if (strcmp(env, "async") == 0) {
+            return (int) GGML_CUDA_MMQ_PIPE_ASYNC;
+        }
+        if (strcmp(env, "off") == 0) {
+            return (int) GGML_CUDA_MMQ_PIPE_OFF;
+        }
+        GGML_LOG_WARN("%s: unknown GGML_CUDA_MMQ_PIPE=%s (off | async | ring), using the default\n", __func__, env);
+        return (int) GGML_CUDA_MMQ_PIPE_DEFAULT;
+    }();
+    return pipe;
+}
 
 static constexpr int QK8_1_MMQ  = 4*QK8_1;
 static constexpr int QK_FP4_MMQ = 2*QK8_1_MMQ;
@@ -42,6 +78,10 @@ struct block_q8_1_mmq {
         half2 ds4[4];   // 1 16 bit scale + 1 16 bit partial sum per 32 values, stored as d0,s0,d1,s1,d2,s2,d3,s3
         half  d2s6[8];  // 1 16 bit scale per 64 values + 1 16 bit partial sum per 16 values for the first 96 values,
                         //     stored as d0,d1,s1,s2,s3,s4,s5
+        int   dsy[4];   // MMQ_Q8_1_DS_LAYOUT_DSY: [0] = half2 (s0, s1), [1] = half2 (s2, s3): the partial sums per 32
+                        //     values; [2] = float d128: one scale for the 128 values; [3] = the bytes sy0..sy3:
+                        //     value k of sub-block j (32 values) is qs[32*j + k] * d128 * sy_j / GGML_CUDA_MMQ_DSY_MAX
+                        //     (see ggml_cuda_q8_1_dsy_quantize)
     };
     int8_t qs[QK8_1_MMQ];
 };
@@ -57,6 +97,63 @@ struct block_fp4_mmq {
 static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_q8_1_mmq) == 4*sizeof(block_q8_1),      "Unexpected block_q8_1_mmq size");
 static_assert(sizeof(block_fp4_mmq)  == sizeof(block_q8_1_mmq),    "Unexpected block_fp4_mmq size");
+
+// MMQ_Q8_1_DS_LAYOUT_DSY quantization of one block_q8_1_mmq by a whole warp, lane l holding its values 4l .. 4l+3 (xi):
+// amax_j = max |x| of sub-block j (32 values, lanes 8j .. 8j+7), amax128 = max_j amax_j,
+// sy_j = amax128 > 0 ? min(MAX, ceil(MAX * amax_j / amax128)) : 0, amax'_j = amax128 * sy_j / MAX,
+// q = clamp(round(x * 127 / amax'_j), -127, 127) (0 where amax'_j == 0), d128 = amax128 / 127 (f32), s_j = the sums
+// of the float values (as the DS4 layout's). The realized scale of sub-block j, d128 * sy_j / MAX, is the exact per-32
+// scale amax_j / 127 rounded up by at most a factor 1 + 1/sy_j. write == false: the shuffles only (every lane of the
+// warp must call it); yb: the block (16-byte aligned).
+static __device__ __forceinline__ void ggml_cuda_q8_1_dsy_quantize(const float4 xi, block_q8_1_mmq * yb, const bool write) {
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+    float sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+    }
+    float amax128 = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 8, WARP_SIZE));
+    amax128 = fmaxf(amax128, __shfl_xor_sync(0xFFFFFFFF, amax128, 16, WARP_SIZE));
+
+    const int   sy    = amax128 > 0.0f ? min(GGML_CUDA_MMQ_DSY_MAX, (int) ceilf(float(GGML_CUDA_MMQ_DSY_MAX) * amax / amax128)) : 0;
+    const float amaxp = amax128 * float(sy) / float(GGML_CUDA_MMQ_DSY_MAX);
+    const float d_inv = amaxp > 0.0f ? 127.0f / amaxp : 0.0f;
+
+    char4 q;
+    q.x = (int) fminf(fmaxf(roundf(xi.x*d_inv), -127.0f), 127.0f);
+    q.y = (int) fminf(fmaxf(roundf(xi.y*d_inv), -127.0f), 127.0f);
+    q.z = (int) fminf(fmaxf(roundf(xi.z*d_inv), -127.0f), 127.0f);
+    q.w = (int) fminf(fmaxf(roundf(xi.w*d_inv), -127.0f), 127.0f);
+
+    // the header: lane 0 gathers the sums and sub-scales of the four sub-blocks
+    const float s1  = __shfl_sync(0xFFFFFFFF, sum,  8, WARP_SIZE);
+    const float s2  = __shfl_sync(0xFFFFFFFF, sum, 16, WARP_SIZE);
+    const float s3  = __shfl_sync(0xFFFFFFFF, sum, 24, WARP_SIZE);
+    const int   sy1 = __shfl_sync(0xFFFFFFFF, sy,   8, WARP_SIZE);
+    const int   sy2 = __shfl_sync(0xFFFFFFFF, sy,  16, WARP_SIZE);
+    const int   sy3 = __shfl_sync(0xFFFFFFFF, sy,  24, WARP_SIZE);
+    if (!write) {
+        return;
+    }
+    ((char4 *) yb->qs)[lane] = q;
+    if (lane == 0) {
+        union { half2 h; int i; } s01, s23;
+        s01.h = make_half2(sum, s1);
+        s23.h = make_half2(s2, s3);
+        int4 hdr;
+        hdr.x = s01.i;
+        hdr.y = s23.i;
+        hdr.z = __float_as_int(amax128 / 127.0f);
+        hdr.w = sy | (sy1 << 8) | (sy2 << 16) | (sy3 << 24);
+        *(int4 *) yb->dsy = hdr;
+    }
+}
 
 static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     switch (type_x) {
@@ -438,6 +535,7 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
 #include "mmq-async.cuh"
+#include "mmq-ring.cuh"
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
@@ -873,7 +971,14 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
-template <ggml_type type, int J, bool fallback, bool fixup, bool async>
+// The threads per CUDA block of mul_mat_q with the pipeline pipe (the ring has its own warp tiles).
+static constexpr __device__ int ggml_cuda_mmq_get_nthreads_pipe(ggml_type type, int J, bool fallback, int pipe) {
+    return pipe == GGML_CUDA_MMQ_PIPE_RING ? GGML_CUDA_MMQ_RING_NTHREADS : ggml_cuda_mmq_get_nthreads(type, J, fallback);
+}
+
+// pipe: GGML_CUDA_MMQ_PIPE_OFF (the default tile loop below), _ASYNC (mmq-async.cuh) or _RING (mmq-ring.cuh, y in the
+// DSY layout), the latter two where the device code has them.
+template <ggml_type type, int J, bool fallback, bool fixup, int pipe>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -882,7 +987,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
 
 #ifdef GGML_CUDA_MMQ_ASYNC_DEVICE
-    if constexpr (async && ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
+    if constexpr (pipe == GGML_CUDA_MMQ_PIPE_RING && ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
+        ggml_cuda_mmq_ring_process_tile<type, J, fallback, fixup>
+            (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+        return;
+    }
+    if constexpr (pipe == GGML_CUDA_MMQ_PIPE_ASYNC && ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
         ggml_cuda_mmq_async_process_tile<type, J, fallback, fixup>
             (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
@@ -961,9 +1072,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-// async: use the asynchronous tile pipeline of mmq-async.cuh (where the device code has it, otherwise the default one).
-template <ggml_type type, int J, bool fallback, bool async = false>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+// pipe: see mul_mat_q_process_tile (launched with _ASYNC / _RING only where the device code has those pipelines).
+template <ggml_type type, int J, bool fallback, int pipe = GGML_CUDA_MMQ_PIPE_OFF>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads_pipe(type, J, fallback, pipe), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
@@ -978,14 +1089,14 @@ static __global__ void mul_mat_q(
         NO_DEVICE_CODE;
         return;
     }
-    // The async variant is only launched where the device code has the asynchronous pipeline (sm_80+):
-    if constexpr (async && !ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
+    // The async / ring variants are only launched where the device code has those pipelines (sm_80+):
+    if constexpr (pipe != GGML_CUDA_MMQ_PIPE_OFF && !ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
         NO_DEVICE_CODE;
         return;
     }
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads_pipe(type, J, fallback, pipe) / warp_size;
     constexpr int qk        = ggml_cuda_type_traits<type>::qk;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
 
@@ -1070,7 +1181,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup, async>
+        mul_mat_q_process_tile<type, J, fallback, fixup, pipe>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
@@ -1177,7 +1288,7 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        mul_mat_q_process_tile<type, J, fallback, fixup, async>
+        mul_mat_q_process_tile<type, J, fallback, fixup, pipe>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
@@ -1261,7 +1372,7 @@ static __global__ void mul_mat_q(
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
-    mul_mat_q_process_tile<type, J, fallback, fixup, async>
+    mul_mat_q_process_tile<type, J, fallback, fixup, pipe>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
@@ -1413,6 +1524,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
+    int     y_layout = -1; // the mmq_q8_1_ds_layout of y (MMQ_Q8_1_DS_LAYOUT_DSY: the ring pipeline must read it)
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1422,8 +1534,48 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// The tile width J mul_mat_q_switch_J launches for ncols columns: the fewest column tiles, the smallest such J.
+static int ggml_cuda_mmq_get_J_best(const ggml_type type, const bool fallback, const int64_t ncols, const int cc, const size_t smpbo) {
+    int J_best        = 0;
+    int ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+        if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (ncols + config.J - 1) / config.J;
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    return J_best;
+}
+
+// The q8_1 layout for the activations of a quantized MUL_MAT without ids (weights of type with nrows_x rows, x_aligned:
+// data and rows 16-byte aligned; ncols_y activation columns): MMQ_Q8_1_DS_LAYOUT_DSY where mul_mat_q runs it with the
+// ring pipeline (GGML_CUDA_MMQ_PIPE=ring, Q4_K / Q5_K, J == 128, the ring compiled for the device), else the per-32
+// layout of the type. Every producer of q8_1 data for a MUL_MAT (quantize, the fused norms and SwiGLU epilogue) and
+// the MUL_MAT itself decide with it, so a MUL_MAT never reads a layout it was not made for.
+static int ggml_cuda_mmq_y_layout(const ggml_type type, const int64_t nrows_x, const int64_t ncols_y, const bool x_aligned) {
+    if ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && x_aligned && ggml_cuda_mmq_get_pipe() == GGML_CUDA_MMQ_PIPE_RING) {
+        const int    id       = ggml_cuda_get_device();
+        const int    cc       = ggml_cuda_info().devices[id].cc;
+        const size_t smpbo    = ggml_cuda_info().devices[id].smpbo;
+        const bool   fallback = nrows_x % GGML_CUDA_MMQ_ASYNC_I != 0;
+        if (ggml_cuda_mmq_get_J_best(type, fallback, ncols_y, cc, smpbo) == GGML_CUDA_MMQ_ASYNC_J &&
+                ggml_cuda_mmq_ring_available(ggml_cuda_mmq_get_config(type, GGML_CUDA_MMQ_ASYNC_J, fallback, cc), cc, smpbo)) {
+            return MMQ_Q8_1_DS_LAYOUT_DSY;
+        }
+    }
+    return mmq_get_q8_1_ds_layout(type);
+}
+
 // tile_group > 0 (see ggml_cuda_mmq_get_tile_group): one CUDA block per output tile in grouped order.
-template <ggml_type type, int J, bool fallback, bool async>
+template <ggml_type type, int J, bool fallback, int pipe>
 static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const int tile_group) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -1432,13 +1584,15 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     GGML_ASSERT(config.nthreads % warp_size == 0);
-    const int nwarps = config.nthreads / warp_size;
-    const int nbytes_shared = async ? ggml_cuda_mmq_async_nbytes_shared(config) : mmq_get_nbytes_shared(config, cc);
+    const int nwarps = (pipe == GGML_CUDA_MMQ_PIPE_RING ? GGML_CUDA_MMQ_RING_NTHREADS : config.nthreads) / warp_size;
+    const int nbytes_shared = pipe == GGML_CUDA_MMQ_PIPE_RING  ? ggml_cuda_mmq_ring_nbytes_shared(config) :
+                              pipe == GGML_CUDA_MMQ_PIPE_ASYNC ? ggml_cuda_mmq_async_nbytes_shared(config) :
+                                                                 mmq_get_nbytes_shared(config, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, async>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, async>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, pipe>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, pipe>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1458,7 +1612,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback, async><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, pipe><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -1471,7 +1625,7 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
         GGML_ASSERT(ntzw == 1 && args.ids_dst == nullptr);
         const dim3 block_nums_tiles(nty*ntx, 1, 1);
         GGML_ASSERT(int64_t(nty*ntx) * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
-        mul_mat_q<type, J, fallback, async><<<block_nums_tiles, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, pipe><<<block_nums_tiles, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -1498,9 +1652,9 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
     }
 
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
-    const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+    const dim3 block_dims_fixup(block_dims.x, config.nthreads/warp_size/2, block_dims.z); // the config, also for the ring
 
-    mul_mat_q<type, J, fallback, async><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+    mul_mat_q<type, J, fallback, pipe><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
@@ -1521,20 +1675,28 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
 // Uses the asynchronous tile pipeline (mmq-async.cuh, results within f32 rounding of the default one) where the device
 // code has it and the data is aligned for 16 byte cp.async copies (always the case for ggml's own buffers). Only the
 // Q4_K / Q5_K kernels with J == 128 are instantiated a second time for it.
+// y in the DSY layout (see ggml_cuda_mmq_y_layout): the ring pipeline (mmq-ring.cuh), which then must be available.
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const int tile_group) {
     if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) && J == GGML_CUDA_MMQ_ASYNC_J) {
         const int id = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[id].cc;
+        const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
-        if (ggml_cuda_mmq_async_available(config, cc, ggml_cuda_info().devices[id].smpbo) &&
-                uintptr_t(args.x) % 16 == 0 && uintptr_t(args.y) % 16 == 0 &&
-                args.stride_channel_y % 4 == 0 && args.stride_sample_y % 4 == 0) {
-            launch_mul_mat_q_impl<type, J, fallback, true>(ctx, args, stream, tile_group);
+        const bool aligned = uintptr_t(args.x) % 16 == 0 && uintptr_t(args.y) % 16 == 0 &&
+            args.stride_channel_y % 4 == 0 && args.stride_sample_y % 4 == 0;
+        if (args.y_layout == MMQ_Q8_1_DS_LAYOUT_DSY) {
+            GGML_ASSERT(ggml_cuda_mmq_ring_available(config, cc, smpbo) && aligned);
+            launch_mul_mat_q_impl<type, J, fallback, GGML_CUDA_MMQ_PIPE_RING>(ctx, args, stream, tile_group);
+            return;
+        }
+        if (ggml_cuda_mmq_get_pipe() != GGML_CUDA_MMQ_PIPE_OFF && ggml_cuda_mmq_async_available(config, cc, smpbo) && aligned) {
+            launch_mul_mat_q_impl<type, J, fallback, GGML_CUDA_MMQ_PIPE_ASYNC>(ctx, args, stream, tile_group);
             return;
         }
     }
-    launch_mul_mat_q_impl<type, J, fallback, false>(ctx, args, stream, tile_group);
+    GGML_ASSERT(args.y_layout != MMQ_Q8_1_DS_LAYOUT_DSY); // only the ring pipeline reads it
+    launch_mul_mat_q_impl<type, J, fallback, GGML_CUDA_MMQ_PIPE_OFF>(ctx, args, stream, tile_group);
 }
 
 // Grouped tile order for large matrix multiplications on sm_86 (returns the number of src0 tile rows per group, or 0
@@ -1570,26 +1732,8 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     const int    cc    = ggml_cuda_info().devices[id].cc;
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
-    int J_best        = 0;
-    int ntiles_J_best = INT_MAX;
-
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
-        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
-        if (config.type == GGML_TYPE_COUNT) {
-            continue;
-        }
-
-        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
-            continue;
-        }
-
-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
-
-        if (ntiles_x < ntiles_J_best) {
-            J_best = J;
-            ntiles_J_best = ntiles_x;
-        }
-    }
+    const int J_best = ggml_cuda_mmq_get_J_best(type, fallback, args.ncols_opt, cc, smpbo);
+    GGML_ASSERT(args.y_layout != MMQ_Q8_1_DS_LAYOUT_DSY || J_best == GGML_CUDA_MMQ_ASYNC_J);
 
     const int tile_group = ggml_cuda_mmq_get_tile_group(
         ggml_cuda_mmq_get_config(type, J_best, fallback, cc), args, cc, ggml_cuda_info().devices[id].nsm);
@@ -1717,3 +1861,6 @@ void ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor 
                              void * vq_out, int out_layout);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+
+// ggml_cuda_mmq_y_layout for the MUL_MAT src0 x src1 (no ids): the q8_1 layout its activations must be produced in.
+int ggml_cuda_mul_mat_q_y_layout(const ggml_tensor * src0, const ggml_tensor * src1);

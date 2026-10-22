@@ -139,6 +139,8 @@ void ggml_cuda_mul_mat_q(
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
     if (!ids) {
+        // the q8_1 layout every producer of this product's activations uses (DSY: the ring pipeline)
+        const int y_layout = use_native_fp4 ? -1 : ggml_cuda_mul_mat_q_y_layout(src0, src1);
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
@@ -164,10 +166,10 @@ void ggml_cuda_mul_mat_q(
 
             } else if (src1_pre_op) {
                 quantize_mmq_q8_1_pre_op_cuda(*src1_pre_op, src1_q8_1_ptr, src0->type, ne10, ne10_padded,
-                                              ne11, ne12, ne13, stream);
+                                              ne11, ne12, ne13, stream, y_layout);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                                       ne11, ne12, ne13, stream, y_layout);
             }
             CUDA_CHECK(cudaGetLastError());
         }
@@ -184,7 +186,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, ne1};
+            ne1, ne1, y_layout};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -328,8 +330,12 @@ bool ggml_cuda_mul_mat_q_glu_supported(const ggml_tensor * mm, const ggml_tensor
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, 128, false, cc);
-    if (!ggml_cuda_mmq_async_available(config, cc, ggml_cuda_info().devices[id].smpbo)) {
+    if (ggml_cuda_mmq_get_pipe() == GGML_CUDA_MMQ_PIPE_OFF || !ggml_cuda_mmq_async_available(config, cc, ggml_cuda_info().devices[id].smpbo)) {
         return false;
+    }
+    if (ggml_cuda_mul_mat_q_y_layout(src0, src1) == MMQ_Q8_1_DS_LAYOUT_DSY ||
+            ggml_cuda_mul_mat_q_y_layout(mm_out->src[0], mm_out->src[1]) == MMQ_Q8_1_DS_LAYOUT_DSY) {
+        return false; // TODO: the SwiGLU kernel on the ring pipeline
     }
     return ggml_cuda_mul_mat_q_whole_tiles_J128(src0->type, src0->ne[1], src1->ne[1], cc, ggml_cuda_info().devices[id].nsm,
                                                 ggml_cuda_info().devices[id].smpbo);
@@ -410,6 +416,11 @@ size_t ggml_cuda_mul_mat_q_src1_q8_1_bytes(const ggml_tensor * src0, const ggml_
     const bool fallback = src0->ne[1] % 128 != 0;
     return src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, src1->ne[1]) * sizeof(block_q8_1_mmq);
+}
+
+int ggml_cuda_mul_mat_q_y_layout(const ggml_tensor * src0, const ggml_tensor * src1) {
+    const bool x_aligned = (uintptr_t) src0->data % 16 == 0 && src0->nb[1] % 16 == 0;
+    return ggml_cuda_mmq_y_layout(src0->type, src0->ne[1], src1->ne[1], x_aligned);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

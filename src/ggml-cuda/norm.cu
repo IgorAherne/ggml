@@ -34,6 +34,13 @@ static __device__ __forceinline__ void norm_store_q8_1(const float4 xi, void * v
     const int64_t k_block = i0 / QK8_1_MMQ; // column block in the channel
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
+    if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_DSY) {
+        // the warp holds the 128 values of the block (group = 32*k + lane, see the callers)
+        ggml_cuda_q8_1_dsy_quantize(xi, y + k_block*nrows + row, true);
+        GGML_UNUSED(iqs);
+        return;
+    }
+
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -609,6 +616,9 @@ static void norm_mul_f32_cuda(
             case MMQ_Q8_1_DS_LAYOUT_D2S6:
                 if (ncols < 1024) { NORM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_D2S6); } else { NORM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_D2S6); }
                 break;
+            case MMQ_Q8_1_DS_LAYOUT_DSY:
+                if (ncols < 1024) { NORM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_DSY); } else { NORM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_DSY); }
+                break;
             default:
                 GGML_ABORT("fatal error");
         }
@@ -877,6 +887,9 @@ void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_t
                 break;
             case MMQ_Q8_1_DS_LAYOUT_D2S6:
                 if (ncols < 1024) { MANM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_D2S6); } else { MANM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_D2S6); }
+                break;
+            case MMQ_Q8_1_DS_LAYOUT_DSY:
+                if (ncols < 1024) { MANM_Q8_1_LAUNCH(WARP_SIZE, MMQ_Q8_1_DS_LAYOUT_DSY); } else { MANM_Q8_1_LAUNCH(1024, MMQ_Q8_1_DS_LAYOUT_DSY); }
                 break;
             default:
                 GGML_ABORT("fatal error");

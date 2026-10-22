@@ -4175,7 +4175,7 @@ static int ggml_cuda_quantized_consumers(const ggml_backend_cuda_context & ctx, 
             !ggml_cuda_mul_mat_uses_mmq_q8_1(ctx, mm)) {
             break;
         }
-        const int l = mmq_get_q8_1_ds_layout(mm->src[0]->type);
+        const int l = ggml_cuda_mul_mat_q_y_layout(mm->src[0], mm->src[1]);
         if (n > 0 && l != layout) {
             break;
         }
@@ -4390,7 +4390,7 @@ static int ggml_cuda_try_mul_mat_glu(ggml_backend_cuda_context * cuda_ctx, ggml_
         !ggml_cuda_mul_mat_q_glu_supported(mm, mm_out)) {
         return -1;
     }
-    const int layout = mmq_get_q8_1_ds_layout(mm_out->src[0]->type);
+    const int layout = ggml_cuda_mul_mat_q_y_layout(mm_out->src[0], mm_out->src[1]);
     ggml_cuda_pool_alloc<char> glu_q8_1(cuda_ctx->pool(), ggml_cuda_mul_mat_q_src1_q8_1_bytes(mm_out->src[0], glu));
     ggml_cuda_mul_mat_q_glu(*cuda_ctx, mm, src1_q8_1, src1_q8_1_filled, glu_q8_1.get(), layout);
     ggml_cuda_mul_mat_q(*cuda_ctx, mm_out->src[0], glu, nullptr, mm_out, nullptr, glu_q8_1.get(), /*src1_q8_1_filled =*/ true);
@@ -4871,12 +4871,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // other): src1 is quantized to q8_1 once and every product reads that copy, instead of each quantizing it again.
     if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, node)) {
         const ggml_tensor * src1   = node->src[1];
-        const auto          layout = mmq_get_q8_1_ds_layout(node->src[0]->type);
+        const int           layout = ggml_cuda_mul_mat_q_y_layout(node->src[0], src1);
         int n = 1;
         while (n < 4 && i + n < cgraph->n_nodes) {
             const ggml_tensor * next = cgraph->nodes[i + n];
             if (next->op != GGML_OP_MUL_MAT || next->src[1] != src1 || (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                mmq_get_q8_1_ds_layout(next->src[0]->type) != layout || !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, next)) {
+                ggml_cuda_mul_mat_q_y_layout(next->src[0], src1) != layout || !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, next)) {
                 break;
             }
             n++;
