@@ -1,0 +1,13 @@
+cuBLASLt 120804
+M 4096 K 4096 N 4096
+  TN-W (D row-major M x N)    4 algos: first    1.603 ms   85.8 T/s | best #0    1.603 ms   85.8 T/s (84.1 % of 102)
+                             + scale kernel (int32 -> f32) 0.412 ms: GEMM + scale    2.025 ms   67.9 T/s  maxrel 9.9e-08
+  TN-X (D col-major M x N)    4 algos: first    1.543 ms   89.1 T/s | best #0    1.543 ms   89.1 T/s (87.3 % of 102)
+M 4096 K 4096 N 24576
+  TN-W (D row-major M x N)    4 algos: first   10.340 ms   79.7 T/s | best #0   10.340 ms   79.7 T/s (78.2 % of 102)
+                             + scale kernel (int32 -> f32) 2.455 ms: GEMM + scale   12.542 ms   65.8 T/s  maxrel 9.2e-08
+  TN-X (D col-major M x N)    4 algos: first    9.555 ms   86.3 T/s | best #0    9.555 ms   86.3 T/s (84.6 % of 102)
+M 4096 K 12288 N 4096
+  TN-W (D row-major M x N)    4 algos: first    4.467 ms   92.3 T/s | best #0    4.467 ms   92.3 T/s (90.5 % of 102)
+                             + scale kernel (int32 -> f32) 0.410 ms: GEMM + scale    4.824 ms   85.5 T/s  maxrel 9.0e-08
+  TN-X (D col-major M x N)    4 algos: first    4.446 ms   92.7 T/s | best #0    4.446 ms   92.7 T/s (90.9 % of 102)

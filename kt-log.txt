@@ -1,0 +1,82 @@
+== W1 no epilogue
+      2394.4 us med     2386.5 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+     13515.4 us med    12113.9 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>(const char *, const int *, void *, int, int, int, int, int, int
+      6461.3 us med     5794.1 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      6521.2 us med     5791.9 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      2559.8 us med     2545.8 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      1394.9 us med     1390.1 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+== W2 W1 + const B
+      2044.0 us med     2041.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+     11702.4 us med    10576.0 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>(const char *, const int *, void *, int, int, int, int, int, int
+      5793.6 us med     5236.9 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      5794.8 us med     5792.5 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      2164.9 us med     2163.2 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      1195.2 us med     1192.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+== W3 W1 + no global loads
+      2201.4 us med     2197.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+     13290.4 us med    12377.3 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>(const char *, const int *, void *, int, int, int, int, int, int
+      6317.7 us med     5887.9 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      6323.6 us med     5905.0 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      2417.6 us med     2410.8 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      1276.9 us med     1274.0 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+== W4 W1 + ring3 (Q4_K)
+      2274.5 us med     2261.4 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+     12692.8 us med    12495.0 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>(const char *, const int *, void *, int, int, int, int, int, int
+      5944.5 us med     5930.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      6303.1 us med     6298.4 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      2534.5 us med     2523.1 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      1329.8 us med     1326.2 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+== W5 W1 + 64x32 warp tile
+== W0 baseline (async, WI=0)
+      2803.5 us med     2801.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+     16725.9 us med    16595.5 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>(const char *, const int *, void *, int, int, int, int, int, int
+      7905.5 us med     7841.6 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      8103.7 us med     7904.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      3026.1 us med     3022.0 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      1620.7 us med     1619.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+== W1 rerun (complete table)
+      2246.0 us med     2235.6 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+     12898.3 us med    12646.8 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>(const char *, const int *, void *, int, int, int, int, int, int
+      5870.1 us med     5800.9 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      6228.6 us med     5896.0 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      2417.2 us med     2408.3 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+      1314.0 us med     1307.6 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (bool)1>(const char *, const int *, const int *, const int *,
+== ring what-if 2: level 2
+      2134.0 us med     2112.4 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+      5930.8 us med     5926.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+== ring what-if 3: level 3
+      2064.1 us med     2056.6 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+      4551.2 us med     4495.9 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+== ring what-if 4: level 4
+      1507.2 us med     1505.8 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+      4234.1 us med     3901.3 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+== ring what-if 10: per-128 int epilogue (m = sc, no IDP), timing only
+      2425.7 us med     2412.8 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+      6631.5 us med     6319.8 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+== ring what-if 0: ring full (DSY int epilogue)
+      3134.8 us med     3132.6 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+      9047.8 us med     8619.9 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>(const char *, const int *, const int *, const int *, 
+== FINAL kernel times PIPE=async
+      2803.8 us med     2802.2 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)1>
+       257.6 us med      257.4 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)0, (int)0>(const float *, const int *, void *
+     16790.5 us med    16723.2 min  x  21  void mul_mat_q_glu_q8_1<(ggml_type)12, (int)1>
+      7940.0 us med     7901.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)1>
+       257.5 us med      257.1 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)0, (int)0>(const float *, const int *, void *
+      8104.3 us med     8064.5 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)1>
+       840.4 us med      837.9 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)0, (int)0>(const float *, const int *, void *
+      3026.9 us med     3023.2 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (int)1>
+       257.8 us med      257.5 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)0, (int)0>(const float *, const int *, void *
+      1621.2 us med     1618.7 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)1>
+       207.8 us med      205.2 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)1, (bool)0, (int)0>(const float *, const int *, void *
+== FINAL kernel times PIPE=ring
+      3225.5 us med     3223.2 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>
+       258.1 us med      257.6 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)3, (bool)0, (int)0>(const float *, const int *, void *
+     18300.3 us med     8970.8 min  x  42  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>
+      1487.0 us med     1485.3 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)3, (bool)0, (int)2>(const float *, const int *, void *
+       257.6 us med      257.3 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)3, (bool)0, (int)0>(const float *, const int *, void *
+      9365.4 us med     9332.2 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>
+       841.0 us med      839.3 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)3, (bool)0, (int)0>(const float *, const int *, void *
+      3551.3 us med     3548.6 min  x  21  void mul_mat_q<(ggml_type)13, (int)128, (bool)0, (int)2>
+       257.8 us med      255.4 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)3, (bool)0, (int)0>(const float *, const int *, void *
+      1860.3 us med     1858.5 min  x  21  void mul_mat_q<(ggml_type)12, (int)128, (bool)0, (int)2>
+       207.9 us med      205.5 min  x  21  void quantize_mmq_q8_1<(mmq_q8_1_ds_layout)3, (bool)0, (int)0>(const float *, const int *, void *

@@ -1,0 +1,10 @@
+weights (Q4_K / Q5_K -> int8 per output row)
+  Q4_K  4096 x  4096: in    9.4 MB out   16.8 MB | dequant div 0.128 ms (205 GB/s) rcp 0.115 ms (229 GB/s) | row amax (once per load) 0.240 ms | check 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q4_K 24576 x  4096: in   56.6 MB out  100.7 MB | dequant div 0.738 ms (213 GB/s) rcp 0.663 ms (237 GB/s) | row amax (once per load) 1.391 ms | check 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q4_K  4096 x 12288: in   28.3 MB out   50.3 MB | dequant div 0.372 ms (212 GB/s) rcp 0.332 ms (237 GB/s) | row amax (once per load) 0.695 ms | check 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q5_K  4096 x  4096: in   11.5 MB out   16.8 MB | dequant div 0.134 ms (211 GB/s) rcp 0.123 ms (231 GB/s) | row amax (once per load) 0.279 ms | check 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q5_K 16384 x  4096: in   46.1 MB out   67.1 MB | dequant div 0.511 ms (222 GB/s) rcp 0.475 ms (238 GB/s) | row amax (once per load) 1.065 ms | check 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q5_K  4096 x 12288: in   34.6 MB out   50.3 MB | dequant div 0.385 ms (221 GB/s) rcp 0.355 ms (239 GB/s) | row amax (once per load) 0.797 ms | check 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+activations (per-token int8)
+  tokens 4096 x  4096 f32 -> int8: 0.256 ms (328 GB/s) | check 32 rows: 0 mismatches
+  tokens 4096 x 12288 f32 -> int8: 0.752 ms (334 GB/s) | check 32 rows: 0 mismatches

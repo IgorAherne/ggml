@@ -1,0 +1,545 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+[1/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\quantize.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+quantize.cu
+tmpxft_00000548_00000000-7_quantize.cudafe1.cpp
+[2/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\ggml-cuda.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+ggml-cuda.cu
+tmpxft_00009d94_00000000-7_ggml-cuda.cudafe1.cpp
+[3/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\mmq.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq.cu
+tmpxft_0000644c_00000000-7_mmq.cudafe1.cpp
+[4/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\norm.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, do_multiply=true, qlayout=0]" at line 611
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, do_multiply=true, qlayout=0]" at line 611
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, do_multiply=true, qlayout=1]" at line 614
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, do_multiply=true, qlayout=1]" at line 614
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, do_multiply=true, qlayout=2]" at line 617
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, do_multiply=true, qlayout=2]" at line 617
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, do_multiply=true, qlayout=3]" at line 620
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(166): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void norm_f32<block_size,do_multiply,qlayout>(const float *, float *, int, int64_t, int64_t, int64_t, float, const float *, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, do_multiply=true, qlayout=3]" at line 620
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, qlayout=0]" at line 883
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, qlayout=0]" at line 883
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, qlayout=1]" at line 886
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, qlayout=1]" at line 886
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, qlayout=2]" at line 889
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, qlayout=2]" at line 889
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=32, qlayout=3]" at line 892
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\norm.cu(247): warning #128-D: loop is not reachable
+      for (int col = tid; col < ncols; col += block_size) {
+      ^
+          detected during instantiation of "void mul_add_norm_mul_f32<block_size,qlayout>(const float *, const float *, const float *, float *, float *, const float *, int, float, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, int64_t, int64_t, int64_t, uint3, uint3, uint3, uint3, void *) [with block_size=1024, qlayout=3]" at line 892
+
+norm.cu
+tmpxft_0000af18_00000000-7_norm.cudafe1.cpp
+[5/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q1_0.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q1_0.cu
+tmpxft_00004bc4_00000000-7_mmq-instance-q1_0.cudafe1.cpp
+[6/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq4_xs.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq4_xs.cu
+tmpxft_00006324_00000000-7_mmq-instance-iq4_xs.cudafe1.cpp
+[7/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q2_0.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q2_0.cu
+tmpxft_00008494_00000000-7_mmq-instance-q2_0.cudafe1.cpp
+[8/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq2_xxs.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq2_xxs.cu
+tmpxft_00006890_00000000-7_mmq-instance-iq2_xxs.cudafe1.cpp
+[9/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq4_nl.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq4_nl.cu
+tmpxft_0000b1d8_00000000-7_mmq-instance-iq4_nl.cudafe1.cpp
+[10/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q4_0.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q4_0.cu
+tmpxft_000074f4_00000000-7_mmq-instance-q4_0.cudafe1.cpp
+[11/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq3_xxs.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq3_xxs.cu
+tmpxft_000087d0_00000000-7_mmq-instance-iq3_xxs.cudafe1.cpp
+[12/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-mxfp4.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-mxfp4.cu
+tmpxft_00003044_00000000-7_mmq-instance-mxfp4.cudafe1.cpp
+[13/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq3_s.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq3_s.cu
+tmpxft_00002028_00000000-7_mmq-instance-iq3_s.cudafe1.cpp
+[14/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq1_s.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq1_s.cu
+tmpxft_0000858c_00000000-7_mmq-instance-iq1_s.cudafe1.cpp
+[15/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q4_1.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q4_1.cu
+tmpxft_000067b0_00000000-7_mmq-instance-q4_1.cudafe1.cpp
+[16/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q5_1.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q5_1.cu
+tmpxft_00004b00_00000000-7_mmq-instance-q5_1.cudafe1.cpp
+[17/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q5_0.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q5_0.cu
+tmpxft_00001514_00000000-7_mmq-instance-q5_0.cudafe1.cpp
+[18/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq2_xs.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq2_xs.cu
+tmpxft_0000a954_00000000-7_mmq-instance-iq2_xs.cudafe1.cpp
+[19/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-iq2_s.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-iq2_s.cu
+tmpxft_00004a10_00000000-7_mmq-instance-iq2_s.cudafe1.cpp
+[20/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q3_k.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q3_k.cu
+tmpxft_0000532c_00000000-7_mmq-instance-q3_k.cudafe1.cpp
+[21/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q8_0.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q8_0.cu
+tmpxft_00008f4c_00000000-7_mmq-instance-q8_0.cudafe1.cpp
+[22/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-nvfp4.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-nvfp4.cu
+tmpxft_000023f4_00000000-7_mmq-instance-nvfp4.cudafe1.cpp
+[23/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q4_k.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q4_k.cu
+tmpxft_0000ae88_00000000-7_mmq-instance-q4_k.cudafe1.cpp
+[24/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q6_k.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q6_k.cu
+tmpxft_0000a85c_00000000-7_mmq-instance-q6_k.cudafe1.cpp
+[25/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q2_k.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q2_k.cu
+tmpxft_0000a8cc_00000000-7_mmq-instance-q2_k.cudafe1.cpp
+[26/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\template-instances\mmq-instance-q5_k.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmq-instance-q5_k.cu
+tmpxft_00006200_00000000-7_mmq-instance-q5_k.cudafe1.cpp
+[27/28] Building CUDA object src\ggml-cuda\CMakeFiles\ggml-cuda.dir\mmvq.cu.obj
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(636): warning #221-D: floating-point value does not fit in required floating-point type
+              return -((float)(1e+300)) ;
+                       ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                  ^
+
+C:\_myDrive\repos\spellcast3d\temp_code\ggml-mmq3\src\ggml-cuda\common.cuh(638): warning #221-D: floating-point value does not fit in required floating-point type
+              return make_half2(-((float)(1e+300)) , -((float)(1e+300)) );
+                                                       ^
+
+mmvq.cu
+tmpxft_0000616c_00000000-7_mmvq.cudafe1.cpp
+[28/28] Linking CUDA shared module bin\ggml-cuda.dll
+BUILD OK

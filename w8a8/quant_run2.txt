@@ -1,0 +1,14 @@
+weights (Q4_K / Q5_K -> int8 per output row)
+  Q4_K  4096 x  4096: in    9.4 MB out   16.8 MB | dequant div 0.137 ms (191 GB/s) rcp 0.119 ms (221 GB/s) | row amax (once per load) 0.263 ms | 16-lane rcp 0.117 ms (225 GB/s) | check (16-lane) 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q4_K 24576 x  4096: in   56.6 MB out  100.7 MB | dequant div 0.783 ms (201 GB/s) rcp 0.678 ms (232 GB/s) | row amax (once per load) 1.529 ms | 16-lane rcp 0.663 ms (237 GB/s) | check (16-lane) 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q4_K  4096 x 12288: in   28.3 MB out   50.3 MB | dequant div 0.373 ms (211 GB/s) rcp 0.336 ms (234 GB/s) | row amax (once per load) 0.691 ms | 16-lane rcp 0.335 ms (235 GB/s) | check (16-lane) 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q5_K  4096 x  4096: in   11.5 MB out   16.8 MB | dequant div 0.134 ms (212 GB/s) rcp 0.124 ms (229 GB/s) | row amax (once per load) 0.273 ms | 16-lane rcp 0.122 ms (232 GB/s) | check (16-lane) 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q5_K 16384 x  4096: in   46.1 MB out   67.1 MB | dequant div 0.514 ms (220 GB/s) rcp 0.477 ms (237 GB/s) | row amax (once per load) 1.059 ms | 16-lane rcp 0.469 ms (241 GB/s) | check (16-lane) 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+  Q5_K  4096 x 12288: in   34.6 MB out   50.3 MB | dequant div 0.388 ms (219 GB/s) rcp 0.358 ms (237 GB/s) | row amax (once per load) 0.792 ms | 16-lane rcp 0.353 ms (240 GB/s) | check (16-lane) 64 rows: 0 mismatches (max 0), s_row rel diff 0.0e+00
+activations (per-token int8)
+  tokens 4096 x  4096 f32 -> int8: 0.255 ms (329 GB/s) | check 32 rows: 0 mismatches
+  tokens 4096 x 12288 f32 -> int8: 0.752 ms (335 GB/s) | check 32 rows: 0 mismatches
+activations (per-token int8)
+  tokens 4096 x  4096 f32 -> int8: 0.255 ms (329 GB/s) | check 32 rows: 0 mismatches
+  tokens 4096 x 12288 f32 -> int8: 0.754 ms (334 GB/s) | check 32 rows: 0 mismatches
+  swiglu + per-token quant 4096 x [gate|up] 2 x 12288 f32 -> int8 12288: 1.358 ms (334 GB/s)

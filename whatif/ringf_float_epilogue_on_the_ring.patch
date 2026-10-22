@@ -1,0 +1,207 @@
+diff --git a/src/ggml-cuda/mmq-ring.cuh b/src/ggml-cuda/mmq-ring.cuh
+index 6701e8a6..e859b48f 100644
+--- a/src/ggml-cuda/mmq-ring.cuh
++++ b/src/ggml-cuda/mmq-ring.cuh
+@@ -122,7 +122,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_load_y(int * __restric
+ // The half H (sub-blocks 4H .. 4H + 3 of the K step) of the warp tile (RN x njt fragments, see above);
+ // sum[(jt*RN + n)*4 + l] (C fragment layout).
+ // rx: the raw blocks of the K step; y: the half tile; ds_h0 (H == 1): the s pairs of half 0 per column ([J][2] ints).
+-template <ggml_type type, int J, int H>
++// dsy == false (GGML_CUDA_MMQ_PIPE=ringf): y in the per-32 DS4 layout and the float epilogue of mmq-async.cuh (the same
++// operations per output: (f16 d*sc -> f32) * d_y * float(C), the min term -dmin*m by the f16 MMA), on the ring pipeline.
++template <ggml_type type, int J, int H, bool dsy>
+ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+         const int * __restrict__ rx, const int * __restrict__ y, float * __restrict__ sum, const int * __restrict__ ds_h0) {
+     typedef tile<16, 8, int> tile_A;
+@@ -134,8 +136,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+     constexpr int row_ints = ggml_cuda_mmq_async_raw_ints(type);
+     constexpr int qs_off   = type == GGML_TYPE_Q4_K ? 4 : 12; // ints: dm + scales (+ qh for Q5_K)
+     constexpr int qh_off   = 4;
+-    constexpr int centre   = ggml_cuda_mmq_ring_centre<type>();
+-    constexpr int G        = ggml_cuda_mmq_ring_G<type>();
++    constexpr int centre   = dsy ? ggml_cuda_mmq_ring_centre<type>() : 0;
++    constexpr int G        = dsy ? ggml_cuda_mmq_ring_G<type>() : 1;
+     constexpr int nsb      = 4;                    // sub-blocks per half
+     constexpr int njt      = J/(cg*tile_C::J);     // column tiles per warp
+     static_assert(njt <= 16 && tile_C::ne == 4 && nsb % G == 0, "unexpected warp tile");
+@@ -157,6 +159,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+     // with the sy bytes of a column gives sc_j * sy_j), d / MAX
+     int   scb[ntx][2][nsb];
+     float dxs[ntx][2];
++    // dsy == false: d*sc of the half's sub-blocks per lane row (half product, then f32, as the other paths)
++    float dmA[ntx][2][nsb];
+     // min term A (H == 1): m'_j of rows g, g + 8 for the sub-blocks 2t, 2t + 1 of the K step, as half2
+     int   min_A[ntx][2];
+ 
+@@ -200,7 +204,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+             const int sc32 = H == 0 ? (hdr.y & 0x3F3F3F3F) : ((hdr.w & 0x0F0F0F0F) | ((hdr.y >> 2) & 0x30303030));
+ #pragma unroll
+             for (int j = 0; j < nsb; ++j) {
+-                scb[n][r][j] = sc32 & (0xFF << (8*j));
++                if constexpr (dsy) {
++                    scb[n][r][j] = sc32 & (0xFF << (8*j));
++                } else {
++                    dmA[n][r][j] = __half2float(__hmul(__low2half(dm.h), __int2half_rn((sc32 >> (8*j)) & 0xFF)));
++                }
+             }
+             dxs[n][r] = __low2float(dm.h) * (1.0f/GGML_CUDA_MMQ_DSY_MAX);
+ 
+@@ -231,10 +239,16 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+     for (int jt = 0; jt < njt; ++jt) {
+         const int * yt = y + jt*(cg*tile_C::J)*MMQ_TILE_Y_K; // the 8 blocks of the column tile
+ 
+-        // min term B (H == 1): (s_2t, s_2t+1) of column g: header int t%2 of the block of half t/2 (half 0: ds_h0)
++        // min term B (H == 1): (s_2t, s_2t+1) of column g: header int t%2 of the block of half t/2 (half 0: ds_h0);
++        // DS4: the .y halves of ds4[2*(t%2)], ds4[2*(t%2) + 1]
+         int min_B = 0;
+         if constexpr (H == 1) {
+-            min_B = t < 2 ? ds_h0[(jt*cg*tile_C::J + g)*2 + t] : yt[g*MMQ_TILE_Y_K + t - 2];
++            if constexpr (dsy) {
++                min_B = t < 2 ? ds_h0[(jt*cg*tile_C::J + g)*2 + t] : yt[g*MMQ_TILE_Y_K + t - 2];
++            } else {
++                const int2 v = *(const int2 *) (yt + g*MMQ_TILE_Y_K + 2*(t & 1));
++                min_B = t < 2 ? ds_h0[(jt*cg*tile_C::J + g)*2 + t] : __byte_perm(v.x, v.y, 0x7632);
++            }
+         }
+ 
+         // B: two ldmatrix.x4 (sub-blocks 0, 1 and 2, 3): registers = B[2q].x[0], B[2q].x[1], B[2q+1].x[0], B[2q+1].x[1]
+@@ -247,14 +261,23 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+                 : "r"(src));
+         }
+ 
+-        // the columns 2t, 2t + 1 of the tile: d128 (f32) and the sy bytes
++        // the columns 2t, 2t + 1 of the tile: d128 (f32) and the sy bytes (DSY) or the 4 per-32 scales d (DS4)
+         float d128[2];
+         int   sy[2];
++        float dB[2][nsb];
+ #pragma unroll
+         for (int c = 0; c < 2; ++c) {
+-            const int2 v = *(const int2 *) (yt + (2*t + c)*MMQ_TILE_Y_K + 2);
+-            d128[c] = __int_as_float(v.x);
+-            sy[c]   = v.y;
++            if constexpr (dsy) {
++                const int2 v = *(const int2 *) (yt + (2*t + c)*MMQ_TILE_Y_K + 2);
++                d128[c] = __int_as_float(v.x);
++                sy[c]   = v.y;
++            } else {
++                const half2 * ds = (const half2 *) (yt + (2*t + c)*MMQ_TILE_Y_K);
++#pragma unroll
++                for (int j = 0; j < nsb; ++j) {
++                    dB[c][j] = __low2float(ds[j]);
++                }
++            }
+         }
+ 
+ #pragma unroll
+@@ -264,6 +287,13 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_vec_dot(
+             for (int j = 0; j < nsb; ++j) {
+                 tile_C C;
+                 mma(C, A[n][j], B[j]);
++                if constexpr (!dsy) {
++#pragma unroll
++                    for (int l = 0; l < tile_C::ne; ++l) {
++                        sum[(jt*ntx + n)*tile_C::ne + l] += dmA[n][l/2][j]*dB[l%2][j]*C.x[l];
++                    }
++                    continue;
++                }
+ #pragma unroll
+                 for (int l = 0; l < tile_C::ne; ++l) {
+                     const int m = (int) __dp4a((unsigned int) scb[n][l/2][j], (unsigned int) sy[l%2], 0u); // sc_j * sy_j, unsigned
+@@ -320,7 +350,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_write_back(
+ // Stage (kb, h), buffers: y ring slot s = (2*(kb - kb0_start) + h) % 3, raw x buffer b = (kb - kb0_start) % 2:
+ //   wait for the group of stage (kb, h), barrier; issue stage (kb, h) + 2: y(kb + 1, h) and, for h == 0, x[kb + 1];
+ //   commit (possibly empty); vec_dot half h.
+-template <ggml_type type, int J, bool fallback, bool fixup>
++template <ggml_type type, int J, bool fallback, bool fixup, bool dsy = true>
+ static __device__ __forceinline__ void ggml_cuda_mmq_ring_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+@@ -374,9 +404,10 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_process_tile(
+         }
+         ggml_cuda_mmq_async_commit();
+         if (tid < 2*J) { // the s pairs of half 0 for the min term in half 1 (its buffer is refilled during half 1)
+-            ds_h0[tid] = ty0[s0*ty_size + (tid/2)*MMQ_TILE_Y_K + tid%2];
++            const int * hdr = ty0 + s0*ty_size + (tid/2)*MMQ_TILE_Y_K;
++            ds_h0[tid] = dsy ? hdr[tid%2] : __byte_perm(hdr[2*(tid%2)], hdr[2*(tid%2) + 1], 0x7632);
+         }
+-        ggml_cuda_mmq_ring_vec_dot<type, J, 0>(rx0 + b*rx_size, ty0 + s0*ty_size, sum, ds_h0);
++        ggml_cuda_mmq_ring_vec_dot<type, J, 0, dsy>(rx0 + b*rx_size, ty0 + s0*ty_size, sum, ds_h0);
+ 
+         // half 1: y(kb, 1) in s1; issue y(kb + 1, 1) -> s0 (consumed: y(kb, 0))
+         ggml_cuda_mmq_async_wait<1>();
+@@ -385,7 +416,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_ring_process_tile(
+             ggml_cuda_mmq_ring_load_y<J>(ty0 + s0*ty_size, by_next + ncols_y*sz);
+         }
+         ggml_cuda_mmq_async_commit();
+-        ggml_cuda_mmq_ring_vec_dot<type, J, 1>(rx0 + b*rx_size, ty0 + s1*ty_size, sum, ds_h0);
++        ggml_cuda_mmq_ring_vec_dot<type, J, 1, dsy>(rx0 + b*rx_size, ty0 + s1*ty_size, sum, ds_h0);
+ 
+         s0 = s2;
+         b ^= 1;
+diff --git a/src/ggml-cuda/mmq.cuh b/src/ggml-cuda/mmq.cuh
+index 16902351..459cb6fa 100644
+--- a/src/ggml-cuda/mmq.cuh
++++ b/src/ggml-cuda/mmq.cuh
+@@ -34,6 +34,7 @@ enum ggml_cuda_mmq_pipe {
+     GGML_CUDA_MMQ_PIPE_OFF   = 0,
+     GGML_CUDA_MMQ_PIPE_ASYNC = 1,
+     GGML_CUDA_MMQ_PIPE_RING  = 2,
++    GGML_CUDA_MMQ_PIPE_RINGF = 3, // the ring pipeline with the per-32 activations and float epilogue of async
+ };
+ #define GGML_CUDA_MMQ_PIPE_DEFAULT GGML_CUDA_MMQ_PIPE_ASYNC
+ 
+@@ -46,6 +47,9 @@ static int ggml_cuda_mmq_get_pipe() {
+         if (strcmp(env, "ring") == 0) {
+             return (int) GGML_CUDA_MMQ_PIPE_RING;
+         }
++        if (strcmp(env, "ringf") == 0) {
++            return (int) GGML_CUDA_MMQ_PIPE_RINGF;
++        }
+         if (strcmp(env, "async") == 0) {
+             return (int) GGML_CUDA_MMQ_PIPE_ASYNC;
+         }
+@@ -973,7 +977,8 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
+ 
+ // The threads per CUDA block of mul_mat_q with the pipeline pipe (the ring has its own warp tiles).
+ static constexpr __device__ int ggml_cuda_mmq_get_nthreads_pipe(ggml_type type, int J, bool fallback, int pipe) {
+-    return pipe == GGML_CUDA_MMQ_PIPE_RING ? GGML_CUDA_MMQ_RING_NTHREADS : ggml_cuda_mmq_get_nthreads(type, J, fallback);
++    return pipe == GGML_CUDA_MMQ_PIPE_RING || pipe == GGML_CUDA_MMQ_PIPE_RINGF ? GGML_CUDA_MMQ_RING_NTHREADS :
++        ggml_cuda_mmq_get_nthreads(type, J, fallback);
+ }
+ 
+ // pipe: GGML_CUDA_MMQ_PIPE_OFF (the default tile loop below), _ASYNC (mmq-async.cuh) or _RING (mmq-ring.cuh, y in the
+@@ -987,8 +992,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+ 
+ #ifdef GGML_CUDA_MMQ_ASYNC_DEVICE
+-    if constexpr (pipe == GGML_CUDA_MMQ_PIPE_RING && ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
+-        ggml_cuda_mmq_ring_process_tile<type, J, fallback, fixup>
++    if constexpr ((pipe == GGML_CUDA_MMQ_PIPE_RING || pipe == GGML_CUDA_MMQ_PIPE_RINGF) && ggml_cuda_mmq_async_device_ok<type, J, fallback>()) {
++        ggml_cuda_mmq_ring_process_tile<type, J, fallback, fixup, pipe == GGML_CUDA_MMQ_PIPE_RING>
+             (x, offset_x, y, ids_dst, dst, tmp_fixup, y_scale, stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+         return;
+@@ -1584,8 +1589,9 @@ static void launch_mul_mat_q_impl(ggml_backend_cuda_context & ctx, const mmq_arg
+ 
+     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+     GGML_ASSERT(config.nthreads % warp_size == 0);
+-    const int nwarps = (pipe == GGML_CUDA_MMQ_PIPE_RING ? GGML_CUDA_MMQ_RING_NTHREADS : config.nthreads) / warp_size;
+-    const int nbytes_shared = pipe == GGML_CUDA_MMQ_PIPE_RING  ? ggml_cuda_mmq_ring_nbytes_shared(config) :
++    const bool ring  = pipe == GGML_CUDA_MMQ_PIPE_RING || pipe == GGML_CUDA_MMQ_PIPE_RINGF;
++    const int nwarps = (ring ? GGML_CUDA_MMQ_RING_NTHREADS : config.nthreads) / warp_size;
++    const int nbytes_shared = ring                             ? ggml_cuda_mmq_ring_nbytes_shared(config) :
+                               pipe == GGML_CUDA_MMQ_PIPE_ASYNC ? ggml_cuda_mmq_async_nbytes_shared(config) :
+                                                                  mmq_get_nbytes_shared(config, cc);
+ 
+@@ -1690,6 +1696,11 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+             launch_mul_mat_q_impl<type, J, fallback, GGML_CUDA_MMQ_PIPE_RING>(ctx, args, stream, tile_group);
+             return;
+         }
++        if (ggml_cuda_mmq_get_pipe() == GGML_CUDA_MMQ_PIPE_RINGF && ggml_cuda_mmq_ring_available(config, cc, smpbo) && aligned &&
++                args.ids_dst == nullptr) {
++            launch_mul_mat_q_impl<type, J, fallback, GGML_CUDA_MMQ_PIPE_RINGF>(ctx, args, stream, tile_group);
++            return;
++        }
+         if (ggml_cuda_mmq_get_pipe() != GGML_CUDA_MMQ_PIPE_OFF && ggml_cuda_mmq_async_available(config, cc, smpbo) && aligned) {
+             launch_mul_mat_q_impl<type, J, fallback, GGML_CUDA_MMQ_PIPE_ASYNC>(ctx, args, stream, tile_group);
+             return;

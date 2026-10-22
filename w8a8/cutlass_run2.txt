@@ -1,0 +1,45 @@
+NVIDIA GeForce RTX 3060, 28 SMs, clock 1807 MHz
+M 4096 K 4096 N 16384 (2MNK = 5.5e+11)
+  128x128x64 w64x64 s3               EVT (fused scale)     7.470 ms    73.6 T/s   72.2 % of 102  maxrel 9.0e-08
+  128x128x64 w64x64 s3               LC f32 GEMM alone     7.255 ms    75.8 T/s | + scale kernel 1.621 ms = 8.804 ms   62.4 T/s  maxrel 9.9e-08
+  128x128x64 w64x64 s3               I32 GEMM alone        7.353 ms    74.8 T/s | + scale kernel = 8.801 ms   62.5 T/s  maxrel 9.9e-08
+  128x128x64 w64x64 s4               EVT (fused scale)     6.727 ms    81.7 T/s   80.1 % of 102  maxrel 9.0e-08
+  128x256x64 w64x64 s3               EVT (fused scale)     6.373 ms    86.3 T/s   84.6 % of 102  maxrel 9.0e-08
+  128x256x64 w64x64 s3               LC f32 GEMM alone     6.376 ms    86.2 T/s | + scale kernel 1.623 ms = 7.902 ms   69.6 T/s  maxrel 9.9e-08
+  128x256x64 w64x64 s3               I32 GEMM alone        6.389 ms    86.1 T/s | + scale kernel = 7.907 ms   69.5 T/s  maxrel 9.9e-08
+  256x128x64 w64x64 s3               EVT (fused scale)     6.296 ms    87.3 T/s   85.6 % of 102  maxrel 9.0e-08
+  128x128x128 w64x64 s3              EVT (fused scale)     6.901 ms    79.7 T/s   78.1 % of 102  maxrel 9.0e-08
+  128x256x64 w64x64 s4               EVT (fused scale)     8.140 ms    67.5 T/s   66.2 % of 102  maxrel 9.0e-08
+M 4096 K 4096 N 4096 (2MNK = 1.37e+11)
+  128x128x64 w64x64 s3               EVT (fused scale)     1.716 ms    80.1 T/s   78.5 % of 102  maxrel 9.6e-08
+  128x128x64 w64x64 s3               LC f32 GEMM alone     1.697 ms    81.0 T/s | + scale kernel 0.412 ms = 2.083 ms   66.0 T/s  maxrel 9.9e-08
+  128x128x64 w64x64 s3               I32 GEMM alone        1.692 ms    81.2 T/s | + scale kernel = 2.111 ms   65.1 T/s  maxrel 9.9e-08
+  128x128x64 w64x64 s4               EVT (fused scale)     1.546 ms    88.9 T/s   87.1 % of 102  maxrel 9.6e-08
+  128x256x64 w64x64 s3               EVT (fused scale)     1.609 ms    85.4 T/s   83.8 % of 102  maxrel 9.6e-08
+  128x256x64 w64x64 s3               LC f32 GEMM alone     1.607 ms    85.5 T/s | + scale kernel 0.413 ms = 1.981 ms   69.4 T/s  maxrel 9.9e-08
+  128x256x64 w64x64 s3               I32 GEMM alone        1.615 ms    85.1 T/s | + scale kernel = 2.012 ms   68.3 T/s  maxrel 9.9e-08
+  256x128x64 w64x64 s3               EVT (fused scale)     1.536 ms    89.5 T/s   87.7 % of 102  maxrel 9.6e-08
+  128x128x128 w64x64 s3              EVT (fused scale)     1.648 ms    83.4 T/s   81.8 % of 102  maxrel 9.6e-08
+  128x256x64 w64x64 s4               EVT (fused scale)     1.709 ms    80.4 T/s   78.8 % of 102  maxrel 9.6e-08
+M 4096 K 4096 N 24576 (2MNK = 8.25e+11)
+  128x128x64 w64x64 s3               EVT (fused scale)    12.577 ms    65.6 T/s   64.3 % of 102  maxrel 9.1e-08
+  128x128x64 w64x64 s3               LC f32 GEMM alone    12.563 ms    65.6 T/s | + scale kernel 2.429 ms = 14.983 ms   55.0 T/s  maxrel 9.2e-08
+  128x128x64 w64x64 s3               I32 GEMM alone       12.603 ms    65.4 T/s | + scale kernel = 14.819 ms   55.6 T/s  maxrel 9.2e-08
+  128x128x64 w64x64 s4               EVT (fused scale)    10.538 ms    78.3 T/s   76.7 % of 102  maxrel 9.1e-08
+  128x256x64 w64x64 s3               EVT (fused scale)     9.987 ms    82.6 T/s   81.0 % of 102  maxrel 9.1e-08
+  128x256x64 w64x64 s3               LC f32 GEMM alone    10.105 ms    81.6 T/s | + scale kernel 2.432 ms = 12.159 ms   67.8 T/s  maxrel 9.2e-08
+  128x256x64 w64x64 s3               I32 GEMM alone        9.963 ms    82.8 T/s | + scale kernel = 12.457 ms   66.2 T/s  maxrel 9.2e-08
+  256x128x64 w64x64 s3               EVT (fused scale)     9.605 ms    85.9 T/s   84.2 % of 102  maxrel 9.1e-08
+  128x128x128 w64x64 s3              EVT (fused scale)    11.212 ms    73.6 T/s   72.1 % of 102  maxrel 9.1e-08
+  128x256x64 w64x64 s4               EVT (fused scale)    12.975 ms    63.6 T/s   62.3 % of 102  maxrel 9.1e-08
+M 4096 K 12288 N 4096 (2MNK = 4.12e+11)
+  128x128x64 w64x64 s3               EVT (fused scale)     5.146 ms    80.1 T/s   78.6 % of 102  maxrel 1.1e-07
+  128x128x64 w64x64 s3               LC f32 GEMM alone     5.039 ms    81.8 T/s | + scale kernel 0.416 ms = 5.303 ms   77.7 T/s  maxrel 9.0e-08
+  128x128x64 w64x64 s3               I32 GEMM alone        5.088 ms    81.0 T/s | + scale kernel = 5.703 ms   72.3 T/s  maxrel 9.0e-08
+  128x128x64 w64x64 s4               EVT (fused scale)     4.564 ms    90.3 T/s   88.6 % of 102  maxrel 1.1e-07
+  128x256x64 w64x64 s3               EVT (fused scale)     4.475 ms    92.1 T/s   90.3 % of 102  maxrel 1.1e-07
+  128x256x64 w64x64 s3               LC f32 GEMM alone     4.466 ms    92.3 T/s | + scale kernel 0.414 ms = 4.825 ms   85.5 T/s  maxrel 9.0e-08
+  128x256x64 w64x64 s3               I32 GEMM alone        4.483 ms    92.0 T/s | + scale kernel = 4.879 ms   84.5 T/s  maxrel 9.0e-08
+  256x128x64 w64x64 s3               EVT (fused scale)     4.475 ms    92.1 T/s   90.3 % of 102  maxrel 1.1e-07
+  128x128x128 w64x64 s3              EVT (fused scale)     4.725 ms    87.3 T/s   85.6 % of 102  maxrel 1.1e-07
+  128x256x64 w64x64 s4               EVT (fused scale)     5.105 ms    80.8 T/s   79.2 % of 102  maxrel 1.1e-07

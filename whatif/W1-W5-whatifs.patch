@@ -1,0 +1,246 @@
+diff --git a/src/ggml-cuda/mmq-async.cuh b/src/ggml-cuda/mmq-async.cuh
+index 26ed63a8..0da2a1cf 100644
+--- a/src/ggml-cuda/mmq-async.cuh
++++ b/src/ggml-cuda/mmq-async.cuh
+@@ -18,6 +18,17 @@
+ #include "cp-async.cuh"
+ #include "unary.cuh"
+ 
++// WHAT-IF switches (timing only, wrong results; not for commit): 0 = off, 1 = W1 no epilogue, 2 = W2 W1 + constant B /
++// scale fragments, 3 = W3 W1 + no global loads after the prologue, 4 = W4 W1 + 3-deep y ring (Q4_K), 5 = W5 W1 + 64x32
++#ifndef GGML_MMQ_WI
++#define GGML_MMQ_WI 1
++#endif
++#define WI_NOEPI    (GGML_MMQ_WI >= 1)
++#define WI_CONSTB   (GGML_MMQ_WI == 2)
++#define WI_NOGLOBAL (GGML_MMQ_WI == 3)
++#define WI_RING3    (GGML_MMQ_WI == 4)
++#define WI_6432     (GGML_MMQ_WI == 5)
++
+ #define GGML_CUDA_MMQ_ASYNC_I        128
+ #define GGML_CUDA_MMQ_ASYNC_J        128
+ #define GGML_CUDA_MMQ_ASYNC_NTHREADS 256
+@@ -41,6 +52,10 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_async_dm_bytes() {
+ 
+ // ids[J] | raw x: 2 buffers | y: 2 half tiles | scales: 2 buffers | y half 0's (d, s) for the min term (J*4 half2)
+ static __host__ size_t ggml_cuda_mmq_async_nbytes_shared(const ggml_cuda_mmq_config & c) {
++    if (WI_RING3 && c.type == GGML_TYPE_Q4_K) {
++        return c.J*sizeof(int) + 2*c.I*ggml_cuda_mmq_async_raw_ints(c.type)*sizeof(int) + 3*c.J*MMQ_TILE_Y_K*sizeof(int) +
++            c.J*4*sizeof(half2);
++    }
+     return c.J*sizeof(int) + 2*c.I*ggml_cuda_mmq_async_raw_ints(c.type)*sizeof(int) + 2*c.J*MMQ_TILE_Y_K*sizeof(int) +
+         2*ggml_cuda_mmq_async_dm_bytes() + c.J*4*sizeof(half2);
+ }
+@@ -185,7 +200,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_mma_f16_f32(
+         : "r"(A0), "r"(A1), "r"(B));
+ }
+ 
+-template <ggml_type type, int J, bool fallback>
++template <ggml_type type, int J, bool fallback, bool regscales = false>
+ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
+         const int * __restrict__ rx, const float * __restrict__ dmd, const half2 * __restrict__ dmm,
+         const int * __restrict__ y, float * __restrict__ sum, int2 * __restrict__ ds_h0, const int h) {
+@@ -193,7 +208,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
+     typedef tile< 8,  8, int> tile_B;
+     typedef tile<16,  8, int> tile_C;
+ 
+-    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
++    constexpr int rows_per_warp = WI_6432 ? 64 : ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+     constexpr int row_ints      = ggml_cuda_mmq_async_raw_ints(type);
+     constexpr int qs_off        = type == GGML_TYPE_Q4_K ? 4 : 12; // ints: dm + scales (+ qh for Q5_K)
+@@ -258,7 +273,22 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
+ #pragma unroll
+             for (int l = 0; l < 2; ++l) {
+                 const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+-                min_A[n][l] = *(const int *) (dmm + i*(GGML_CUDA_MMQ_ASYNC_DM_ROW/2) + ty);
++                if (WI_CONSTB) {
++                    min_A[n][l] = 0x3c003c00 + n + l;
++                } else if (regscales) {
++                    const int4 hdr = *(const int4 *) (rx + i*row_ints);
++                    const int m32 = ty < 2 ? (hdr.z & 0x3F3F3F3F) : (((hdr.w >> 4) & 0x0F0F0F0F) | ((hdr.z >> 2) & 0x30303030));
++                    const int sh  = 16*(ty & 1);
++                    const half2 mm = make_half2(__int2half_rn((m32 >> sh) & 0x3F), __int2half_rn((m32 >> (sh + 8)) & 0x3F));
++                    union { int i; half2 h; } u;
++                    u.i = hdr.x;
++                    const half nd = -__high2half(u.h);
++                    union { half2 h; int i; } r;
++                    r.h = __hmul2(make_half2(nd, nd), mm);
++                    min_A[n][l] = r.i;
++                } else {
++                    min_A[n][l] = *(const int *) (dmm + i*(GGML_CUDA_MMQ_ASYNC_DM_ROW/2) + ty);
++                }
+             }
+         }
+     }
+@@ -269,7 +299,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
+         // min term B: s of column j0 + lane/4, sub-blocks 2*ty, 2*ty + 1. Half 0: the (d, s) pairs of sub-blocks 0 .. 3
+         // to ds_h0, column tile jt by the warp (threadIdx.y/ntx) == jt % (nwarps/ntx) of the column set.
+         int min_B = 0;
+-        if (h == 0) {
++        if (WI_CONSTB) {
++            min_B = 0x3c003c00 + jt;
++        } else if (h == 0) {
+             if (ty < 2 && jt % (nwarps/ntx) == threadIdx.y/ntx) {
+                 ds_h0[(jt*tile_C::J + threadIdx.x/4)*2 + ty] =
+                     *(const int2 *) (y_dm + (j0 + threadIdx.x/4)*MMQ_TILE_Y_K + 2*ty);
+@@ -285,7 +317,12 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
+             tile_B   B;
+             float    dB[tile_C::ne/2];
+ 
+-            load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
++            if (WI_CONSTB) {
++                B.x[0] = 0x01010101*(k01 + 1) + j0;
++                B.x[1] = 0x01010101*(k01 + 2) + j0;
++            } else {
++                load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K); // faster than load_ldmatrix
++            }
+ 
+ #pragma unroll
+             for (int l = 0; l < tile_C::ne/2; ++l) {
+@@ -297,12 +334,25 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_vec_dot(
+ #pragma unroll
+             for (int n = 0; n < ntx; ++n) {
+                 tile_C C;
++#if WI_NOEPI
++#pragma unroll
++                for (int l = 0; l < tile_C::ne; ++l) {
++                    C.x[l] = __float_as_int(sum[(j0/tile_C::J + n)*tile_C::ne + l]);
++                }
++                mma(C, A[n][k01/QI8_1], B);
++#pragma unroll
++                for (int l = 0; l < tile_C::ne; ++l) {
++                    sum[(j0/tile_C::J + n)*tile_C::ne + l] = __int_as_float(C.x[l]);
++                }
++                GGML_UNUSED(dB);
++#else
+                 mma(C, A[n][k01/QI8_1], B);
+ 
+ #pragma unroll
+                 for (int l = 0; l < tile_C::ne; ++l) {
+                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA[n][l/2][k01/QI8_1]*dB[l%2]*C.x[l];
+                 }
++#endif
+             }
+         }
+ 
+@@ -442,6 +492,87 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_glu_q8_1(
+     }
+ }
+ 
++
++// WHAT-IF W4: 3-deep ring of y half tiles (prefetch lead two halves), one barrier per half, raw x double buffered per
++// K step (x[kb + 1] issued with y(kb + 1, 0) during half 0 of kb), min term A from the raw header in registers.
++template <ggml_type type, int J, bool fallback, bool fixup, int glu_qlayout = -1>
++static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile_ring3(
++        const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
++        const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
++        const float * __restrict__ y_scale,
++        const int stride_row_x, const int ncols_y, const int stride_col_dst,
++        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
++        const ggml_cuda_mmq_glu_args glu = ggml_cuda_mmq_glu_args()) {
++    constexpr bool is_glu  = glu_qlayout >= 0;
++    constexpr int nthreads = GGML_CUDA_MMQ_ASYNC_NTHREADS;
++    constexpr int I        = GGML_CUDA_MMQ_ASYNC_I;
++    constexpr int qk       = ggml_cuda_type_traits<type>::qk;
++    constexpr int row_ints = ggml_cuda_mmq_async_raw_ints(type);
++    constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
++    constexpr int ne_block = QK8_1_MMQ;
++    constexpr int sz       = sizeof(block_q8_1_mmq) / sizeof(int);
++    constexpr int rx_size  = I*row_ints;
++    constexpr int ty_size  = J*MMQ_TILE_Y_K;
++
++    extern __shared__ int data_mul_mat_q[];
++    int  * rx0   = data_mul_mat_q + J;
++    int  * ty0   = rx0 + 2*rx_size;
++    int2 * ds_h0 = (int2 *) (ty0 + 3*ty_size);
++
++    float sum[J*I / nthreads] = {0.0f};
++
++    {
++        const int * by = y + ncols_y*((kb0_start*qk/ne_block)*sz);
++        ggml_cuda_mmq_async_load_x<type, fallback, is_glu>(rx0, x, offset_x + kb0_start, tile_x_max_i, stride_row_x, glu.shift);
++        ggml_cuda_mmq_async_load_y<J>(ty0, by);
++        ggml_cuda_mmq_async_commit();
++        ggml_cuda_mmq_async_load_y<J>(ty0 + ty_size, by + ncols_y*sz);
++        ggml_cuda_mmq_async_commit();
++    }
++
++    int s0 = 0; // ring slot of half 0 of kb (half 1: s0 + 1 mod 3)
++    int b  = 0;
++    for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
++        const bool has_next = kb0 + 1 < kb0_stop;
++        const int * by_next = y + ncols_y*(((kb0 + 1)*qk/ne_block)*sz);
++        const int s1 = s0 == 2 ? 0 : s0 + 1;
++        const int s2 = s1 == 2 ? 0 : s1 + 1;
++
++        // half 0: y(kb, 0) in s0; issue y(kb + 1, 0) -> s2 and x[kb + 1]
++        ggml_cuda_mmq_async_wait<1>();
++        __syncthreads();
++        if (has_next) {
++            ggml_cuda_mmq_async_load_y<J>(ty0 + s2*ty_size, by_next);
++            ggml_cuda_mmq_async_load_x<type, fallback, is_glu>(rx0 + (b ^ 1)*rx_size, x, offset_x + kb0 + 1, tile_x_max_i, stride_row_x, glu.shift);
++        }
++        ggml_cuda_mmq_async_commit();
++        ggml_cuda_mmq_async_vec_dot<type, J, fallback, true>(rx0 + b*rx_size, nullptr, nullptr, ty0 + s0*ty_size, sum, ds_h0, 0);
++
++        // half 1: y(kb, 1) in s1; issue y(kb + 1, 1) -> s0 (y(kb, 0) is consumed)
++        ggml_cuda_mmq_async_wait<1>();
++        __syncthreads();
++        if (has_next) {
++            ggml_cuda_mmq_async_load_y<J>(ty0 + s0*ty_size, by_next + ncols_y*sz);
++        }
++        ggml_cuda_mmq_async_commit();
++        ggml_cuda_mmq_async_vec_dot<type, J, fallback, true>(rx0 + b*rx_size, nullptr, nullptr, ty0 + s1*ty_size, sum, ds_h0, 1);
++
++        s0 = s2;
++        b ^= 1;
++    }
++
++    if constexpr (is_glu) {
++        static_assert(!fixup && !fallback, "the SwiGLU epilogue needs whole tiles");
++        __syncthreads(); // the last half's shared memory reads
++        ggml_cuda_mmq_async_glu_q8_1<type, J, glu_qlayout>(sum, (float *) rx0, glu, tile_y_max_j);
++        GGML_UNUSED(write_back);
++    } else if (fixup) {
++        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
++    } else {
++        write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
++    }
++}
++
+ // Drop-in for mul_mat_q_process_tile (same arguments and results). Pipeline per K step kb (buffers b = step parity):
+ //   vec_dot half 0 (x[kb] raw + scales, y half 0)        | in flight: y half 1 of kb, raw x of kb + 1
+ //   wait, barrier; copy y half 0 of kb + 1; scales of kb + 1 from its raw x
+@@ -456,6 +587,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
+         const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+         const ggml_cuda_mmq_glu_args glu = ggml_cuda_mmq_glu_args()) {
++    if constexpr (WI_RING3 && type == GGML_TYPE_Q4_K) {
++        ggml_cuda_mmq_async_process_tile_ring3<type, J, fallback, fixup, glu_qlayout>(x, offset_x, y, ids_dst, dst, tmp_fixup,
++            y_scale, stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, glu);
++        return;
++    }
+     constexpr bool is_glu  = glu_qlayout >= 0;
+     constexpr int nthreads = GGML_CUDA_MMQ_ASYNC_NTHREADS;
+     constexpr int I        = GGML_CUDA_MMQ_ASYNC_I;
+@@ -509,7 +645,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
+         __syncthreads();
+ 
+         if (has_next) {
+-            ggml_cuda_mmq_async_load_y<J>(ty0, by_next);
++            if (!WI_NOGLOBAL) ggml_cuda_mmq_async_load_y<J>(ty0, by_next);
+             ggml_cuda_mmq_async_commit();
+             ggml_cuda_mmq_async_scales<type>(dmd(b ^ 1), dmm(b ^ 1), rx0 + (b ^ 1)*rx_size);
+         }
+@@ -520,8 +656,8 @@ static __device__ __forceinline__ void ggml_cuda_mmq_async_process_tile(
+         __syncthreads();
+ 
+         if (has_next) {
+-            ggml_cuda_mmq_async_load_y<J>(ty1, by_next + ncols_y*sz);
+-            if (kb0 + 2 < kb0_stop) {
++            if (!WI_NOGLOBAL) ggml_cuda_mmq_async_load_y<J>(ty1, by_next + ncols_y*sz);
++            if (!WI_NOGLOBAL && kb0 + 2 < kb0_stop) {
+                 ggml_cuda_mmq_async_load_x<type, fallback, is_glu>(rx0 + b*rx_size, x, offset_x + kb0 + 2, tile_x_max_i, stride_row_x, glu.shift);
+             }
+             ggml_cuda_mmq_async_commit();

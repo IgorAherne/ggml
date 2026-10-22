@@ -1,0 +1,182 @@
+== W1 no epilogue  2026-10-22 20:57:17  PIPE=unset
+mm q4_K: median 2.509 ms (min 2.502), 54.8 T/s, hash 5ddd9b68a97a9963, sum nan, |sum| nan
+glu q4_K: median 19.967 ms (min 18.529), 62.0 T/s, hash 3e49eba90c6dbfce, sum nan, |sum| nan
+mm q4_K: median 7.084 ms (min 7.071), 58.2 T/s, hash 9231d00b6d096509, sum -3.80143e+06, |sum| 6.18103e+07
+mm q5_K: median 2.528 ms (min 2.515), 54.4 T/s, hash c3f5c344b530acbf, sum nan, |sum| nan
+mm q4_K: median 1.529 ms (min 1.520), 50.5 T/s, hash 880edb0895c8d830, sum nan, |sum| nan
+== W2 = W1 + constant B and scale fragments  2026-10-22 21:03:28  PIPE=unset
+[gpu-lock 21:03:28] The GPU lock is held by QS (pid 27960, running) since 2026-10-22T21:03:24+02:00, heartbeat 5 s ago, expected 3 min: sd-cli ork_right.png. Waiting (0 s so far).
+[gpu-lock 21:03:48] The GPU lock is held by QS (pid 27960, running) since 2026-10-22T21:03:24+02:00, heartbeat 25 s ago, expected 3 min: sd-cli ork_right.png. Waiting (20 s so far).
+[gpu-lock 21:04:08] The GPU lock is held by QS (pid 27960, running) since 2026-10-22T21:03:24+02:00, heartbeat 45 s ago, expected 3 min: sd-cli ork_right.png. Waiting (40 s so far).
+mm q4_K: median 2.660 ms (min 2.649), 51.7 T/s, hash e9bd637ca985b783, sum 2.2128e+09, |sum| 2.2128e+09
+glu q4_K: median 20.346 ms (min 18.303), 60.8 T/s, hash 21609369a7062783, sum 7.08181e+09, |sum| 7.08181e+09
+mm q4_K: median 7.413 ms (min 7.356), 55.6 T/s, hash edccdb8d737b3b83, sum 7.08162e+09, |sum| 7.08162e+09
+mm q5_K: median 2.594 ms (min 2.577), 53.0 T/s, hash 378483bbfcf81b83, sum 2.28614e+09, |sum| 2.28614e+09
+mm q4_K: median 1.610 ms (min 1.604), 48.0 T/s, hash a27a525a2ff57383, sum 1.23895e+09, |sum| 1.23895e+09
+== W3 = W1 + no global loads after the prologue  2026-10-22 21:09:57  PIPE=unset
+mm q4_K: median 2.308 ms (min 2.306), 59.5 T/s, hash 5d5453af09fc431e, sum nan, |sum| nan
+glu q4_K: median 17.770 ms (min 16.071), 69.6 T/s, hash 16c245bceb660c06, sum nan, |sum| nan
+mm q4_K: median 6.655 ms (min 6.643), 62.0 T/s, hash 5ab4fb9d12e5b7ee, sum nan, |sum| nan
+mm q5_K: median 2.222 ms (min 2.219), 61.9 T/s, hash b222c952a042e6d8, sum nan, |sum| nan
+mm q4_K: median 1.410 ms (min 1.408), 54.8 T/s, hash ffc27eb55a27ce51, sum nan, |sum| nan
+== W4 = W1 + 3-deep y ring, lead 2 halves, 1 barrier/half (Q4_K only)  2026-10-22 21:11:52  PIPE=unset
+mm q4_K: median 2.467 ms (min 2.461), 55.7 T/s, hash 5ddd9b68a97a9963, sum nan, |sum| nan
+glu q4_K: median 19.088 ms (min 18.733), 64.8 T/s, hash 3e49eba90c6dbfce, sum nan, |sum| nan
+mm q4_K: median 7.141 ms (min 6.966), 57.7 T/s, hash 9231d00b6d096509, sum -3.80143e+06, |sum| 6.18103e+07
+mm q5_K: median 2.555 ms (min 2.544), 53.8 T/s, hash c3f5c344b530acbf, sum nan, |sum| nan
+mm q4_K: median 1.491 ms (min 1.486), 51.9 T/s, hash 880edb0895c8d830, sum nan, |sum| nan
+== W5 = W1 + 64x32 warp tile  2026-10-22 21:13:53  PIPE=unset
+mm q4_K: median 2.539 ms (min 2.531), 54.1 T/s, hash a1be107c2ff9a3cf, sum nan, |sum| nan
+glu q4_K: median 19.841 ms (min 18.617), 62.3 T/s, hash bc39c8b6563678c1, sum nan, |sum| nan
+mm q4_K: median 7.156 ms (min 7.145), 57.6 T/s, hash d153df939866e541, sum -3.80143e+06, |sum| 6.18103e+07
+mm q5_K: median 2.690 ms (min 2.600), 51.1 T/s, hash 88260d4aabb55ab7, sum nan, |sum| nan
+mm q4_K: median 1.547 ms (min 1.538), 50.0 T/s, hash 06a8869a072566b0, sum nan, |sum| nan
+== W0 baseline (WI=0)  2026-10-22 21:15:51  PIPE=unset
+mm q4_K: median 3.069 ms (min 3.067), 44.8 T/s, hash c06cfba24dc30fd0, sum 5416.13, |sum| 1.71299e+07
+glu q4_K: median 24.899 ms (min 24.871), 49.7 T/s, hash 539c2683be1c7ecc, sum -20556.1, |sum| 3.02132e+07
+mm q4_K: median 8.958 ms (min 8.947), 46.0 T/s, hash ed0d2b1e0591c6bf, sum -1303.23, |sum| 2.96796e+07
+mm q5_K: median 3.275 ms (min 3.100), 42.0 T/s, hash 13b791ed018d1697, sum 5944.8, |sum| 1.71282e+07
+mm q4_K: median 1.837 ms (min 1.834), 42.1 T/s, hash 191a301da1996ef6, sum 3742.54, |sum| 1.11222e+07
+== W1 rerun  2026-10-22 21:17:54  PIPE=unset
+mm q4_K: median 2.509 ms (min 2.503), 54.8 T/s, hash 5ddd9b68a97a9963, sum nan, |sum| nan
+glu q4_K: median 20.010 ms (min 18.766), 61.8 T/s, hash 3e49eba90c6dbfce, sum nan, |sum| nan
+mm q4_K: median 7.080 ms (min 7.070), 58.2 T/s, hash 9231d00b6d096509, sum -3.80143e+06, |sum| 6.18103e+07
+mm q5_K: median 2.537 ms (min 2.524), 54.2 T/s, hash c3f5c344b530acbf, sum nan, |sum| nan
+mm q4_K: median 1.528 ms (min 1.525), 50.6 T/s, hash 880edb0895c8d830, sum nan, |sum| nan
+== ring RN1 CG1 (16x128, 256 thr), f32 d128
+mm q4_K 4096 4096 4096:
+   async     3.071 ms    44.8 T/s   (3.071)  c06cfba24dc30fd0
+   ring      4.150 ms    33.1 T/s   (4.150)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+mm q5_K 4096 4096 4096:
+   async     3.290 ms    41.8 T/s   (3.290)  13b791ed018d1697
+   ring      4.108 ms    33.5 T/s   (4.108)  5af8db411aa23e32
+   ring vs async: rel L2 1.219e-02  max|d|/rms 6.204e-02  nan 0
+== ring RN1 CG1, volatile dp4a
+mm q4_K 4096 4096 4096:
+   async     3.069 ms    44.8 T/s   (3.069)  c06cfba24dc30fd0
+   ring      4.155 ms    33.1 T/s   (4.155)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+== ring WHAT-IF RN1 CG1 no min term
+mm q4_K 4096 4096 4096:
+   async     3.067 ms    44.8 T/s   (3.067)  c06cfba24dc30fd0
+   ring      3.188 ms    43.1 T/s   (3.188)  2baf6a4dcbf40800
+   ring vs async: rel L2 3.991e-01  max|d|/rms 2.361e+00  nan 0
+== ring RN1 CG1, ds_h0 in shared (Q5_K over budget)
+mm q4_K 4096 4096 4096:
+   async     3.067 ms    44.8 T/s   (3.067)  c06cfba24dc30fd0
+   ring      3.406 ms    40.4 T/s   (3.406)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+== ring RN2 CG2 (32x64, 256 thr), ds_h0
+mm q4_K 4096 4096 4096:
+   async     3.068 ms    44.8 T/s   (3.068)  c06cfba24dc30fd0
+   ring      3.744 ms    36.7 T/s   (3.744)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+== ring RN1 CG2 (16x64, 512 thr), ds_h0
+mm q4_K 4096 4096 4096:
+   async     3.071 ms    44.8 T/s   (3.071)  c06cfba24dc30fd0
+   ring      3.453 ms    39.8 T/s   (3.453)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+== ring WHAT-IF ring RN1 CG1 no epilogue
+mm q4_K 4096 4096 4096:
+   async     3.068 ms    44.8 T/s   (3.068)  c06cfba24dc30fd0
+   ring      2.549 ms    53.9 T/s   (2.549)  70ee04c6b0e19c99
+   ring vs async: rel L2 nan  max|d|/rms nan  nan 253
+== ring RN1 CG1, ds_h0 over ids (Q5_K fits)
+mm q4_K 4096 4096 4096:
+   async     3.068 ms    44.8 T/s   (3.068)  c06cfba24dc30fd0
+   ring      3.492 ms    39.4 T/s   (3.492)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+mm q5_K 4096 4096 4096:
+   async     3.290 ms    41.8 T/s   (3.290)  13b791ed018d1697
+   ring      3.819 ms    36.0 T/s   (3.819)  5af8db411aa23e32
+   ring vs async: rel L2 1.219e-02  max|d|/rms 6.204e-02  nan 0
+== FINAL pcmp off/async/ring 3 rounds 2026-10-22 22:18:56
+mm q4_K 4096 4096 4096:
+   off       3.943 ms    34.9 T/s   (3.943 3.943 3.943)  31b15a72b0d7cac8
+   async     3.069 ms    44.8 T/s   (3.069 3.069 3.068)  c06cfba24dc30fd0
+   ring      3.489 ms    39.4 T/s   (3.490 3.489 3.489)  b99595c579a23a31
+   async vs off: rel L2 3.603e-07  max|d|/rms 5.217e-06  nan 0
+   ring vs off: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+glu q4_K 4096 24576 4096:
+   off      34.661 ms    35.7 T/s   (33.351 34.661 34.665)  b06c3f6ae3c1c0ec
+   async    25.506 ms    48.5 T/s   (25.501 25.516 25.506)  539c2683be1c7ecc
+   ring     30.241 ms    40.9 T/s   (30.241 30.233 30.319)  9080048c907b825f
+   async vs off: rel L2 2.132e-04  max|d|/rms 5.266e-03  nan 0
+   ring vs off: rel L2 2.833e-02  max|d|/rms 2.508e-01  nan 0
+   ring vs async: rel L2 2.833e-02  max|d|/rms 2.508e-01  nan 0
+mm q4_K 12288 4096 4096:
+   off      11.707 ms    35.2 T/s   (11.717 11.707 11.705)  addd64455283b4e5
+   async     8.962 ms    46.0 T/s   (8.962 8.960 8.964)  ed0d2b1e0591c6bf
+   ring     10.227 ms    40.3 T/s   (10.217 10.227 10.227)  17b03203006ea296
+   async vs off: rel L2 7.156e-07  max|d|/rms 8.603e-06  nan 0
+   ring vs off: rel L2 1.250e-02  max|d|/rms 6.516e-02  nan 0
+   ring vs async: rel L2 1.250e-02  max|d|/rms 6.516e-02  nan 0
+mm q5_K 4096 4096 4096:
+   off       4.112 ms    33.4 T/s   (4.111 4.112 4.113)  bf1629816b361d1d
+   async     3.290 ms    41.8 T/s   (3.290 3.291 3.290)  13b791ed018d1697
+   ring      3.819 ms    36.0 T/s   (3.819 3.818 3.821)  5af8db411aa23e32
+   async vs off: rel L2 3.602e-07  max|d|/rms 4.472e-06  nan 0
+   ring vs off: rel L2 1.219e-02  max|d|/rms 6.204e-02  nan 0
+   ring vs async: rel L2 1.219e-02  max|d|/rms 6.204e-02  nan 0
+mm q4_K 3072 3072 4096:
+   off       2.316 ms    33.4 T/s   (2.316 2.318 2.315)  82386a6800ee26ce
+   async     1.836 ms    42.1 T/s   (1.836 1.837 1.836)  191a301da1996ef6
+   ring      2.076 ms    37.2 T/s   (2.076 2.075 2.076)  87454753ce2059f5
+   async vs off: rel L2 3.131e-07  max|d|/rms 3.874e-06  nan 0
+   ring vs off: rel L2 1.261e-02  max|d|/rms 6.496e-02  nan 0
+   ring vs async: rel L2 1.261e-02  max|d|/rms 6.496e-02  nan 0
+mm q4_K 3072 12288 4096:
+   off       8.553 ms    36.2 T/s   (8.552 8.553 8.553)  bd3ebba1b591c020
+   async     6.578 ms    47.0 T/s   (6.580 6.577 6.578)  055803fd62cc7b40
+   ring      7.508 ms    41.2 T/s   (7.509 7.507 7.508)  316fb8a3c5a2817d
+   async vs off: rel L2 3.131e-07  max|d|/rms 4.733e-06  nan 0
+   ring vs off: rel L2 1.262e-02  max|d|/rms 6.859e-02  nan 0
+   ring vs async: rel L2 1.262e-02  max|d|/rms 6.859e-02  nan 0
+mm q4_K 12288 3072 4096:
+   off       9.062 ms    34.1 T/s   (9.061 9.062 9.064)  855702f2c9b76d37
+   async     6.981 ms    44.3 T/s   (6.978 6.981 6.981)  0174e875ac14addb
+   ring      7.941 ms    38.9 T/s   (7.940 7.941 7.942)  6982e6244d65e95a
+   async vs off: rel L2 7.156e-07  max|d|/rms 8.602e-06  nan 0
+   ring vs off: rel L2 1.250e-02  max|d|/rms 6.515e-02  nan 0
+   ring vs async: rel L2 1.250e-02  max|d|/rms 6.516e-02  nan 0
+mm q5_K 3072 3072 4096:
+   off       2.398 ms    32.2 T/s   (2.398 2.398 2.397)  7ff8b7ac4aa3092c
+   async     1.961 ms    39.4 T/s   (1.962 1.961 1.961)  1d26f0b97c00330d
+   ring      2.287 ms    33.8 T/s   (2.288 2.287 2.286)  772840f10d97babf
+   async vs off: rel L2 3.130e-07  max|d|/rms 4.735e-06  nan 0
+   ring vs off: rel L2 1.232e-02  max|d|/rms 6.467e-02  nan 0
+   ring vs async: rel L2 1.232e-02  max|d|/rms 6.467e-02  nan 0
+== ring RN1 CG1 volatile dp4a (clean)
+mm q4_K 4096 4096 4096:
+   async     3.069 ms    44.8 T/s   (3.069 3.071 3.069)  c06cfba24dc30fd0
+   ring      3.491 ms    39.4 T/s   (3.493 3.489 3.491)  b99595c579a23a31
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+mm q5_K 4096 4096 4096:
+   async     3.291 ms    41.8 T/s   (3.292 3.290 3.291)  13b791ed018d1697
+   ring      3.819 ms    36.0 T/s   (3.818 3.820 3.819)  5af8db411aa23e32
+   ring vs async: rel L2 1.219e-02  max|d|/rms 6.204e-02  nan 0
+glu q4_K 3072 24576 4096:
+   off      26.673 ms    34.8 T/s   (29.282 26.673 25.861)  6dd4103d3c34e809
+   async    19.480 ms    47.6 T/s   (19.480 19.208 19.605)  0df1e284f2f13a74
+   ring     23.386 ms    39.7 T/s   (23.386 23.380 23.631)  bb4d2c1387d03463
+   async vs off: rel L2 1.963e-04  max|d|/rms 4.662e-03  nan 0
+   ring vs off: rel L2 2.849e-02  max|d|/rms 2.655e-01  nan 0
+   ring vs async: rel L2 2.849e-02  max|d|/rms 2.653e-01  nan 0
+== ring ringf+ring RN/CG 1 2
+mm q4_K 4096 4096 4096:
+   async     3.069 ms    44.8 T/s   (3.069)  c06cfba24dc30fd0
+   ringf     3.544 ms    38.8 T/s   (3.544)  c06cfba24dc30fd0
+   ring      3.554 ms    38.7 T/s   (3.554)  b99595c579a23a31
+   ringf vs async: rel L2 0.000e+00  max|d|/rms 0.000e+00  nan 0
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+   ring vs ringf: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+== ring ringf+ring RN/CG 2 2
+mm q4_K 4096 4096 4096:
+   async     3.068 ms    44.8 T/s   (3.068)  c06cfba24dc30fd0
+   ringf     4.148 ms    33.1 T/s   (4.148)  c06cfba24dc30fd0
+   ring      3.790 ms    36.3 T/s   (3.790)  b99595c579a23a31
+   ringf vs async: rel L2 0.000e+00  max|d|/rms 0.000e+00  nan 0
+   ring vs async: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
+   ring vs ringf: rel L2 1.247e-02  max|d|/rms 6.298e-02  nan 0
