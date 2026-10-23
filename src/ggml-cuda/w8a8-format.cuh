@@ -6,8 +6,19 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// The activations' sub-scale range: sy in 1 .. W8A8_SY_MAX (5 bits), d_g = d_t * sy / W8A8_SY_MAX. The GEMM adds
+// sy * (a 32-value int8 dot product) into one int32 per output, so |acc| <= W8A8_SY_MAX * 127^2 * K: with 31,
+// 2,047,995,904 < 2^31 for K = 4096 (the attention's and the [gate|up] products: no wrap possible); for K = 12288 (the
+// down product) the bound is 3x 2^31; on the real activation dumps the largest accumulator stays 41x below 2^31 (the
+// 2026-10-23 review's measurement with the model's weights). (8-bit
+// sub-scales, 255, left only a 3.2x margin on real to_out activations: the residual stream's massive channels.)
+#define W8A8_SY_MAX   31
+
 #ifndef W8A8_BM
-#define W8A8_BM       128   // tokens per block tile (128: 4 warps, two blocks per SM; 256: 8 warps, one block per SM)
+// tokens per block tile (128: 4 warps, two blocks per SM - 255 registers x 128 threads = half the 64K register file,
+// 2 x (49,920 + 1,024 reserved) bytes of shared memory: cudaOccupancyMaxActiveBlocksPerMultiprocessor gives 2 on the RTX
+// 3060, w8a8-tools/occ.cu; 256: 8 warps, one block per SM)
+#define W8A8_BM       128
 #endif
 #define W8A8_BN       128   // output channels per block tile
 #define W8A8_BK       64    // K values per pipeline stage (2 sub-scale groups)

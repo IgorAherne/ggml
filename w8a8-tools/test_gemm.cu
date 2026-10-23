@@ -66,7 +66,7 @@ static void run_shape(int T, int N, int K, bool check, int reps) {
     std::vector<int8_t> hx((size_t) Tp * K, 0), hw((size_t) N * K);
     std::vector<uint8_t> hs((size_t) Tp * G);
     std::mt19937 rng(1234 + T + N + K);
-    std::uniform_int_distribution<int> d8(-127, 127), dsy(1, 255);
+    std::uniform_int_distribution<int> d8(-127, 127), dsy(1, W8A8_SY_MAX);
     for (int64_t t = 0; t < T; ++t) for (int k = 0; k < K; ++k) hx[(size_t) t*K + k] = (int8_t) d8(rng);
     for (auto & v : hw) v = (int8_t) d8(rng);
     for (auto & v : hs) v = (uint8_t) dsy(rng);

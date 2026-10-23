@@ -1,9 +1,10 @@
-// Bit-identity of the W8A8 format kernels (src/ggml-cuda/w8a8.cuh) with the research emulation (GGML_CUDA_W8A8=sub:8,
+// Bit-identity of the W8A8 format kernels (src/ggml-cuda/w8a8.cuh) with the research emulation (GGML_CUDA_W8A8=sub:5,
 // main tree src/ggml-cuda/w8a8-emu.cu) and ggml's Q4_K / Q5_K dequantizers, compiled here VERBATIM with the same nvcc
 // flags as ggml-cuda (-O3 -use_fast_math): same instructions -> any difference is a formula difference.
 //   weights:     ggml dequantize_q4_K / _q5_K (f32) -> emulation w8a8_rowquant(bits 0): q, d_row; ours: q_w, dW.
 //                Also our in-kernel dequantized values against ggml's (every value).
-//   activations: emulation w8a8_rowquant(bits 8): q, sy, d_row per row; ours: q_x, sy (tile-permuted), d_t;
+//   activations: emulation w8a8_rowquant(bits = log2(W8A8_SY_MAX + 1) = 5): q, sy, d_row per row; ours: q_x, sy
+//                (tile-permuted), d_t;
 //                inputs: synthetic (gaussian, outlier channels, zero row, tiny rows, huge range) and real DiT
 //                activation rows (dumps of the engine, GGML_CUDA_ACT_DUMP); the SCALE pre-op (x/32 of to_out) against
 //                scale_f32's FMA then the emulation; the f16 input path against the emulation of the f16-rounded
@@ -261,7 +262,9 @@ static void test_act(const char * name, const std::vector<float> & hx, int T, in
     } else {
         CK(cudaMemcpy(dref_in, dx, (size_t) n*4, cudaMemcpyDeviceToDevice));
     }
-    w8a8_rowquant<<<T, 256>>>(dref_in, K, nullptr, 8, dy, deq, des, ded);
+    constexpr int SY_BITS = 5;
+    static_assert((1 << SY_BITS) - 1 == W8A8_SY_MAX, "the emulation's sub-scale width");
+    w8a8_rowquant<<<T, 256>>>(dref_in, K, nullptr, SY_BITS, dy, deq, des, ded);
     CK(cudaMemset(dq, 0x55, (size_t) Tp*K)); CK(cudaMemset(dsy, 0x55, (size_t) Tp*G)); CK(cudaMemset(ddt, 0x55, Tp*4));
     bool ok;
     if (half_in) ok = w8a8_quantize_act_cuda<__half>(dh, K, W8A8_PRE_NONE, 1.0f, 0.0f, dq, dsy, ddt, T, K, 0);
@@ -275,14 +278,14 @@ static void test_act(const char * name, const std::vector<float> & hx, int T, in
     CK(cudaMemcpy(se.data(), des, se.size(), cudaMemcpyDeviceToHost)); CK(cudaMemcpy(so.data(), dsy, so.size(), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(de.data(), ded, T*4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(dd.data(), ddt, Tp*4, cudaMemcpyDeviceToHost));
     long badq = cmp_bytes(qe.data(), qo.data(), (size_t) n), bads = 0, badd = 0, badpad = 0;
-    long sy_hist[4] = {0, 0, 0, 0};  // sy = 1, 2..63, 64..254, 255
+    long sy_hist[4] = {0, 0, 0, 0};  // sy = 1, 2..15, 16..M-1, M
     for (int t = 0; t < T; ++t) {
         badd += memcmp(&de[t], &dd[t], 4) != 0;
         for (int g = 0; g < G; ++g) {
             const uint8_t s = so[((size_t) (t / W8A8_BM) * G + g) * W8A8_BM + w8a8_sy_pos(t % W8A8_BM)];
             bads += s != se[(size_t) t*G + g];
             const int e = se[(size_t) t*G + g];
-            sy_hist[e == 1 ? 0 : (e < 64 ? 1 : (e < 255 ? 2 : 3))]++;
+            sy_hist[e == 1 ? 0 : (e < 16 ? 1 : (e < W8A8_SY_MAX ? 2 : 3))]++;
         }
     }
     for (int64_t t = T; t < Tp; ++t) {
@@ -290,7 +293,7 @@ static void test_act(const char * name, const std::vector<float> & hx, int T, in
         badpad += dd[t] != 0.0f;
     }
     printf("act %-34s T %4d K %5d: int8 differ %ld of %lld | sy differ %ld of %lld | d_t differ %ld | padding rows not 0: %ld"
-           " | sy: =1 %ld, 2-63 %ld, 64-254 %ld, 255 %ld\n", name, T, K, badq, (long long) n, bads, (long long) T*G, badd, badpad,
+           " | sy: =1 %ld, 2-15 %ld, 16-30 %ld, 31 %ld\n", name, T, K, badq, (long long) n, bads, (long long) T*G, badd, badpad,
            sy_hist[0], sy_hist[1], sy_hist[2], sy_hist[3]);
     CK(cudaFree(dx)); CK(cudaFree(dref_in)); CK(cudaFree(dh)); CK(cudaFree(dy)); CK(cudaFree(deq)); CK(cudaFree(des));
     CK(cudaFree(ded)); CK(cudaFree(dq)); CK(cudaFree(dsy)); CK(cudaFree(ddt));

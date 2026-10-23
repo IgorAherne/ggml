@@ -7,7 +7,7 @@ D=/c/Users/Igor/AppData/Local/Temp/claude/C---myDrive-repos-spellcast3d/28dae9df
 run() { # name op type K N T [act dump]
   local name=$1; shift
   local act=""; [ -n "$6" ] && act="$6"
-  W8A8BENCH_ACT=$act GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:8 MMBENCH_DUMP=out/${name}_emu.bin ./w8a8bench.exe $BIN $1 $2 $3 $4 $5 2 | sed "s/^/emu   /"
+  W8A8BENCH_ACT=$act GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:5 MMBENCH_DUMP=out/${name}_emu.bin ./w8a8bench.exe $BIN $1 $2 $3 $4 $5 2 | sed "s/^/emu   /"
   W8A8BENCH_ACT=$act MMBENCH_DUMP=out/${name}_k.bin ./w8a8bench.exe $BIN $1 $2 $3 $4 $5 5 | sed "s/^/w8a8  /"
   W8A8BENCH_ACT=$act GGML_CUDA_DISABLE_FUSION=1 MMBENCH_DUMP=out/${name}_kn.bin ./w8a8bench.exe $BIN $1 $2 $3 $4 $5 5 | sed "s/^/nofuse/"
   W8A8BENCH_ACT=$act GGML_CUDA_W8A8_KERNEL=off MMBENCH_DUMP=out/${name}_mmq.bin ./w8a8bench.exe $BIN $1 $2 $3 $4 $5 5 | sed "s/^/mmq   /"

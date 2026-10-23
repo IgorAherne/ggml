@@ -65,9 +65,9 @@ void w8a8_log_once(const int device) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     GGML_LOG_INFO("ggml_cuda: W8A8 int8 matmul path (W8 x A8-sub32) on %s (cc %d): Q4_K/Q5_K products with >= %lld tokens%s%s%s, "
-                  "SwiGLU intermediate %s, norm writer %s%s\n", prop.name, ggml_cuda_info().devices[device].cc, (long long) c.min_tokens,
+                  "SwiGLU intermediate %s, norm writer %s%s, sub-scales 1..%d\n", prop.name, ggml_cuda_info().devices[device].cc, (long long) c.min_tokens,
                   c.names.empty() ? "" : ", weights named *", c.names.c_str(), c.names.empty() ? "" : "*", c.glu_f16 ? "f16" : "f32",
-                  c.norm_fuse ? "fused" : "off", c.norm_check ? " (checked)" : "");
+                  c.norm_fuse ? "fused" : "off", c.norm_check ? " (checked)" : "", W8A8_SY_MAX);
 }
 
 }  // namespace
@@ -85,7 +85,7 @@ bool ggml_cuda_w8a8_supported(const ggml_backend_cuda_context & ctx, const ggml_
         return false;
     }
     const int64_t K = src0->ne[0], N = src0->ne[1], T = src1->ne[1];
-    if (T < c.min_tokens || T > INT_MAX || N > INT_MAX || K % 1024 != 0 || K > 16384 || N % W8A8_BN != 0 || src1->ne[0] != K ||
+    if (T < c.min_tokens || T > INT_MAX || N > INT_MAX || !w8a8_quantize_act_supported(K) || N % W8A8_BN != 0 || src1->ne[0] != K ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[0] != N || dst->ne[1] != T) {
         return false;
     }

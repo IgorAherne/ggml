@@ -5,9 +5,9 @@
 
 // The "W8 x A8-sub32" matmul path (kernels in w8a8.cuh) for the Q4_K / Q5_K products of large token counts on sm_80+:
 // int8 weights per output channel (converted from the k-quant blocks at every call, into pool memory) x int8
-// activations per token with 8-bit integer sub-scales per 32 values, on the int8 tensor cores with one int32
-// accumulator per output. The number formats are those of the research emulation GGML_CUDA_W8A8=sub:8 (w8a8-emu.cu),
-// bit for bit.
+// activations per token with 5-bit integer sub-scales per 32 values (W8A8_SY_MAX), on the int8 tensor cores with one
+// int32 accumulator per output. The number formats are those of the research emulation GGML_CUDA_W8A8=sub:5
+// (w8a8-emu.cu), bit for bit.
 //
 // Environment:
 //   GGML_CUDA_W8A8_KERNEL     off | on (default on where supported: an sm_80+ card and kernels compiled for it)

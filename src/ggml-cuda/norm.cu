@@ -93,7 +93,7 @@ static constexpr int NORM_QLAYOUT_W8A8 = 100;
 // A fused norm's output for the W8A8 path's products: row `row` of ncols values (ncols % 1024 == 0, <= 16384; 1024
 // threads, thread tid normalizing columns 4*(tid + i*1024) .. +3 as the q8_1 variant does, with its pinned arithmetic),
 // quantized with w8a8_quantize_act's expressions (w8a8.cuh; M a run-time value as there, so that the divisions compile
-// alike): the row's max |v|, d_t = amax/127, per 32 values (8 consecutive lanes) sy = max(1, min(M, ceil(M*g/amax))),
+// alike; M = W8A8_SY_MAX): the row's max |v|, d_t = amax/127, per 32 values (8 consecutive lanes) sy = max(1, min(M, ceil(M*g/amax))),
 // d = d_t*sy/M, inv = 1/d, q = clamp(rint(v*inv)) - the q_x / sy / d_t that quantizing the norm's f32 output gives.
 // s_max: 32 floats of shared memory, free for this block. Every thread of the block must call it.
 template <int block_size>
@@ -950,7 +950,7 @@ void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_t
     // the block sizes of norm_f32_cuda, so the reduction runs in the same order
     if (w8a8 != nullptr) {
         GGML_ASSERT(q8_1 == nullptr && ncols % 1024 == 0 && ncols <= 16384 && nchannels == 1 && nsamples == 1);
-        const int M = 255;  // run-time, as w8a8_quantize_act's
+        const int M = W8A8_SY_MAX;  // run-time, as w8a8_quantize_act's
         mul_add_norm_mul_f32<1024, NORM_QLAYOUT_W8A8><<<blocks_num, dim3(1024, 1, 1), 32 * sizeof(float2), stream>>>(
             a_d, b_d, x_d, xo_d, dst_d, m_d, ncols, eps, bs1, bs2, bs3, b0, b1, b2, b3, ms1, ms2, ms3, m0, m1, m2, m3,
             nullptr, *w8a8, M);

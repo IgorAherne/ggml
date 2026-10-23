@@ -5079,8 +5079,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         int n = 1;
         while (n < 4 && i + n < cgraph->n_nodes) {
             const ggml_tensor * next = cgraph->nodes[i + n];
+            // (the layout is asked for only a product that takes the q8_1 path: it aborts on other weight types)
             if (next->op != GGML_OP_MUL_MAT || next->src[1] != src1 || (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-                mmq_get_q8_1_ds_layout(next->src[0]->type) != layout || !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, next)) {
+                !ggml_cuda_mul_mat_uses_mmq_q8_1(*cuda_ctx, next) || mmq_get_q8_1_ds_layout(next->src[0]->type) != layout) {
                 break;
             }
             n++;

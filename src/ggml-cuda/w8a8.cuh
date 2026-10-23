@@ -4,27 +4,27 @@
 // integration is w8a8.cu). Self-contained (CUDA headers only) so that the stand-alone tests in w8a8-tools/ compile the
 // very same kernels.
 //
-// Number formats (the precision contract; the research emulation GGML_CUDA_W8A8=sub:8, w8a8-emu.cu, uses the same
+// Number formats (the precision contract; the research emulation GGML_CUDA_W8A8=sub:5, w8a8-emu.cu, uses the same
 // formulas and expressions, so the int8 values and sub-scales are bit-identical to it):
 //   activations X [T][K] f32 (or the f16 SwiGLU output of the gate|up epilogue below), per token t:
 //     amax_t = max_k |x|, d_t = amax_t / 127; per group g of 32 values: amax_g = the group's max,
-//     sy = max(1, min(M, ceil(M * amax_g / amax_t))) (1 when amax_t == 0), M = 255; d_g = d_t * sy / M, inv_g = 1 / d_g;
-//     q_x = clamp(rint(x * inv_g), -127, 127).
+//     sy = max(1, min(M, ceil(M * amax_g / amax_t))) (1 when amax_t == 0), M = W8A8_SY_MAX = 31 (5-bit sub-scales);
+//     d_g = d_t * sy / M, inv_g = 1 / d_g; q_x = clamp(rint(x * inv_g), -127, 127).
 //   weights W [N][K] = ggml's dequantized Q4_K / Q5_K values: amax_n = max_k |w|, dW_n = amax_n / 127,
 //     q_w = clamp(rint(w * (127 / amax_n)), -127, 127).
-//   product: acc[t][n] = sum_g sy[t][g] * (sum_{k in g} q_x * q_w) (int32, exact), y = float(acc) * (d_t / 255) * dW_n.
+//   product: acc[t][n] = sum_g sy[t][g] * (sum_{k in g} q_x * q_w) (int32, exact), y = float(acc) * (d_t / M) * dW_n.
 // The GEMM issues every m16n8k32 MMA (one k step = one sub-scale group) with a zero C operand and adds sy * P to the
 // int32 accumulator with one IMAD per output: no float work in the main loop.
 //
 // Buffers:
 //   q_x  int8  [T_pad][K]          T_pad = T rounded up to W8A8_BM; rows >= T are 0
 //   sy   uint8 [T_pad/BM][K/32][BM] per token tile and group, the tile's rows in the order the warps read them
-//                                  (w8a8_sy_pos): a thread's 8 values of one group are 8 consecutive bytes
+//                                  (w8a8_sy_pos): a thread's 2*MF values of one group are consecutive bytes
 //   d_t  f32   [T_pad]             rows >= T are 0
 //   q_w  int8  [N][K], dW f32 [N]  (glu: [gate | up] rows interleaved, gate_j at 2j and up_j at 2j+1)
-// Overflow: |acc| <= 255 * 127^2 * K in theory, but acc = 255 * 127^2 * y / (amax_t * amax_n): an overflow needs
-// |y| > 522 * amax_t * amax_n (K = 4096), impossible for real activations. The MMA is the saturating one; the IMAD
-// accumulate would wrap in that pathological case.
+// Overflow: |acc| <= W8A8_SY_MAX * 127^2 * K: below 2^31 for K <= 4096 (no wrap possible); for K = 12288 the largest
+// accumulator on real activations is 41x below 2^31 (w8a8-format.cuh). The MMA is the saturating one, but with
+// its zero C operand the accumulation is the IMAD's, which would wrap.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -245,7 +245,7 @@ static __global__ void __launch_bounds__(256) w8a8_quantize_act(
 // ---- the GEMM ----
 
 enum w8a8_epilogue {
-    W8A8_EPI_F32      = 0,  // y = acc * d_t/255 * dW_n -> f32 dst[t][n] (ggml's [N, T] layout)
+    W8A8_EPI_F32      = 0,  // y = acc * d_t/W8A8_SY_MAX * dW_n -> f32 dst[t][n] (ggml's [N, T] layout)
     W8A8_EPI_GLU_F16  = 1,  // interleaved [gate | up] rows: silu(y_gate) * y_up -> f16 [t][n/2]
     W8A8_EPI_GLU_F32  = 2,  // the same, f32 out
     W8A8_EPI_I32      = 3,  // the raw int32 accumulators [t][n] (tests)
@@ -337,7 +337,8 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
     const unsigned sbase = (unsigned) __cvta_generic_to_shared(w8a8_smem);
 
     // per-thread copy addresses: chunk i*NTHREADS + tid of a stage = row i*NTHREADS/4 + tid/4, 16-byte chunk tid%4
-    // (rows r and r + 32*i have the same swizzle); the sub-scales: threads 0..31 copy 16 of the stage's 512 bytes each
+    // (rows r and r + 32*i have the same swizzle); the sub-scales: threads 0 .. 2*BM/16-1 copy 16 of the stage's 2*BM
+    // bytes each
     const unsigned cp_soff = (unsigned) w8a8_swz(tid / 4, tid % 4);
     const int8_t  * pA  = qx + ((int64_t) m0 + tid/4) * K + 16*(tid % 4);
     const int8_t  * pB  = qw + ((int64_t) n0 + tid/4) * K + 16*(tid % 4);
@@ -514,7 +515,7 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int t = m0 + wm*WM + mf*16 + h*8 + gid;
-            st[mf][h] = t < T ? dt[t] * (1.0f / 255.0f) : 0.0f;
+            st[mf][h] = t < T ? dt[t] * (1.0f / (float) W8A8_SY_MAX) : 0.0f;
         }
     }
 #pragma unroll
@@ -537,7 +538,9 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
                         // ggml's swiglu: silu(gate) * up (unary_gated_op_kernel<op_silu>, silu = x / (1 + exp(-x)))
                         const float g = __fmul_rn(y0 / (1.0f + expf(-y0)), y1);
                         if constexpr (epi == W8A8_EPI_GLU_F16) {
-                            *(__half *) (ebuf + (r*EPI_LD + c/2)*2) = __float2half(g);
+                            // clamped to the f16 range first: a SwiGLU output beyond +-65504 (a text token's channel at
+                            // step 0 reaches ~4e3, 16x below) would be inf and turn the down product's token into NaN
+                            *(__half *) (ebuf + (r*EPI_LD + c/2)*2) = __float2half(fminf(fmaxf(g, -65504.f), 65504.f));
                         } else {
                             *(float *) (ebuf + (r*EPI_LD + c/2)*4) = g;
                         }
@@ -581,12 +584,23 @@ static inline void w8a8_convert_weights_cuda(const void * vx, const bool q5, con
     }
 }
 
-// K % 1024 == 0, K <= 16384. src: f32 or f16 rows with stride s01 (elements). Launches T_pad blocks.
+// The K values w8a8_quantize_act_cuda has a kernel for (K/1024 float4 or half4 per thread in registers).
+static inline bool w8a8_quantize_act_supported(const int64_t K) {
+    if (K % 1024 != 0) {
+        return false;
+    }
+    switch (K / 1024) {
+        case 1: case 2: case 3: case 4: case 5: case 6: case 8: case 12: case 16: return true;
+        default: return false;
+    }
+}
+
+// K: w8a8_quantize_act_supported. src: f32 or f16 rows with stride s01 (elements). Launches T_pad blocks.
 template <typename src_t>
 static inline bool w8a8_quantize_act_cuda(const src_t * x, const int64_t s01, const int pre, const float scale, const float bias,
                                           int8_t * qx, uint8_t * sy, float * dt, const int T, const int K, cudaStream_t stream) {
     const unsigned grid = (unsigned) w8a8_pad_tokens(T);
-    const int M = 255;
+    const int M = W8A8_SY_MAX;  // a run-time kernel argument (as the emulation's), so the divisions compile alike
 #define W8A8_Q(NV) case NV: \
         if (pre == W8A8_PRE_SCALE) w8a8_quantize_act<NV, src_t, W8A8_PRE_SCALE><<<grid, 256, 0, stream>>>(x, s01, qx, sy, dt, T, K, M, scale, bias); \
         else                       w8a8_quantize_act<NV, src_t, W8A8_PRE_NONE ><<<grid, 256, 0, stream>>>(x, s01, qx, sy, dt, T, K, M, scale, bias); \
@@ -615,8 +629,8 @@ static inline cudaError_t w8a8_gemm_cuda(const int epi, const int8_t * qx, const
     const dim3 grid((unsigned) (ntm * ntn));
     const int smem = w8a8_smem_bytes();
     cudaError_t err = cudaSuccess;
-    // the kernels' dynamic shared memory above 48 KB and the carveout, once per device (function attributes are per
-    // device context)
+    // the kernels' dynamic shared memory above 48 KB and the largest shared-memory carveout (two blocks per SM need
+    // 2 x (49,920 + 1,024) bytes), once per device (function attributes are per device context)
     int device = 0;
     err = cudaGetDevice(&device);
     if (err != cudaSuccess) {
