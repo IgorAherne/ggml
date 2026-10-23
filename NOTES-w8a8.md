@@ -265,3 +265,6 @@ ggml-cuda target with the release GPU list: see below).
 Not verified / not done: other GPUs than the RTX 3060 (sm_80/89/90/100/120 only compiled, never run); the release build
 of stable-diffusion.cpp itself (only this ggml's ggml-cuda target); the norm-writer fusion into this format (the brief's
 later optimisation: ~22 ms a step); W8g256 (dropped by the coordinator).
+Full ggml-cuda target with the release GPU list (build-relcheck.cmd: CMAKE_CUDA_ARCHITECTURES 61;70;75;80;86;89;90;100;120,
+the release's CUDA flags): BUILD OK in 13 min 14 s, no errors (build-relcheck.log); ggml-cuda.dll 341.9 MB with cubins
+sm_61 .. sm_120.
