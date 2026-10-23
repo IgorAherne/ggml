@@ -30,9 +30,12 @@ assert "{GEN}" in flags
 def job(arch: str, f: str):
     obj = OUT / f"{Path(f).stem}.sm{arch}.obj"
     gen = f'"--generate-code=arch=compute_{arch},code=[compute_{arch},sm_{arch}]"'
-    cmd = (f'call "{VCVARS}" >nul && "{NVCC}" -forward-unknown-to-host-compiler {defines} {includes} {flags.replace("{GEN}", gen)} '
-           f'-x cu -c "{ROOT / "src" / "ggml-cuda" / f}" -o "{obj}"')
-    p = subprocess.run(["cmd", "/c", cmd], capture_output=True, text=True)
+    script = OUT / f"job_{arch}_{Path(f).stem}.cmd"
+    lines = ["@echo off", f'call "{VCVARS}" >nul',
+             f'"{NVCC}" -forward-unknown-to-host-compiler {defines} {includes} {flags.replace("{GEN}", gen)} -x cu -c '
+             f'"{ROOT / "src" / "ggml-cuda" / f}" -o "{obj}"']
+    script.write_text(chr(10).join(lines) + chr(10))  # text mode: CRLF on Windows
+    p = subprocess.run(["cmd", "/c", str(script)], capture_output=True, text=True)
     errs = [l for l in (p.stdout + p.stderr).splitlines() if " error" in l or "error:" in l]
     return arch, f, p.returncode, errs[:5], obj
 
