@@ -2,6 +2,7 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
+#include "fattn-tile-dp4a.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
@@ -758,7 +759,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
-            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            // Spellcast3D: INT8 (dp4a) scores for big batches on cards without tensor cores (GGML_CUDA_FATTN_DP4A=off: F32)
+            if (ggml_cuda_flash_attn_ext_tile_dp4a_use(ggml_cuda_get_device(), dst)) {
+                ggml_cuda_flash_attn_ext_tile_dp4a(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            }
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
