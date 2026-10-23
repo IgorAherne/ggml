@@ -1,0 +1,8 @@
+*.exe
+*.exp
+*.lib
+*.sass
+*.log
+*.bin
+*.nsys-rep
+*.sqlite
