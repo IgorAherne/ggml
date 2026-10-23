@@ -171,3 +171,55 @@ w8a8k_f32 1.16 / 1.34-1.35; today's engine (release2 tag of the coordinator, fus
 Emulation sanity: GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:8 through THIS branch's DLL renders chest pixel-identical
 to the coordinator's sub8_nofuse (PSNR inf, suite tag sub8_redo): the same-DLL comparisons compare with the very
 emulation the pictures were judged on.
+
+## Token-count crossover (w8a8-tools/thresh.sh: w8a8bench medians, GGML_CUDA_W8A8_MIN_TOKENS=1 vs KERNEL=off)
+T      mm q4_K 4096x4096 (W8A8 / MMQ ms)   mm q4_K K 12288 N 4096
+128    0.233 / 0.134                         0.696 / 0.319
+256    0.290 / 0.231                         0.865 / 0.597
+384    0.348 / 0.325                         1.033 / 0.872
+512    0.406 / 0.427                         1.197 / 1.212
+768    0.523 / 0.597                         1.532 / 1.704
+1024   0.676 / 0.831                         1.992 / 2.398
+2048   1.177 / 1.576                         3.455 / 4.569
+4096   2.065 / 3.069                         6.384 / 8.915
+-> W8A8 wins from ~512 tokens (the per-call weight conversion is amortized); the default stays 1024 (clearly ahead,
+   and the DiT at 1024x1024 has 4096+ tokens; at 512x512, 1024). (The glu rows of this run were erratic below 1024
+   tokens for both paths - e.g. MMQ 28.7 ms at 384 and 5.8 at 768 - and are left out.)
+
+## Device memory (thresh.sh: the device's used memory after the runs minus before the tensors = the tensors + the
+## pool's peak + lazily loaded modules; the same tensors for both paths)
+                       W8A8      MMQ       difference
+glu T 4096             904 MiB   872 MiB   +32 MiB
+mm K 12288 T 4096      384       352       +32
+3 x mm one src1 T 4096 640       636       +4
+glu T 8360             1706      1678      +28
+mm K 12288 T 8360      704       674       +30
+3 x mm T 8360          1258      1254      +4
+Reading: MMQ needs pool memory too (its q8_1 activations, T*K*1.125 bytes, and the GLU kernel's q8_1 output of the
+SwiGLU, T*12288*1.125: 56 MB at 4096, 116 MB at 8360); the W8A8 pool peak is the [gate|up] layer's int8 weights
+(100.7 MB) + the activations (17 / 36 MB), or the down product's int8 input (52 / 106 MB) + its weights (50 MB): about
+the same size, so the route's extra VRAM is ~30 MiB at 4096 and at 8360 tokens. The SwiGLU intermediate lives in the
+graph's own (already allocated) SWIGLU tensor.
+
+## The hub on the 8 GB-card emulation (code/devtools/qwen-speed/bench_pair.py w8a8_8gb "--runs 2 --card-gb 8 --verbose"
+## <bin_w8a8> "--attention sage --prefix-keep on": the installed engine spellcast-perf-9fcb5c2 (release build), then
+## this branch's ggml-cuda.dll in sd.cpp's build-sm86 bin folder, through the hub's own launch)
+installed: run 1 40.6 s (prompt 1.15, drawing 37.33, finishing 1.95); run 2 (re-roll) 38.9 s (drawing 36.96)
+W8A8:      run 1 35.4 s (prompt 2.79, drawing 29.45, finishing 2.62); run 2 30.2 s (drawing 28.31, finishing 1.81)
+-> no memory problem on the 8 GB plan; a re-roll -22 % (drawing -23 %: 1.48 -> 1.13 s a step). Run 1's prompt (2.79
+   vs 1.15 s) and finishing (2.62 vs 1.95 s) are not the path's work (the text encoder and the VAE have no
+   transformer_blocks products); NOT investigated (a dev build against the release build; run 2's finishing is equal).
+
+## Per drawing step (code/devtools/qwen-speed/stepprof.py: nsys of sd-cli at 2 and 6 steps, kernel totals subtracted
+## / 4; 1024x1024 text only, --sage-attn, fusion on; out: w8a8-tools/out/stepprof_*.txt)
+today's engine (sd.cpp build-sm86 bin as is, MMQ): 1458.4 ms of kernels per step
+  mul_mat_q_glu_q8_1 Q4_K 545.30 | mul_mat_q Q4_K 531.73 | mul_mat_q Q5_K 87.27 | quantize_mmq_q8_1 (SCALE pre-op) 8.38
+  + 0.54 + 0.78 -> the matmul route 1173.2 ms (+ the q8_1 writer inside mul_add_norm_mul_f32<1024,1> 46.79)
+W8A8 (this branch): 1120.1 ms of kernels per step
+  w8a8_gemm f32 (126 4096^2 products + 32 downs) 405.09 | w8a8_gemm GLU (32 gate|up) 330.61 | conversion 22.16 + 19.79
+  (gate|up interleaved) + 3.65 (Q5_K) | quantizers 16.79 (f32: 66 calls = q/k/v once per block + gate|up + 2) + 14.71
+  (f16 down inputs) + 8.17 (SCALE pre-op, to_out) -> the route 821.0 ms (+ mul_add_norm_mul_f32 f32 output 54.12, +5.6 ms
+  against the q8_1 writer: the norm-writer fusion into this format is the brief's "later optimisation")
+-> matmul route 1173.2 -> 821.0 ms (-352 ms, -30 %); the step's kernels 1458.4 -> 1120.1 ms (-23 %); wall: the suite's
+   steady 1.44-1.47 -> 1.11-1.12 s/it, the hub's 8 GB re-roll drawing 36.96 -> 28.31 s.
+   (The brief's yardstick "1,160 ms of MMQ kernels" was the mmq3 agent's per-call list; measured here 1173.2.)
