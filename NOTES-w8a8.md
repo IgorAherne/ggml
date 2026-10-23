@@ -277,3 +277,51 @@ branch now adds only: ggml-cuda.cu +104 lines, w8a8-emu.cu +15/-2, w8a8.cuh, w8a
 After the merge (rebuilt build-sm86): w8a8bench hashes unchanged - mm q4_K 4096^3 e65cf1a2d9d23f7d, glu 4096
 beb8864db98f4545, SCALE+mm q5_K T 4145 8eb416686829375f, 3 x mm T 4145 579847c482e3ba17 (= the verified run).
 The sd-cli folder used for every picture / bench: scratchpad w8a8\bin_w8a8 (sd.cpp build-sm86 bin + this ggml-cuda.dll).
+
+# Task 2 (2026-10-23): the activation quantization fused into the norm writer
+Spec (coordinator): when the mul + add + norm + mul chain's modulated output feeds only W8A8 products (q/k/v of a block,
+or the [gate|up] head of the GLU chain), the fused norm kernel writes q_x / sy / d_t itself with exactly
+w8a8_quantize_act's arithmetic, bit-identical to the unfused chain, the f32 output not written.
+## What changed (commit b3c1389c)
+- src/ggml-cuda/w8a8-format.cuh (new): the tile constants, w8a8_sy_pos, w8a8_pad_tokens (moved from w8a8.cuh) and
+  w8a8_act_ptrs, shared by w8a8.cuh and norm.cu. All 48 w8a8 kernels' SASS unchanged (w8a8-tools/sass_cmp.py, old DLL
+  of 568feaa7 vs new: 48 equal).
+- norm.cu: mul_add_norm_mul_f32<1024, NORM_QLAYOUT_W8A8 = 100> + norm_store_w8a8: the q8_1 variant's pinned
+  normalization, the row max over the block, then sy / d / inv / q with the quantizer's expressions (M = 255 passed at
+  run time, as the quantizer gets it). The kernel got two trailing parameters (w8a8_act_ptrs, M): the SASS of all 36
+  existing norm.cu kernels is unchanged (sass_cmp.py on norm.cu.obj, the new parameters normalized out of the names);
+  the new variant uses 40 registers, no stack (sm_86; 40-50 on sm_61..sm_120).
+- ggml-cuda.cu: ggml_cuda_w8a8_consumers (ggml_cuda_quantized_consumers' gating: 1..4 MUL_MATs right after the node,
+  all of its uses, each taken by the W8A8 path; the tensor F32, contiguous, one channel / sample, not an output, not a
+  view) beside the q8_1 test in the mul_add_norm_mul fusion; the GLU-chain test made a function
+  (ggml_cuda_w8a8_glu_chain) for both fusions. Products then take the pre-quantized activations as the shared-src1
+  fusion does. If anything else reads the norm's output, the fusion does not apply (f32 + quantizer as before).
+- w8a8-mm.cu/.cuh: ggml_cuda_w8a8_act_alloc (the last token tile's padding rows zeroed: q_x, d_t and that tile's sy
+  block by cudaMemsetAsync before the writer fills rows < T), GGML_CUDA_W8A8_NORM=on|off (new switch, default on),
+  GGML_CUDA_W8A8_CHECK_NORM=1 (research: the chain also run unfused - ggml's NORM and MUL ops into their own buffers,
+  then the quantizer - and the two activation sets compared byte for byte, padding included; synchronous).
+  The existing switches and formats unchanged.
+## Bit-identity (w8a8-tools/verify_norm.sh, verify_norm_glu32.sh; w8a8bench graphs normmm3 = h = norm(x + a*b)*m then
+## q/k/v of h built one after the other, normglu = h into [gate|up] + SwiGLU + down; random and real activations)
+output hashes, fused | GGML_CUDA_W8A8_NORM=off | GGML_CUDA_DISABLE_FUSION=1, and the byte check:
+  normmm3 q4_K random T 4096 / 4145 / 8360 / 1811: 3f646541dbf777b4, 65b4b5df86ddbb42, 01628cd2885248e9, dc8eb0310b73c14f
+     - all three modes identical, 0 bytes differ
+  normmm3 q5_K real (dump 000252) T 4096 / 4145 / 8360 / 1811: 8bde4988bb2702a7, 36cbd7c0ec643778, 5221ceaa24e4d5af,
+     1613f08266dc4d27 - identical, 0 bytes
+  normglu q4_K (SwiGLU f16): fused = norm off at every T (random d1810745475d66ce, f863ddd3e001e170, d233895a04e75cd9,
+     d78b0ce5ee14586e; real 3d31bed76301cbd0, 28c1e11491bd11fd, 98a4122ed0dcc63e, 0e94fc4eba3bb0d2), 0 bytes; fusion
+     off differs as expected (the GLU chain then runs unfused with ggml's f32 SWIGLU, not the f16 intermediate);
+     with GGML_CUDA_W8A8_GLU=f32 in all modes: all three identical at every T (random 836a7b55343d7c86, e95fbae594035c64,
+     feaff4cd81089e02, f595a9494d5c9dea; real bbd18e8212a1ea1b, 808e0ca1ec04ee42, 2225f33ce0754d8a, 612a3e1d9169fe62)
+## Speed
+nsys per call (kt.py), the norm kernel(s) only: T 4096: fused writer 850.3 / 852.0 us vs f32 writer 854.0 / 849.2 +
+quantizer 254.1 / 253.5 us; T 8360: 1727.9 / 1761.5 vs 1721.5 / 1737.1 + 514.9 / 515.1 us -> ~250 us (4096) / ~500 us
+(8360) saved per call; the writer itself within -0.4 .. +1.4 % of the f32 writer.
+Per drawing step (stepprof.py, same DLL, the switch only): norm writer off 1113.4 ms of kernels (mul_add_norm_mul_f32
+<1024,-1> 54.60 + quantize_act<4,float,0> 16.26 ms) -> on 1092.2 ms (mul_add_norm_mul_f32<1024,100> 52.12 + the
+unfused remainder <1024,-1> 1.94 + quantize_act 0.73): -21.2 ms a step (the targeted kernels 70.9 -> 54.8 ms, -16.1).
+Suite steady (6 prompts): on 1.10-1.11 s/it text only, 1.29-1.30 with an example picture; off 1.13 / 1.31-1.32.
+## Pictures: suite tags w8a8k_norm (default) and w8a8k_normoff: all six pixel-identical to w8a8k_f16 (PSNR inf).
+## Compile: relcheck.py with norm.cu added: w8a8-mm.cu, ggml-cuda.cu, w8a8-emu.cu, norm.cu x sm_61/70/75/80/86/89/90/
+## 100/120: all 36 OK. The new norm variant is plain CUDA (no sm_80 instructions), compiled everywhere; the host launches
+## it only when every consumer passes ggml_cuda_w8a8_supported, which requires an sm_80+ card with sm_80+ kernels.

@@ -15,7 +15,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 NVCC = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe"
 CUOBJDUMP = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\cuobjdump.exe"
 VCVARS = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-FILES = ["w8a8-mm.cu", "ggml-cuda.cu", "w8a8-emu.cu"]
+FILES = ["w8a8-mm.cu", "ggml-cuda.cu", "w8a8-emu.cu", "norm.cu"]
 ARCHS = [a for a in sys.argv[1:]] or ["61", "70", "75", "80", "86", "89", "90", "100", "120"]
 
 text = NINJA.read_text()
