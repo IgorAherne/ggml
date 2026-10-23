@@ -6,6 +6,10 @@ build-sm86\bin. Stand-alone tests: w8a8-tools/ (build_tool.cmd <name> [out]; ext
 nvcc flags as ggml-cuda: -O3 -use_fast_math -arch=sm_86). Every card run through the GPU lock
 (python scratchpad/qs3/lockrun.py "<purpose>" <min> -- <cmd>).
 Coordinator update 2026-10-23: the W8g256 variant (section 6 step 4) is dropped; the format stays section 1 exactly.
+FORMAT CHANGE (review, 2026-10-23 afternoon, task 3 at the end): the sub-scales are 5 bits now, M = W8A8_SY_MAX = 31
+(sy = max(1, min(31, ceil(31*g/amax))), d_g = d_t*sy/31, the epilogue's d_t/31): with 8-bit sub-scales the int32
+accumulator came within 3.2x of 2^31 on real to_out activations. Everything above the "Task 3" section was measured
+with M = 255 / GGML_CUDA_W8A8=sub:8 (history); the current reference is GGML_CUDA_W8A8=sub:5.
 
 ## Files
 - src/ggml-cuda/w8a8.cuh: the kernels (self-contained, CUDA headers only; the tests include it): weight conversion
@@ -330,3 +334,46 @@ Suite steady (6 prompts): on 1.10-1.11 s/it text only, 1.29-1.30 with an example
 chest: 1,409+ calls checked (the last report "check 1409 ... 0 bytes differ (total 0)"); knight_back (example picture):
 the same, total 0. Both pictures pixel-identical to w8a8k_f16. (Step 0 with the prefix in the STORE graph slices and
 concatenates the modulated tokens, so its norms are not this pattern; the later steps' 64 calls a step are fused.)
+
+# Task 3 (2026-10-23 afternoon): the adversarial review's fixes (commit 43111a85)
+1. Accumulator margin: on the real dumps the 8-bit sub-scales brought the int32 accumulator to 669,048,290 = 2^31/3.2
+   (to_out, the residual stream's massive channels; the brief's "impossible" bound was wrong). Now 5-bit sub-scales,
+   W8A8_SY_MAX = 31 in w8a8-format.cuh, used by the quantizer launcher (w8a8.cuh, a run-time kernel argument as before),
+   the norm writer (norm.cu, likewise) and the GEMM epilogue (d_t / 31): |acc| <= 31*127^2*K = 2,047,995,904 < 2^31 at
+   K 4096 (q/k/v/out/gate_up: no wrap possible); the down product (K 12288) keeps a 41x measured margin (the review's
+   number). The emulation's exact reference: GGML_CUDA_W8A8=sub:5.
+   SASS (sass_cmp.py, d38ac9d2's DLL vs the new one, 1476 functions w8a8_ / mul_add_norm / mul_mat_q): only the three
+   GEMM epilogue variants differ (w8a8_gemm<0, 1, 2>: the 1/31 constant, the clamp); the quantizer, the converter, the
+   norm writer and every MMQ kernel are unchanged (M is a run-time argument).
+2. The f16 SwiGLU intermediate clamped to +-65504 before __float2half (a step-0 text-token channel reaches ~3,990;
+   an inf there would become a NaN token through the prefix cache). Note: a NaN input becomes -65504 (fminf / fmaxf).
+3. The q8_1 shared-src1 fusion asks mmq_get_q8_1_ds_layout only after ggml_cuda_mul_mat_uses_mmq_q8_1 (it aborts on
+   F16 / BF16 / F32 weights, e.g. a runtime LoRA's product sharing the input). MMQ results unchanged (verify1's MMQ hashes
+   = the first runs': c06cfba24dc30fd0, efadb8b54f9628c3, ...).
+4. The W8A8 dispatch admits only the K the quantizer has a kernel for (w8a8_quantize_act_supported: K/1024 in
+   1 2 3 4 5 6 8 12 16), instead of every K % 1024 == 0 <= 16384 (7168, 9216, ... would have aborted). Checked:
+   mm q4_K K 7168 and K 9216 (T 2048, transformer_blocks names) run MMQ: hashes a7e4dd4b6467fdaa / 303097100b0bda73 =
+   the GGML_CUDA_W8A8_KERNEL=off runs', no abort.
+5. Comments: "two blocks per SM" is TRUE and stays (the review said one block): w8a8-tools/occ.cu,
+   cudaOccupancyMaxActiveBlocksPerMultiprocessor on the RTX 3060 = 2 for all three GEMM variants (255 registers x 128
+   threads = 32,768 = half the 65,536-register file; 2 x (49,920 + 1,024) = 101,888 <= 102,400 bytes of shared memory);
+   every sm_80+ target has 64K registers per SM and >= 100 KB of shared memory, and the GEMM uses 255 registers on all
+   of them (relcheck res-usage). The comments now say why; the stale "512 bytes" (BM 256's sy stage) fixed; the
+   carveout comment says what it is for; 8-bit / 255 / sub:8 texts in w8a8.cuh, w8a8-mm.cuh replaced.
+## Re-verification (5-bit sub-scales)
+- test_formats (bits = 5 in the emulation's verbatim quantizer): 38 of 38 lines with 0 differences (weights Q4_K/Q5_K;
+  activations synthetic f32 / SCALE / f16 / 6 real dumps). test_gemm (sy 1..31): 0 differences on all 9 shapes.
+- verify1 / verify2 against GGML_CUDA_W8A8=sub:5 (same DLL): products rel L2 8.0e-07 .. 1.97e-06 (mm q4_K 4096^2
+  T 4096 1.137e-06, T 8360 1.138e-06, T 4145 8.05e-07, T 1811 1.138e-06, q5_K 1.137e-06, K 12288 1.967e-06, SCALE
+  8.05e-07, 3 x mm 8.05e-07, real to_q 8.21e-07, real down 1.356e-06, K 12288 T 8360 / 1811 1.966e-06, q5_K K 12288
+  1.39e-06); GLU f16 2.07e-03, GLU f32 = fusion off (bit-identical) 1.88e-04 (real 1.78e-04); MMQ vs sub:5 1.59e-02 ..
+  4.0e-02. Hashes (fusion on = off): mm4096 7a9b31ec0f5211c9, mm8360 526839cf860f3fc1, mm4145 6eb456aac43e4fae, mm1811
+  1b76f55a1f55be66, q5_K e3edb9d64bf26024, K 12288 b411cd044aed1b46, SCALE 9bf45f4b580af1d9, 3 x mm 0b91937729d117fc,
+  glu4096 f16 f8d3242a490c36aa (f32 = fusion off f85e0b0448a13456).
+- verify_norm (the fused norm writer, 5-bit): normmm3 fused = norm off = no fusion at T 4096 / 4145 / 8360 / 1811,
+  random and real (7825f4d13bcd90f4, 241475e86d5ac296, 2ed4064f70a0ccce, 4d203f1c52ff9520; real 0c6004ccb788a2ae,
+  52d744bdccfb4e7e, 21b42be420c87a9e, 0a2bdec1a5fa20d2), 0 bytes differ; normglu fused = norm off, and with
+  GGML_CUDA_W8A8_GLU=f32 all three modes identical at every T (random 799d560ca3c8ff1b, aefc030429d91433,
+  0c8db733ba5d4c3d, 17b8aa1c7fb199a1; real 8e40232aa34fcb3b, 7d8a06505e3df471, b3cfdae904fac809, 1bb4b45b49ac9f86).
+- Release architectures (relcheck.py): w8a8-mm.cu, ggml-cuda.cu, w8a8-emu.cu, norm.cu x 9 archs: 36 OK; the GEMM 255
+  registers on sm_80 .. sm_120 (stacks 0-32 B as before), stubs on sm_61 / 70 / 75.
