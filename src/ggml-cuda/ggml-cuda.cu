@@ -355,6 +355,13 @@ static ggml_cuda_device_info ggml_cuda_init() {
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
+        if (const char * fake_cc = getenv("GGML_CUDA_FAKE_CC")) {
+            // Research hook: the host-side dispatch treats the card as this compute capability - e.g. 610 on an RTX
+            // 3060 with a compute_61-only build runs the GTX 10xx kernel paths through the PTX JIT. Never set in
+            // production: a capability the card lacks (or a build without that arch) fails or runs wrong kernels.
+            info.devices[id].cc = atoi(fake_cc);
+            GGML_LOG_INFO("  Device %d: compute capability taken as %d (GGML_CUDA_FAKE_CC)\n", id, info.devices[id].cc);
+        }
         std::string device_name(prop.name);
         if (device_name == "NVIDIA GeForce MX450") {
             turing_devices_without_mma.push_back({ id, device_name });
@@ -2437,6 +2444,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // matmul (ggml_cuda_mul_mat_q) is copied to the host and written with the weight's name - its per-channel max |x| and
 // sum x^2 over all tokens for every call, and a subsample of up to 256 token rows for the calls whose per-weight
 // index is listed in GGML_CUDA_ACT_DUMP_ROWS (comma-separated, 0-based). Synchronous; for offline precision studies.
+static int     ggml_cuda_act_dump_pending = -1;
+static int64_t ggml_cuda_act_dump_stride  = 1;
 static void ggml_cuda_act_dump(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
     static const char * dir = getenv("GGML_CUDA_ACT_DUMP");
     if (dir == nullptr || src1->type != GGML_TYPE_F32 || src1->ne[1] < 32 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
@@ -2477,8 +2486,9 @@ static void ggml_cuda_act_dump(ggml_backend_cuda_context & ctx, const ggml_tenso
             csq[k] += a * a;
         }
     }
+    static const int64_t max_rows = getenv("GGML_CUDA_ACT_DUMP_NROWS") ? atoll(getenv("GGML_CUDA_ACT_DUMP_NROWS")) : 256;
     const bool    rows   = std::find(row_calls.begin(), row_calls.end(), call) != row_calls.end();
-    const int64_t stride = rows ? std::max<int64_t>(1, T / 256) : 0;
+    const int64_t stride = rows ? std::max<int64_t>(1, T / max_rows) : 0;
     const int32_t nrows  = rows ? (int32_t) ((T + stride - 1) / stride) : 0;
     char path[1024];
     snprintf(path, sizeof(path), "%s/%06d.bin", dir, serial);
@@ -2495,7 +2505,37 @@ static void ggml_cuda_act_dump(ggml_backend_cuda_context & ctx, const ggml_tenso
     }
     fprintf(index, "%06d %d %s %" PRId64 " %" PRId64 " %d %s\n", serial, call, src0->name, K, T, nrows, ggml_type_name(src0->type));
     fflush(index);
+    ggml_cuda_act_dump_pending = rows ? serial : -1;
+    ggml_cuda_act_dump_stride  = stride;
     serial++;
+}
+
+// The second half of the hook: the product's OUTPUT rows (the same token subsample) of a call whose input rows were
+// written, as <serial>.out.bin: header {0x32544341, N, T, nrows} then nrows x N floats. Called after the matmul.
+static void ggml_cuda_act_dump_out(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    if (ggml_cuda_act_dump_pending < 0 || dst->type != GGML_TYPE_F32) {
+        return;
+    }
+    const int serial = ggml_cuda_act_dump_pending;
+    ggml_cuda_act_dump_pending = -1;
+    const int64_t N = dst->ne[0];
+    const int64_t T = dst->ne[1];
+    const int64_t stride = ggml_cuda_act_dump_stride;
+    const int32_t nrows = (int32_t) ((T + stride - 1) / stride);
+    std::vector<float> h((size_t) N * T);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    CUDA_CHECK(cudaMemcpy2D(h.data(), N * sizeof(float), dst->data, dst->nb[1], N * sizeof(float), T, cudaMemcpyDeviceToHost));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%06d.out.bin", getenv("GGML_CUDA_ACT_DUMP"), serial);
+    FILE * f = fopen(path, "wb");
+    if (f != nullptr) {
+        const int32_t header[4] = { 0x32544341, (int32_t) N, (int32_t) T, nrows };
+        fwrite(header, sizeof(header), 1, f);
+        for (int64_t t = 0; t < T; t += stride) {
+            fwrite(h.data() + t * N, sizeof(float), N, f);
+        }
+        fclose(f);
+    }
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -2574,6 +2614,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_act_dump(ctx, src0, src1);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        ggml_cuda_act_dump_out(ctx, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
