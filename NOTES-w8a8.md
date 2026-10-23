@@ -127,3 +127,47 @@ ggml-level times (w8a8bench, incl. weight conversion + activation quantization, 
 63.3 T/s (MMQ 3.067, 44.8); T 8360 4.311 (MMQ 6.270); T 4145 2.225 (MMQ 3.319); T 1811 1.109 (MMQ 1.556); q5_K 2.187 (MMQ
 3.291); K 12288 6.391 64.5 T/s (MMQ 8.916); SCALE+mm 2.239 (MMQ 3.531); 3 x mm one src1 8.459 (MMQ 11.747); glu 4096
 18.613 66.5 T/s (f32 intermediate 18.736; fusion off 21.425; MMQ 25.523).
+
+## Kernel-only times (nsys, w8a8-tools/kt.py on w8a8bench, 11 calls each, medians; the path's real inputs: Q4_K/Q5_K
+## weights from N(0, 0.02), activations N(0, 1); MMQ = GGML_CUDA_W8A8_KERNEL=off on the same build)
+| product (T = 4096)               | W8A8 GEMM          | + conversion | + quantizer      | MMQ kernel       | + q8_1 quantize |
+| mm q4_K 4096x4096                | 1799.3 us 76.4 T/s | 108.2 us     | 253.0 us (f32)   | 2803.8 us 49.0   | 257.4 |
+| mm q5_K 4096x4096                | 1798.0 us 76.4     | 123.6        | 253.2            | 3027.4 us 45.4   | 257.2 |
+| mm q4_K K 12288 N 4096           | 5251.3 us 78.5     | 358.4        | 756.3 (f32)      | 8103.9 us 50.9   | 802.2 |
+| glu: gate|up N 24576 (SwiGLU f16)| 10201.2 us 80.8    | 609.9 (rows interleaved) | 253.1 | 17156.1 (GLU kernel, q8_1 out) | 258.1 |
+|      down K 12288 of it          | 5386.0 us 76.6     | 359.5        | 457.0 (f16 in)   | 8114.0           | (in the GLU kernel) |
+| SCALE x/32 + mm q5_K             | 1798.1             | 123.6        | 252.9 (pre-op)   |                  |       |
+GEMM T/s = 2 T N K / kernel time. Per call incl. conversion and quantization: 4096^2 q4_K 2.160 vs 3.061 ms (-29 %);
+q5_K 2.175 vs 3.284 (-34 %); down 6.365 vs 8.906 (-29 %); GLU chain 17.27 vs 25.53 ms (-32 %).
+(Random uniform int8 in test_gemm gives 1.714 ms for the 4096^3 GEMM: the data changes the card's power / clock.)
+
+## Release architectures (w8a8-tools/relcheck.py: the changed files w8a8-mm.cu, ggml-cuda.cu, w8a8-emu.cu compiled with
+## build-sm86's exact ggml-cuda flags and --generate-code=arch=compute_XX,code=[compute_XX,sm_XX] for each of
+## 61 70 75 80 86 89 90 100 120)
+All 27 compiles OK. cuobjdump of w8a8-mm per arch: sm_61 / 70 / 75: every w8a8 kernel a stub (6-8 instructions: the
+__CUDA_ARCH__ >= 800 guard); sm_80 / 86 / 89 / 90 / 100 / 120: the real kernels (GEMM 1960-2184 instructions, 64 IMMA in
+the loop). The host side takes the path only when ggml_cuda_highest_compiled_arch(cc) >= 800 and cc >= 800, so a
+Pascal / Volta / Turing card keeps MMQ.
+
+## Pictures (code/devtools/qwen-speed/suite.py, --extra=--sage-attn, fusion on, bin = sd.cpp build-sm86 bin with this
+## branch's ggml-cuda.dll; tags w8a8k_f16 (default) and w8a8k_f32 (GGML_CUDA_W8A8_GLU=f32))
+PSNR rgb dB (SSIM, LPIPS)    chest            knight           potion           fox              knight_back      ork_right
+w8a8k_f16 vs sub8_nofuse     35.04 (.971 .033) 44.07 (.997 .003) 36.28 (.993 .005) 32.78 (.987 .010) 35.49 (.993 .005) 30.88 (.971 .016)
+w8a8k_f32 vs sub8_nofuse     38.23 (.984 .020) 43.42 (.997 .003) 35.94 (.991 .008) 25.97 (.961 .030) 28.82 (.972 .018) 39.80 (.996 .002)
+w8a8k_f16 vs w8a8k_f32       38.82            43.21            32.67            25.00            28.67            30.26
+w8a8k_f16 vs ctrl_nofuse     31.02 (.958 .042) 39.78 (.994 .007) 37.34 (.993 .006) 19.55 (.883 .098) 24.87 (.943 .050) 31.54 (.973 .014)
+w8a8k_f32 vs ctrl_nofuse     31.29            38.44            34.29            19.12            23.68            31.46
+sub8_nofuse vs ctrl_nofuse   31.79 (.962 .037) 38.81 (.993 .007) 37.00 (.993 .006) 19.54 (.883 .098) 25.15 (.945 .049) 32.36 (.975 .013)
+(the emulation's own numbers, for the last three rows; the rounding-only yardstick of round 3: chest 35.15, fox 23.58)
+Steady step (sd-cli, 1024x1024, 25 steps): w8a8k_f16 1.11-1.12 s/it text only, 1.31-1.32 with an example picture;
+w8a8k_f32 1.16 / 1.34-1.35; today's engine (release2 tag of the coordinator, fusion on) 1.44-1.47; ctrl_nofuse 1.68-1.72.
+
+## ggml-level verification, more token counts (w8a8-tools/verify2.sh; same columns as verify1)
+  glu T 8360: f16 2.299e-03; f32 = fusion off (hash 6fb89991c41834f1) 2.087e-04; MMQ 3.226e-02
+  glu T 1811: f16 2.290e-03; f32 = fusion off (hash 97bd0a545896db9e) 2.120e-04; MMQ 3.209e-02
+  mm q4_K K 12288 T 8360: 1.970e-06 | 2.84e-05 | 1.1e-04;  T 1811: 1.970e-06;  q5_K K 12288 T 4145: 1.396e-06
+  times (ggml level): glu T 8360 35.09 ms 72.0 T/s (f32 37.48, fusion off 43.32, MMQ 52.43); K 12288 T 8360 12.74 ms
+  (MMQ 18.31); T 1811 3.27 (MMQ 4.52); glu T 1811 11.12 (MMQ 14.60).
+Emulation sanity: GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:8 through THIS branch's DLL renders chest pixel-identical
+to the coordinator's sub8_nofuse (PSNR inf, suite tag sub8_redo): the same-DLL comparisons compare with the very
+emulation the pictures were judged on.

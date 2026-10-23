@@ -295,8 +295,19 @@ bool ggml_cuda_w8a8_emu(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     cublasHandle_t h = ctx.cublas_handle();
     const float one = 1.0f, zero = 0.0f;
     CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH));
-    CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, wq.get(), (int) K, xq.get(), (int) K,
-                             &zero, (float *) dst->data, (int) N));
+    // GGML_CUDA_W8A8_EMU_KSPLIT=<s> (research control, spellcast-w8a8 branch): the f32 GEMM as s GEMMs over K/s each,
+    // accumulated in dst (beta 1): the same values with another f32 summation order, a rounding-only change
+    static const int ksplit = getenv("GGML_CUDA_W8A8_EMU_KSPLIT") ? atoi(getenv("GGML_CUDA_W8A8_EMU_KSPLIT")) : 1;
+    if (ksplit > 1 && K % (32*ksplit) == 0) {
+        const int64_t kc = K / ksplit;
+        for (int s = 0; s < ksplit; ++s) {
+            CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) kc, &one, wq.get() + s*kc, (int) K,
+                                     xq.get() + s*kc, (int) K, s == 0 ? &zero : &one, (float *) dst->data, (int) N));
+        }
+    } else {
+        CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, wq.get(), (int) K, xq.get(), (int) K,
+                                 &zero, (float *) dst->data, (int) N));
+    }
     CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH));
     return true;
 }

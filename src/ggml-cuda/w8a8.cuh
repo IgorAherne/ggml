@@ -52,9 +52,6 @@
 #ifndef W8A8_STAGES
 #define W8A8_STAGES   3
 #endif
-#ifndef W8A8_WHATIF
-#define W8A8_WHATIF   0     // timing experiments of the stand-alone tests only (w8a8-tools); 0 = the real kernel
-#endif
 
 static constexpr int w8a8_stage_bytes() { return W8A8_BM*W8A8_BK + W8A8_BN*W8A8_BK + 2*W8A8_BM; }
 static constexpr int w8a8_smem_bytes()  { return W8A8_STAGES*w8a8_stage_bytes(); }
@@ -417,30 +414,18 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
     // every read of the stage's slot is issued before it, so the slot takes stage kt+S right after it (S stages
     // resident, S-1 copies in flight), and stage kt+1 is complete (wait) before its fragments are read.
     auto load_a1 = [&](int (&f)[4], const unsigned st, const int ks, const int mf) {
-#if W8A8_WHATIF == 13   // what-if (wrong results): no fragment loads (registers change by a cheap op)
-        f[0] += (int) st; f[1] ^= ks; (void) mf;
-#else
         w8a8_ldsm_x4(f, st + a_off[ks] + mf*1024);
-#endif
     };
     auto load_s = [&](uint2 & fs, const unsigned st, const int ks) {
-#if W8A8_WHATIF == 2 || W8A8_WHATIF == 7 || W8A8_WHATIF == 13   // what-if (wrong results): constant sub-scales, no shared-memory reads of sy
-        fs = make_uint2(0x01020304u + st, 0x05060708u + ks);
-#else
         if constexpr (MF == 4) {
             asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(fs.x), "=r"(fs.y) : "r"(st + sy_off + ks*BM));
         } else {
             asm volatile("ld.shared.u32 %0, [%1];" : "=r"(fs.x) : "r"(st + sy_off + ks*BM));
             fs.y = 0;
         }
-#endif
     };
     auto load_b = [&](int (&fb)[4], const unsigned st, const int ks, const int np) {
-#if W8A8_WHATIF == 13
-        fb[0] += (int) st; fb[2] ^= np + ks;
-#else
         w8a8_ldsm_x4(fb, st + b_off[ks] + np*1024);
-#endif
     };
 
     int   fa[MF][4] = {};
@@ -475,35 +460,12 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
                     // last MMA is reused; the last pair's second half frees 3 2 1 0 / 0 1 2 3 = the next k step's order)
                     const int mf = (nn ^ par) ? MF - 1 - j : j;
                     int (&c)[4] = acc[mf][2*np + nn];
-#if W8A8_WHATIF == 1 || W8A8_WHATIF == 6   // what-if (wrong results): plain accumulation in the MMA, no sub-scales
-                    asm volatile("mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
-                                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-                                 : "r"(fa[mf][0]), "r"(fa[mf][1]), "r"(fa[mf][2]), "r"(fa[mf][3]), "r"(b[2*nn]), "r"(b[2*nn + 1]));
-#else
                     int p[4];
                     w8a8_mma_zero(p, fa[mf], b[2*nn], b[2*nn + 1]);
-#if W8A8_WHATIF == 8   // what-if (wrong results): IADD instead of the IMAD (kept out of the MMA by asm)
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) asm volatile("add.s32 %0, %0, %1;" : "+r"(c[q]) : "r"(p[q]));
-#elif W8A8_WHATIF == 9   // what-if (wrong results): one FADD per element (P bits as float)
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) c[q] = __float_as_int(__int_as_float(c[q]) + __int_as_float(p[q]));
-#elif W8A8_WHATIF == 10  // what-if (wrong results): one FFMA per element
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) c[q] = __float_as_int(fmaf(__int_as_float(sv[mf][q/2]), __int_as_float(p[q]), __int_as_float(c[q])));
-#elif W8A8_WHATIF == 11  // what-if (wrong results): FADD + FFMA per element (the exact float route's cost)
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) c[q] = __float_as_int(fmaf(__int_as_float(sv[mf][q/2]), __int_as_float(p[q]) - 12582912.0f, __int_as_float(c[q])));
-#elif W8A8_WHATIF == 12  // what-if (wrong results): LEA (shift-add, ALU pipe) per element
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) asm volatile("{ .reg .u32 t; shl.b32 t, %1, 3; add.s32 %0, %0, t; }" : "+r"(c[q]) : "r"(p[q]));
-#else
                     c[0] += sv[mf][0] * p[0];
                     c[1] += sv[mf][0] * p[1];
                     c[2] += sv[mf][1] * p[2];
                     c[3] += sv[mf][1] * p[3];
-#endif
-#endif
                     if (np == 3 && nn == 1) {
                         load_a1(fa[mf], nst, nks, mf);   // its last use in this k step
                     }
@@ -541,14 +503,8 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
                 // every read of this stage's slot is issued: after the barrier it takes stage kt+S; stage kt+1 is
                 // complete (the copies of stages <= kt+1 done: S-2 newer groups may be pending)
                 w8a8_cp_wait<S - 2>();
-#if W8A8_WHATIF != 4   // what-if 4 (wrong results, races): no barrier
                 __syncthreads();
-#endif
-#if W8A8_WHATIF == 3 || W8A8_WHATIF == 6 || W8A8_WHATIF >= 7   // what-if (wrong results): no global loads after the prologue
-                if (false) {
-#else
                 if (left > 0) {
-#endif
                     load_stage(slot);
                 }
                 w8a8_cp_commit();
@@ -621,9 +577,6 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
             const int r = r0 + vr;
             const int t = m0 + wm*WM + mf*16 + r;
             const int4 v = *(const int4 *) (ebuf + r*EPI_LD*EPI_ESZ + vc*16);
-#if W8A8_WHATIF == 5   // what-if (wrong results): no epilogue stores unless the value is a magic one
-            if (v.x != 0x12345678) continue;
-#endif
             if (t < T) {
                 // column of this vector's first value in the output row
                 const int64_t col = epi == W8A8_EPI_F32 || epi == W8A8_EPI_I32 ? n0 + wn*64 + vc*4 : (n0 + wn*64)/2 + vc*(16/EPI_ESZ);
@@ -684,10 +637,25 @@ static inline cudaError_t w8a8_gemm_cuda(const int epi, const int8_t * qx, const
     const dim3 grid((unsigned) (ntm * ntn));
     const int smem = w8a8_smem_bytes();
     cudaError_t err = cudaSuccess;
+    // the kernels' dynamic shared memory above 48 KB and the carveout, once per device (function attributes are per
+    // device context)
+    int device = 0;
+    err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        return err;
+    }
 #define W8A8_G(E) { \
-        static bool attr_set = false; \
-        if (!attr_set) { err = cudaFuncSetAttribute(w8a8_gemm<E>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);             if (err == cudaSuccess) err = cudaFuncSetAttribute(w8a8_gemm<E>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);             attr_set = err == cudaSuccess; } \
-        if (err != cudaSuccess) return err; \
+        static bool attr_set[64] = {}; \
+        if (device < 64 && !attr_set[device]) { \
+            err = cudaFuncSetAttribute(w8a8_gemm<E>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+            if (err == cudaSuccess) { \
+                err = cudaFuncSetAttribute(w8a8_gemm<E>, cudaFuncAttributePreferredSharedMemoryCarveout, 100); \
+            } \
+            if (err != cudaSuccess) { \
+                return err; \
+            } \
+            attr_set[device] = true; \
+        } \
         w8a8_gemm<E><<<grid, W8A8_NTHREADS, smem, stream>>>(qx, sy, dt, qw, dw, dst, ldd, T, N, K, group); }
     switch (epi) {
         case W8A8_EPI_F32:     W8A8_G(W8A8_EPI_F32);     break;
