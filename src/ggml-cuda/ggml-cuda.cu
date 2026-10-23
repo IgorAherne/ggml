@@ -2062,7 +2062,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
-    if (src0->type == compute_type) {
+    // Cards without fast fp16 (GTX 10xx: cc 6.1) take F16 sources with F32 compute. Instead of converting both to
+    // F32 in pool buffers first (the im2col of a 512-pixel VAE tile is 1.4 GB as F16, 2.7 GB converted, per
+    // convolution), one plain GEMM hands them to cuBLAS as F16 with F32 compute: the kernels convert as they load.
+    // GGML_CUDA_F16_SGEMM=off restores the conversion path.
+    static const bool f16_sgemm_off = getenv("GGML_CUDA_F16_SGEMM") != nullptr && std::string(getenv("GGML_CUDA_F16_SGEMM")) == "off";
+    const bool pass_f16 = compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && !f16_sgemm_off &&
+                          src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 &&
+                          !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc);
+
+    if (src0->type == compute_type || pass_f16) {
         src0_ptr = (const cuda_t *) src0->data;
     } else {
         src0_alloc.alloc(ggml_nelements(src0));
@@ -2087,7 +2096,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
-    if (src1->type == compute_type) {
+    if (src1->type == compute_type || pass_f16) {
         src1_ptr = (const cuda_t *) src1->data;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
@@ -2119,8 +2128,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
     cublasComputeType_t cu_compute_type = traits::compute_type;
     cudaDataType_t cu_data_type = traits::data_type;
-    cudaDataType_t cu_data_type_a = traits::data_type;
-    cudaDataType_t cu_data_type_b = traits::data_type;
+    cudaDataType_t cu_data_type_a = pass_f16 ? CUDA_R_16F : traits::data_type;
+    cudaDataType_t cu_data_type_b = pass_f16 ? CUDA_R_16F : traits::data_type;
     const void * alpha = traits::get_alpha();
     const void * beta = traits::get_beta();
 
@@ -2158,7 +2167,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && !pass_f16) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
