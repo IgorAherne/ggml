@@ -60,6 +60,8 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
+#include "ggml-cuda/w8a8-emu.cuh"
+#include "ggml-cuda/w8a8-mm.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
@@ -2465,6 +2467,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    if (ggml_cuda_w8a8_emu(ctx, src0, src1, dst)) {  // research emulation, inactive unless GGML_CUDA_W8A8 is set
+        return;
+    }
+    if (ggml_cuda_w8a8_supported(ctx, dst)) {  // the W8 x A8-sub32 int8 path (w8a8-mm.cuh)
+        ggml_cuda_w8a8_mul_mat(ctx, src0, src1, dst);
+        return;
+    }
+
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
@@ -2516,6 +2526,9 @@ static bool ggml_cuda_mul_mat_uses_mmq_q8_1(const ggml_backend_cuda_context & ct
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear) {
+        return false;
+    }
+    if (ggml_cuda_w8a8_supported(ctx, dst)) {  // the W8A8 path takes it (its own fusions: ggml_cuda_try_fuse_w8a8)
         return false;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
@@ -4351,6 +4364,94 @@ static int ggml_cuda_try_fuse_into_concat(ggml_backend_cuda_context * cuda_ctx, 
     return j - i;
 }
 
+// The W8A8 path's fusions (w8a8-mm.cuh), the counterparts of the q8_1 ones below (which skip its products):
+// - SCALE + MUL_MAT: the scale is applied while quantizing the SCALE's input (scale_f32's FMA), its output never written;
+// - 2..4 MUL_MATs of one src1 (an attention's q, k and v): src1 quantized once;
+// - [gate | up] MUL_MAT -> SWIGLU -> MUL_MAT (the last of those products, or a lone one): ggml_cuda_w8a8_glu.
+// Returns the number of nodes after i that it covered, -1 when none applies (a lone product: ggml_cuda_mul_mat).
+static int ggml_cuda_try_fuse_w8a8(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    auto next_compute = [&](int j) {
+        for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        }
+        return j;
+    };
+    // index of the down MUL_MAT when nodes[j] heads a [gate | up] -> SWIGLU -> MUL_MAT chain the path runs, else -1
+    auto glu_chain = [&](const int j) {
+        const ggml_tensor * mm = cgraph->nodes[j];
+        if (mm->op != GGML_OP_MUL_MAT || ggml_node_get_use_count(cgraph, j) != 1 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return -1;
+        }
+        const int jg = next_compute(j);
+        if (jg >= cgraph->n_nodes) {
+            return -1;
+        }
+        const ggml_tensor * glu = cgraph->nodes[jg];
+        if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[0] != mm || glu->src[1] != nullptr ||
+            ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 || (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, jg) != 1) {
+            return -1;
+        }
+        const int jo = next_compute(jg);
+        if (jo >= cgraph->n_nodes) {
+            return -1;
+        }
+        const ggml_tensor * mm_out = cgraph->nodes[jo];
+        if (mm_out->op != GGML_OP_MUL_MAT || (mm_out->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            !ggml_cuda_w8a8_glu_supported(*cuda_ctx, mm, glu, mm_out)) {
+            return -1;
+        }
+        return jo;
+    };
+
+    if (node->op == GGML_OP_SCALE) {
+        if (i + 1 >= cgraph->n_nodes) {
+            return -1;
+        }
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_tensor * x = node->src[0];
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == node && mm->src[0] != node && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_node_has_n_uses(cgraph, i, 1) && node->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(node) && ggml_are_same_shape(node, x) && ggml_cuda_w8a8_supported(*cuda_ctx, mm, x)) {
+            ggml_cuda_w8a8_act act(cuda_ctx->pool());
+            ggml_cuda_w8a8_quantize(*cuda_ctx, act, x->data, false, x->nb[1] / sizeof(float), x->ne[1], x->ne[0], true,
+                                    ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1));
+            ggml_cuda_w8a8_mul_mat(*cuda_ctx, mm->src[0], act, mm);
+            return 1;
+        }
+        return -1;
+    }
+
+    if (node->op != GGML_OP_MUL_MAT || !ggml_cuda_w8a8_supported(*cuda_ctx, node)) {
+        return -1;
+    }
+    const ggml_tensor * src1 = node->src[1];
+    int n = 1;
+    while (n < 4 && i + n < cgraph->n_nodes) {
+        const ggml_tensor * next = cgraph->nodes[i + n];
+        if (next->op != GGML_OP_MUL_MAT || next->src[1] != src1 || next->src[0] == src1 || (next->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            !ggml_cuda_w8a8_supported(*cuda_ctx, next)) {
+            break;
+        }
+        n++;
+    }
+    const int jo = glu_chain(i + n - 1);
+    if (n == 1 && jo < 0) {
+        return -1;
+    }
+    ggml_cuda_w8a8_act act(cuda_ctx->pool());
+    ggml_cuda_w8a8_quantize(*cuda_ctx, act, src1->data, false, src1->nb[1] / sizeof(float), src1->ne[1], src1->ne[0]);
+    for (int j = 0; j < n; j++) {
+        ggml_tensor * mm = cgraph->nodes[i + j];
+        if (j == n - 1 && jo >= 0) {
+            ggml_cuda_w8a8_glu(*cuda_ctx, mm, act, cgraph->nodes[next_compute(i + j)], cgraph->nodes[jo]);
+            return jo - i;
+        }
+        ggml_cuda_w8a8_mul_mat(*cuda_ctx, mm->src[0], act, mm);
+    }
+    return n - 1;
+}
+
 // nodes[mm_idx] = a quantized MUL_MAT of a [gate | up] weight, then (view nodes skipped) a one-tensor SWIGLU of it
 // (gate first) and a quantized MUL_MAT of that (e.g. a transformer MLP's down projection): the first product runs with
 // the SwiGLU and the second product's q8_1 quantization in its epilogue (ggml_cuda_mul_mat_q_glu, same values), the
@@ -4807,6 +4908,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return last - i;
                 }
             }
+        }
+    }
+
+    // the W8A8 path's fusions (SCALE + MUL_MAT, shared src1, [gate | up] -> SWIGLU -> down)
+    if (node->op == GGML_OP_SCALE || node->op == GGML_OP_MUL_MAT) {
+        const int n_fused = ggml_cuda_try_fuse_w8a8(cuda_ctx, cgraph, i);
+        if (n_fused >= 0) {
+            return n_fused;
         }
     }
 

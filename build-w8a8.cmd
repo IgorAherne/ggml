@@ -10,6 +10,8 @@ if not exist build-sm86\CMakeCache.txt (
     -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_CUDA_FLAGS="-Xcudafe --diag_suppress=177 -Xcudafe --diag_suppress=550" ^
     -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF || exit /b 1
 )
+rem re-configure (quick with the cache): picks up new source files (ggml-cuda globs *.cu at configure time)
+"%CMAKE%" -S . -B build-sm86 >nul || exit /b 1
 "%CMAKE%" --build build-sm86 --config Release -j 24 || exit /b 1
 if not exist build-sm86\bin\cudart64_12.dll copy /y C:\_myDrive\repos\stable-diffusion.cpp\build-sm86\bin\cudart64_12.dll build-sm86\bin\ >nul
 if not exist build-sm86\bin\cublas64_12.dll copy /y C:\_myDrive\repos\stable-diffusion.cpp\build-sm86\bin\cublas64_12.dll build-sm86\bin\ >nul
