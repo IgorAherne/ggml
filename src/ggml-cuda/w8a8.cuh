@@ -37,7 +37,7 @@
 #endif
 
 #ifndef W8A8_BM
-#define W8A8_BM       256   // tokens per block tile (256: 8 warps, one block per SM; 128: 4 warps, two blocks per SM)
+#define W8A8_BM       128   // tokens per block tile (128: 4 warps, two blocks per SM; 256: 8 warps, one block per SM)
 #endif
 #define W8A8_BN       128   // output channels per block tile
 #define W8A8_BK       64    // K values per pipeline stage (2 sub-scale groups)
@@ -54,12 +54,6 @@
 #endif
 #ifndef W8A8_WHATIF
 #define W8A8_WHATIF   0     // timing experiments of the stand-alone tests only (w8a8-tools); 0 = the real kernel
-#endif
-#ifndef W8A8_GROUP_N
-#define W8A8_GROUP_N  0     // > 0: tile order by groups of this many channel tiles instead (token tile inner)
-#endif
-#ifndef W8A8_GROUP_M
-#define W8A8_GROUP_M  4     // tile order: groups of this many token tiles, channel tiles inner
 #endif
 
 static constexpr int w8a8_stage_bytes() { return W8A8_BM*W8A8_BK + W8A8_BN*W8A8_BK + 2*W8A8_BM; }
@@ -322,7 +316,7 @@ template <int epi>
 static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gemm(
         const int8_t * __restrict__ qx, const uint8_t * __restrict__ sy, const float * __restrict__ dt,
         const int8_t * __restrict__ qw, const float * __restrict__ dw, void * __restrict__ dst, const int64_t ldd,
-        const int T, const int N, const int K) {
+        const int T, const int N, const int K, const int group) {
 #if W8A8_DEVICE_OK
     extern __shared__ __align__(128) uint8_t w8a8_smem[];
     constexpr int BM = W8A8_BM, BN = W8A8_BN, BK = W8A8_BK, S = W8A8_STAGES;
@@ -330,26 +324,26 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
 
     const int ntm = (T + BM - 1) / BM;
     const int ntn = N / BN;
+    // grouped tile order (consecutive blocks run at the same time and share operands in L2): group > 0: groups of
+    // `group` token tiles, the token tile fastest, all channel tiles; group < 0: groups of -group channel tiles, the
+    // channel tile fastest, all token tiles
     const int bid = blockIdx.x;
-#if W8A8_GROUP_N > 0
-    // grouped tile order: W8A8_GROUP_N channel tiles x all token tiles per group, the channel tile fastest
-    const int per_grp  = W8A8_GROUP_N * ntm;
-    const int grp      = bid / per_grp;
-    const int first_n  = grp * W8A8_GROUP_N;
-    const int gsize    = min(W8A8_GROUP_N, ntn - first_n);
-    const int in_grp   = bid % per_grp;
-    const int tn       = first_n + in_grp % gsize;
-    const int tm       = in_grp / gsize;
-#else
-    // grouped tile order: W8A8_GROUP_M token tiles x all channel tiles per group, the token tile fastest
-    const int per_grp  = W8A8_GROUP_M * ntn;
-    const int grp      = bid / per_grp;
-    const int first_m  = grp * W8A8_GROUP_M;
-    const int gsize    = min(W8A8_GROUP_M, ntm - first_m);
-    const int in_grp   = bid % per_grp;
-    const int tm       = first_m + in_grp % gsize;
-    const int tn       = in_grp / gsize;
-#endif
+    int tm, tn;
+    if (group > 0) {
+        const int per_grp = group * ntn;
+        const int first_m = (bid / per_grp) * group;
+        const int gsize   = min(group, ntm - first_m);
+        const int in_grp  = bid % per_grp;
+        tm = first_m + in_grp % gsize;
+        tn = in_grp / gsize;
+    } else {
+        const int per_grp = -group * ntm;
+        const int first_n = (bid / per_grp) * -group;
+        const int gsize   = min(-group, ntn - first_n);
+        const int in_grp  = bid % per_grp;
+        tn = first_n + in_grp % gsize;
+        tm = in_grp / gsize;
+    }
     const int m0 = tm * BM;
     const int n0 = tn * BN;
 
@@ -638,7 +632,7 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
         }
     }
 #else
-    (void) qx; (void) sy; (void) dt; (void) qw; (void) dw; (void) dst; (void) ldd; (void) T; (void) N; (void) K;
+    (void) qx; (void) sy; (void) dt; (void) qw; (void) dw; (void) dst; (void) ldd; (void) T; (void) N; (void) K; (void) group;
 #endif
 }
 
@@ -673,9 +667,18 @@ static inline bool w8a8_quantize_act_cuda(const src_t * x, const int64_t s01, co
 #undef W8A8_Q
 }
 
+// the tile order measured best per shape on the RTX 3060 (w8a8-tools/cmp.sh): see NOTES-w8a8.md
+static inline int w8a8_default_group(const int T, const int N, const int K) {
+    (void) T; (void) K;
+    return N >= 16384 ? 4 : -4;
+}
+
 static inline cudaError_t w8a8_gemm_cuda(const int epi, const int8_t * qx, const uint8_t * sy, const float * dt, const int8_t * qw,
                                          const float * dw, void * dst, const int64_t ldd, const int T, const int N, const int K,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, int group = 0) {
+    if (group == 0) {
+        group = w8a8_default_group(T, N, K);
+    }
     const int ntm = (T + W8A8_BM - 1) / W8A8_BM;
     const int ntn = N / W8A8_BN;
     const dim3 grid((unsigned) (ntm * ntn));
@@ -685,7 +688,7 @@ static inline cudaError_t w8a8_gemm_cuda(const int epi, const int8_t * qx, const
         static bool attr_set = false; \
         if (!attr_set) { err = cudaFuncSetAttribute(w8a8_gemm<E>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);             if (err == cudaSuccess) err = cudaFuncSetAttribute(w8a8_gemm<E>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);             attr_set = err == cudaSuccess; } \
         if (err != cudaSuccess) return err; \
-        w8a8_gemm<E><<<grid, W8A8_NTHREADS, smem, stream>>>(qx, sy, dt, qw, dw, dst, ldd, T, N, K); }
+        w8a8_gemm<E><<<grid, W8A8_NTHREADS, smem, stream>>>(qx, sy, dt, qw, dw, dst, ldd, T, N, K, group); }
     switch (epi) {
         case W8A8_EPI_F32:     W8A8_G(W8A8_EPI_F32);     break;
         case W8A8_EPI_GLU_F16: W8A8_G(W8A8_EPI_GLU_F16); break;

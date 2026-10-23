@@ -52,3 +52,20 @@ v4 + staged epilogue (per m fragment through shared memory, 16-byte streaming st
   what-ifs b256 (no global loads): IMAD 81.5/82.5/85.0; constant sy 87.4/86.7/90.0; plain 100.0/101.6/105.3;
   IADD 91.7/94.1/97.2; no fragment loads (spills) 75.3/78.6/79.5.
   S=4: no gain. PRMT sy extraction: slower (spills). Warp tile 32x64 (16 warps / 128 regs): spills 92-120 B.
+
+NOTE (found 2026-10-23 ~04:00): the lock wrapper started `bash` = WSL's bash (python's subprocess on Windows), which
+does not inherit Windows environment variables: every "GLU_EPI=1" cmp run above timed [1] with the f32 epilogue, not
+the SwiGLU f16 one. Fixed with w8a8-tools/lk.sh (Git's bash). All [1] numbers above are f32-epilogue numbers.
+
+### Tile order sweep, 128x128 tile (BM 128, 4 warps, 2 blocks/SM), run-time group (raster.sh, 3 interleaved rounds,
+### ms per round; [1] with the SwiGLU f16 epilogue = the real gate|up call)
+group      4096^3 (ms)          gate|up 4096x24576x4096 GLU   down 4096x4096x12288
+ 4         1.713 1.720 1.725    10.465 10.553 10.606          5.389 5.413 5.414
+ 3         1.719 1.720 1.747    10.468 10.546 10.554          5.415 5.437 5.455
+ 2         1.731 1.731 1.744    10.493 10.496 10.544          5.450 5.509 5.536
+ 1         2.044 2.066 2.086    10.955 10.981 10.982          6.268 6.298 6.364
+-2         1.740 1.747 1.816    10.504 10.550 10.647          5.498 5.520 5.540
+-4         1.714 1.715 1.728    10.558 10.567 10.644          5.342 5.387 5.439
+-8         1.940 1.940 1.952    11.118 11.227 11.275          5.844 5.845 5.887
+-> default: group 4 for N >= 16384, -4 otherwise: 4096^3 1.714 ms = 80.2 T/s; gate|up GLU 10.465 ms = 78.8 T/s;
+   down 5.342 ms = 77.2 T/s (GEMM kernels alone, random int8 data, CUDA events).

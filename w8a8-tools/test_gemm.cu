@@ -116,7 +116,8 @@ static void run_shape(int T, int N, int K, bool check, int reps) {
     if (reps > 0) {
         const int epi = getenv("W8A8_EPI") ? atoi(getenv("W8A8_EPI")) : W8A8_EPI_F32;
         const int64_t ldd = epi == W8A8_EPI_F32 ? N : N/2;
-        const float ms = time_median([&] { w8a8_gemm_cuda(epi, dx, dsy_, ddt, dw8, ddw, dout, ldd, T, N, K, 0); }, reps);
+        const int group = getenv("W8A8_GROUP") ? atoi(getenv("W8A8_GROUP")) : 0;
+        const float ms = time_median([&] { w8a8_gemm_cuda(epi, dx, dsy_, ddt, dw8, ddw, dout, ldd, T, N, K, 0, group); }, reps);
         printf(" | %s epilogue %.3f ms %.1f T/s", epi == W8A8_EPI_F32 ? "f32" : (epi == W8A8_EPI_GLU_F16 ? "glu-f16" : "glu-f32"),
                ms, flops / ms / 1e9);
     }
@@ -126,8 +127,8 @@ static void run_shape(int T, int N, int K, bool check, int reps) {
 
 int main(int argc, char ** argv) {
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
-    printf("%s, %d SMs; tiles %dx%dx%d, %d stages, group %d, smem %d B\n", prop.name, prop.multiProcessorCount, W8A8_BM, W8A8_BN,
-           W8A8_BK, W8A8_STAGES, W8A8_GROUP_M, w8a8_smem_bytes());
+    printf("%s, %d SMs; tiles %dx%dx%d, warp tile %dx64, %d stages, smem %d B\n", prop.name, prop.multiProcessorCount,
+           W8A8_BM, W8A8_BN, W8A8_BK, W8A8_WM, W8A8_STAGES, w8a8_smem_bytes());
     if (argc > 1 && !strcmp(argv[1], "bench")) {
         const int reps = argc > 5 ? atoi(argv[5]) : 20;
         run_shape(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), false, reps);
