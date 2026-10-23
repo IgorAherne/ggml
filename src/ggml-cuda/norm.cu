@@ -1,6 +1,7 @@
 #include "norm.cuh"
 #include "mmq.cuh"
 #include "unary.cuh"
+#include "w8a8-format.cuh"
 #include <climits>
 #include <cstdint>
 
@@ -82,6 +83,80 @@ static __device__ __forceinline__ void norm_store_q8_1(const float4 xi, void * v
             y[ib].ds4[iqs/32] = make_half2(d, sum);
         } else {
             y[ib].d4[iqs/32]  = d;
+        }
+    }
+}
+
+// mul_add_norm_mul_f32's qlayout for the W8A8 path's activations (w8a8-format.cuh) instead of q8_1 data
+static constexpr int NORM_QLAYOUT_W8A8 = 100;
+
+// A fused norm's output for the W8A8 path's products: row `row` of ncols values (ncols % 1024 == 0, <= 16384; 1024
+// threads, thread tid normalizing columns 4*(tid + i*1024) .. +3 as the q8_1 variant does, with its pinned arithmetic),
+// quantized with w8a8_quantize_act's expressions (w8a8.cuh; M a run-time value as there, so that the divisions compile
+// alike): the row's max |v|, d_t = amax/127, per 32 values (8 consecutive lanes) sy = max(1, min(M, ceil(M*g/amax))),
+// d = d_t*sy/M, inv = 1/d, q = clamp(rint(v*inv)) - the q_x / sy / d_t that quantizing the norm's f32 output gives.
+// s_max: 32 floats of shared memory, free for this block. Every thread of the block must call it.
+template <int block_size>
+static __device__ __forceinline__ void norm_store_w8a8(
+        const float * xo, const float * m, const uint3 m_ncols_packed, const float mean_p, const float inv_std_p,
+        const int ncols, const int row, const w8a8_act_ptrs w8, const int M, float * s_max) {
+    static_assert(block_size == 1024, "the W8A8 writer takes 1024 threads");
+    constexpr int MAXI = 4;  // ncols <= 4*4*block_size
+    const int tid     = threadIdx.x;
+    const int ngroups = ncols / 4;
+    float4 v[MAXI];
+    float mx = 0.0f;
+#pragma unroll
+    for (int i = 0; i < MAXI; ++i) {
+        const int group = tid + i*block_size;
+        if (group < ngroups) {
+            const int c = 4*group;
+            v[i].x = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 0], mean_p)), m[fastmodulo(c + 0, m_ncols_packed)]);
+            v[i].y = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 1], mean_p)), m[fastmodulo(c + 1, m_ncols_packed)]);
+            v[i].z = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 2], mean_p)), m[fastmodulo(c + 2, m_ncols_packed)]);
+            v[i].w = __fmul_rn(__fmul_rn(inv_std_p, __fsub_rn(xo[c + 3], mean_p)), m[fastmodulo(c + 3, m_ncols_packed)]);
+            mx = fmaxf(mx, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
+        }
+    }
+    // the row's max |v| (a max: the same value in any order)
+    mx = warp_reduce_max(mx);
+    if (tid % WARP_SIZE == 0) {
+        s_max[tid / WARP_SIZE] = mx;
+    }
+    __syncthreads();
+    float amax = s_max[0];
+#pragma unroll
+    for (int w = 1; w < block_size/WARP_SIZE; ++w) {
+        amax = fmaxf(amax, s_max[w]);
+    }
+    const float d_row = amax / 127.0f;
+    if (tid == 0) {
+        w8.dt[row] = d_row;
+    }
+    const int G = ncols / 32;
+    int8_t  * qrow    = w8.qx + (int64_t) row * ncols;
+    uint8_t * sy_tile = w8.sy + (int64_t) (row / W8A8_BM) * G * W8A8_BM + w8a8_sy_pos(row % W8A8_BM);
+#pragma unroll
+    for (int i = 0; i < MAXI; ++i) {
+        const int group = tid + i*block_size;
+        if (group < ngroups) {  // warp-uniform (ngroups % 256 == 0)
+            float g = fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w)));
+#pragma unroll
+            for (int off = 4; off > 0; off >>= 1) {
+                g = fmaxf(g, __shfl_xor_sync(0xFFFFFFFF, g, off, WARP_SIZE));
+            }
+            const int   sv  = amax > 0.0f ? max(1, min(M, (int) ceilf((float) M * g / amax))) : 1;
+            const float d   = d_row * (float) sv / (float) M;
+            const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+            char4 q;
+            q.x = (signed char) max(-127, min(127, __float2int_rn(v[i].x * inv)));
+            q.y = (signed char) max(-127, min(127, __float2int_rn(v[i].y * inv)));
+            q.z = (signed char) max(-127, min(127, __float2int_rn(v[i].z * inv)));
+            q.w = (signed char) max(-127, min(127, __float2int_rn(v[i].w * inv)));
+            *(char4 *) (qrow + 4*group) = q;
+            if (tid % 8 == 0) {
+                sy_tile[(int64_t) (group / 8) * W8A8_BM] = (uint8_t) sv;
+            }
         }
     }
 }
@@ -173,7 +248,8 @@ static __global__ void norm_f32(
 // residual's product and sum are rounded separately (__fmul_rn / __fadd_rn, like k_mul_add_f32 and the unfused
 // kernels); the norm part is norm_f32's code (same block size, same per-thread column order, same reduction) on those
 // values, and its result is multiplied like the NORM + MUL fusion.
-// qlayout >= 0: dst as q8_1 data for quantized MUL_MATs, as in norm_f32.
+// qlayout >= 0: dst as q8_1 data for quantized MUL_MATs, as in norm_f32; NORM_QLAYOUT_W8A8: dst as the W8A8 path's
+// activations (w8 and M: norm_store_w8a8).
 template <int block_size, int qlayout = -1>
 static __global__ void mul_add_norm_mul_f32(
         const float * a, const float * b, const float * x, float * xo, float * dst, const float * m,
@@ -182,7 +258,7 @@ static __global__ void mul_add_norm_mul_f32(
         const uint3 b_ncols_packed, const uint3 b_nrows_packed, const uint3 b_nchannels_packed, const uint3 b_nsamples_packed,
         const int64_t m_stride_row, const int64_t m_stride_channel, const int64_t m_stride_sample,
         const uint3 m_ncols_packed, const uint3 m_nrows_packed, const uint3 m_nchannels_packed, const uint3 m_nsamples_packed,
-        void * vq = nullptr) {
+        void * vq = nullptr, const w8a8_act_ptrs w8 = {}, const int w8_M = 0) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -219,7 +295,15 @@ static __global__ void mul_add_norm_mul_f32(
     const float var = mean_var.y / ncols - mean * mean;
     const float inv_std = rsqrtf(var + eps);
 
-    if constexpr (qlayout >= 0) {
+    if constexpr (qlayout == NORM_QLAYOUT_W8A8) {
+        // the statistics and the normalization pinned as in the q8_1 variant below
+        float mean_p, inv_std_p;
+        norm_stats_pinned(mean_var, ncols, eps, mean_p, inv_std_p);
+        // other threads wrote some of the columns to xo, and every thread has read s_sum2: wait for both
+        __syncthreads();
+        norm_store_w8a8<block_size>(xo, m, m_ncols_packed, mean_p, inv_std_p, ncols, row, w8, w8_M, (float *) s_sum2);
+        return;
+    } else if constexpr (qlayout >= 0) {
         // the statistics and the normalization pinned to norm_f32's compiled arithmetic, as in norm_f32's q8_1 variant
         float mean_p, inv_std_p;
         norm_stats_pinned(mean_var, ncols, eps, mean_p, inv_std_p);
@@ -832,7 +916,8 @@ void ggml_cuda_op_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
 }
 
 void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_tensor * mul1, ggml_tensor * add,
-                                         ggml_tensor * norm, ggml_tensor * mul2, void * q8_1, int q8_1_layout) {
+                                         ggml_tensor * norm, ggml_tensor * mul2, void * q8_1, int q8_1_layout,
+                                         const w8a8_act_ptrs * w8a8) {
     const ggml_tensor * a = mul1->src[0];
     const ggml_tensor * b = mul1->src[1];
     const ggml_tensor * x = add->src[0] == mul1 ? add->src[1] : add->src[0];
@@ -863,6 +948,14 @@ void ggml_cuda_op_mul_add_norm_mul_fused(ggml_backend_cuda_context & ctx, ggml_t
 
     cudaStream_t stream = ctx.stream();
     // the block sizes of norm_f32_cuda, so the reduction runs in the same order
+    if (w8a8 != nullptr) {
+        GGML_ASSERT(q8_1 == nullptr && ncols % 1024 == 0 && ncols <= 16384 && nchannels == 1 && nsamples == 1);
+        const int M = 255;  // run-time, as w8a8_quantize_act's
+        mul_add_norm_mul_f32<1024, NORM_QLAYOUT_W8A8><<<blocks_num, dim3(1024, 1, 1), 32 * sizeof(float2), stream>>>(
+            a_d, b_d, x_d, xo_d, dst_d, m_d, ncols, eps, bs1, bs2, bs3, b0, b1, b2, b3, ms1, ms2, ms3, m0, m1, m2, m3,
+            nullptr, *w8a8, M);
+        return;
+    }
     if (q8_1 != nullptr) {
         GGML_ASSERT(ncols % QK8_1_MMQ == 0 && nchannels == 1 && nsamples == 1);
 #define MANM_Q8_1_LAUNCH(bs, ql) \

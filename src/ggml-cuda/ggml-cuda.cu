@@ -4264,6 +4264,28 @@ static int ggml_cuda_quantized_consumers(const ggml_backend_cuda_context & ctx, 
     return n > 0 && ggml_node_get_use_count(cgraph, t_idx) == n ? n : 0;
 }
 
+// ggml_cuda_quantized_consumers' counterpart for the W8A8 path: the number of MUL_MAT nodes right after node t_idx
+// (1..4) that use its output as src1, are all of its uses and that the W8A8 path computes (ggml_cuda_w8a8_supported),
+// when t (F32, contiguous, one channel and sample, not a graph output, not a view) can be handed to them as quantized
+// activations only; else 0.
+static int ggml_cuda_w8a8_consumers(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int t_idx) {
+    const ggml_tensor * t = cgraph->nodes[t_idx];
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->ne[2] != 1 || t->ne[3] != 1 ||
+        (t->flags & GGML_TENSOR_FLAG_OUTPUT) || t->view_src != nullptr) {
+        return 0;
+    }
+    int n = 0;
+    while (n < 4 && t_idx + 1 + n < cgraph->n_nodes) {
+        const ggml_tensor * mm = cgraph->nodes[t_idx + 1 + n];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != t || mm->src[0] == t || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            !ggml_cuda_w8a8_supported(ctx, mm)) {
+            break;
+        }
+        n++;
+    }
+    return n > 0 && ggml_node_get_use_count(cgraph, t_idx) == n ? n : 0;
+}
+
 // The q8_1 buffer size for the n MUL_MATs after node t_idx (the largest any of them would allocate).
 static size_t ggml_cuda_consumers_q8_1_bytes(const ggml_cgraph * cgraph, int t_idx, int n) {
     size_t nbytes = 0;
@@ -4430,6 +4452,40 @@ static int ggml_cuda_try_fuse_into_concat(ggml_backend_cuda_context * cuda_ctx, 
     return j - i;
 }
 
+// Index of the down MUL_MAT when nodes[j] heads a [gate | up] MUL_MAT -> SWIGLU -> MUL_MAT chain that the W8A8 path runs
+// as one (ggml_cuda_w8a8_glu), else -1. View nodes between them are skipped.
+static int ggml_cuda_w8a8_glu_chain(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int j) {
+    auto next_compute = [&](int k) {
+        for (++k; k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k]); ++k) {
+        }
+        return k;
+    };
+    const ggml_tensor * mm = cgraph->nodes[j];
+    if (mm->op != GGML_OP_MUL_MAT || ggml_node_get_use_count(cgraph, j) != 1 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    const int jg = next_compute(j);
+    if (jg >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * glu = cgraph->nodes[jg];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[0] != mm || glu->src[1] != nullptr ||
+        ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 || (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, jg) != 1) {
+        return -1;
+    }
+    const int jo = next_compute(jg);
+    if (jo >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * mm_out = cgraph->nodes[jo];
+    if (mm_out->op != GGML_OP_MUL_MAT || (mm_out->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        !ggml_cuda_w8a8_glu_supported(*cuda_ctx, mm, glu, mm_out)) {
+        return -1;
+    }
+    return jo;
+}
+
 // The W8A8 path's fusions (w8a8-mm.cuh), the counterparts of the q8_1 ones below (which skip its products):
 // - SCALE + MUL_MAT: the scale is applied while quantizing the SCALE's input (scale_f32's FMA), its output never written;
 // - 2..4 MUL_MATs of one src1 (an attention's q, k and v): src1 quantized once;
@@ -4441,33 +4497,6 @@ static int ggml_cuda_try_fuse_w8a8(ggml_backend_cuda_context * cuda_ctx, ggml_cg
         for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
         }
         return j;
-    };
-    // index of the down MUL_MAT when nodes[j] heads a [gate | up] -> SWIGLU -> MUL_MAT chain the path runs, else -1
-    auto glu_chain = [&](const int j) {
-        const ggml_tensor * mm = cgraph->nodes[j];
-        if (mm->op != GGML_OP_MUL_MAT || ggml_node_get_use_count(cgraph, j) != 1 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-            return -1;
-        }
-        const int jg = next_compute(j);
-        if (jg >= cgraph->n_nodes) {
-            return -1;
-        }
-        const ggml_tensor * glu = cgraph->nodes[jg];
-        if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[0] != mm || glu->src[1] != nullptr ||
-            ggml_get_op_params_i32(glu, 1) != 0 || glu->type != GGML_TYPE_F32 || (glu->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            (glu->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, jg) != 1) {
-            return -1;
-        }
-        const int jo = next_compute(jg);
-        if (jo >= cgraph->n_nodes) {
-            return -1;
-        }
-        const ggml_tensor * mm_out = cgraph->nodes[jo];
-        if (mm_out->op != GGML_OP_MUL_MAT || (mm_out->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            !ggml_cuda_w8a8_glu_supported(*cuda_ctx, mm, glu, mm_out)) {
-            return -1;
-        }
-        return jo;
     };
 
     if (node->op == GGML_OP_SCALE) {
@@ -4501,7 +4530,7 @@ static int ggml_cuda_try_fuse_w8a8(ggml_backend_cuda_context * cuda_ctx, ggml_cg
         }
         n++;
     }
-    const int jo = glu_chain(i + n - 1);
+    const int jo = ggml_cuda_w8a8_glu_chain(cuda_ctx, cgraph, i + n - 1);
     if (n == 1 && jo < 0) {
         return -1;
     }
@@ -5090,6 +5119,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, mm, nullptr, src1_q8_1.get(), /*src1_q8_1_filled =*/ true);
             }
             return 3 + n_mm;
+        }
+        // the W8A8 path's products (q, k and v of a block, or a [gate | up] product heading the GLU chain): the norm's
+        // output written directly as their quantized activations (the quantizer's exact arithmetic), never in f32
+        const int n_w = ggml_cuda_w8a8_norm_fusion_enabled() ? ggml_cuda_w8a8_consumers(*cuda_ctx, cgraph, i + 3) : 0;
+        if (n_w > 0) {
+            ggml_tensor * mul2 = cgraph->nodes[i + 3];
+            ggml_cuda_w8a8_act act(cuda_ctx->pool());
+            ggml_cuda_w8a8_act_alloc(*cuda_ctx, act, mul2->ne[1], mul2->ne[0]);
+            const w8a8_act_ptrs ptrs = ggml_cuda_w8a8_act_ptrs(act);
+            ggml_cuda_op_mul_add_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], mul2, nullptr, -1, &ptrs);
+            if (ggml_cuda_w8a8_norm_check_enabled()) {
+                // research check: the same chain unfused (NORM, MUL into their own buffers, then the quantizer) - add
+                // already holds the residual, which the fused kernel wrote
+                ggml_cuda_op_norm(*cuda_ctx, cgraph->nodes[i + 2]);
+                ggml_cuda_op_mul(*cuda_ctx, mul2);
+                ggml_cuda_w8a8_act ref(cuda_ctx->pool());
+                ggml_cuda_w8a8_quantize(*cuda_ctx, ref, mul2->data, false, mul2->nb[1] / sizeof(float), mul2->ne[1], mul2->ne[0]);
+                const int64_t bad = ggml_cuda_w8a8_act_mismatches(*cuda_ctx, act, ref);
+                static int64_t checks = 0, bad_total = 0;
+                checks++;
+                bad_total += bad;
+                if (bad != 0 || checks % 64 == 1) {
+                    GGML_LOG_INFO("ggml_cuda: W8A8 norm writer check %lld (%s, T %lld, K %lld): %lld bytes differ (total %lld)\n",
+                                  (long long) checks, mul2->name, (long long) mul2->ne[1], (long long) mul2->ne[0], (long long) bad,
+                                  (long long) bad_total);
+                }
+            }
+            const int jo = ggml_cuda_w8a8_glu_chain(cuda_ctx, cgraph, i + 3 + n_w);
+            for (int j = 0; j < n_w; j++) {
+                ggml_tensor * mm = cgraph->nodes[i + 4 + j];
+                if (j == n_w - 1 && jo >= 0) {
+                    int jg = i + 4 + j + 1;
+                    while (ggml_cuda_is_view_or_noop(cgraph->nodes[jg])) {
+                        jg++;
+                    }
+                    ggml_cuda_w8a8_glu(*cuda_ctx, mm, act, cgraph->nodes[jg], cgraph->nodes[jo]);
+                    return jo - i;
+                }
+                ggml_cuda_w8a8_mul_mat(*cuda_ctx, mm->src[0], act, mm);
+            }
+            return 3 + n_w;
         }
         ggml_cuda_op_mul_add_norm_mul_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
         return 3;

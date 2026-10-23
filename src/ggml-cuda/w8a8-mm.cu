@@ -12,6 +12,8 @@ struct w8a8_config {
     int64_t     min_tokens = 1024;
     std::string names      = "transformer_blocks";
     bool        glu_f16    = true;
+    bool        norm_fuse  = true;
+    bool        norm_check = false;
 };
 
 const w8a8_config & w8a8_cfg() {
@@ -33,6 +35,12 @@ const w8a8_config & w8a8_cfg() {
         }
         if (const char * e = getenv("GGML_CUDA_W8A8_GLU")) {
             c.glu_f16 = strcmp(e, "f32") != 0;
+        }
+        if (const char * e = getenv("GGML_CUDA_W8A8_NORM")) {
+            c.norm_fuse = strcmp(e, "off") != 0 && strcmp(e, "0") != 0;
+        }
+        if (const char * e = getenv("GGML_CUDA_W8A8_CHECK_NORM")) {
+            c.norm_check = atoi(e) != 0;
         }
         return c;
     }();
@@ -57,8 +65,9 @@ void w8a8_log_once(const int device) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     GGML_LOG_INFO("ggml_cuda: W8A8 int8 matmul path (W8 x A8-sub32) on %s (cc %d): Q4_K/Q5_K products with >= %lld tokens%s%s%s, "
-                  "SwiGLU intermediate %s\n", prop.name, ggml_cuda_info().devices[device].cc, (long long) c.min_tokens,
-                  c.names.empty() ? "" : ", weights named *", c.names.c_str(), c.names.empty() ? "" : "*", c.glu_f16 ? "f16" : "f32");
+                  "SwiGLU intermediate %s, norm writer %s%s\n", prop.name, ggml_cuda_info().devices[device].cc, (long long) c.min_tokens,
+                  c.names.empty() ? "" : ", weights named *", c.names.c_str(), c.names.empty() ? "" : "*", c.glu_f16 ? "f16" : "f32",
+                  c.norm_fuse ? "fused" : "off", c.norm_check ? " (checked)" : "");
 }
 
 }  // namespace
@@ -92,6 +101,54 @@ bool ggml_cuda_w8a8_supported(const ggml_backend_cuda_context & ctx, const ggml_
         return false;
     }
     return w8a8_device_ok(ctx.device);
+}
+
+bool ggml_cuda_w8a8_norm_fusion_enabled() {
+    return w8a8_cfg().norm_fuse;
+}
+
+bool ggml_cuda_w8a8_norm_check_enabled() {
+    return w8a8_cfg().norm_check;
+}
+
+void ggml_cuda_w8a8_act_alloc(ggml_backend_cuda_context & ctx, ggml_cuda_w8a8_act & act, const int64_t T, const int64_t K) {
+    const int64_t Tp = w8a8_pad_tokens(T);
+    act.qx.alloc(Tp*K);
+    act.sy.alloc(Tp*(K/32));
+    act.dt.alloc(Tp);
+    act.T = T;
+    act.K = K;
+    if (Tp > T) {  // the last token tile's padding rows: q_x and d_t 0, its sy block 0 (the writer then fills rows < T)
+        cudaStream_t stream = ctx.stream();
+        CUDA_CHECK(cudaMemsetAsync(act.qx.get() + T*K, 0, (Tp - T)*K, stream));
+        CUDA_CHECK(cudaMemsetAsync(act.sy.get() + (Tp - W8A8_BM)*(K/32), 0, W8A8_BM*(K/32), stream));
+        CUDA_CHECK(cudaMemsetAsync(act.dt.get() + T, 0, (Tp - T)*sizeof(float), stream));
+    }
+}
+
+static __global__ void w8a8_count_mismatches(const uint8_t * a, const uint8_t * b, const int64_t n, unsigned long long * count) {
+    unsigned long long c = 0;
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        c += a[i] != b[i];
+    }
+    if (c) {
+        atomicAdd(count, c);
+    }
+}
+
+int64_t ggml_cuda_w8a8_act_mismatches(ggml_backend_cuda_context & ctx, ggml_cuda_w8a8_act & a, ggml_cuda_w8a8_act & b) {
+    GGML_ASSERT(a.T == b.T && a.K == b.K);
+    const int64_t Tp = w8a8_pad_tokens(a.T);
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<unsigned long long> count(ctx.pool(), 1);
+    CUDA_CHECK(cudaMemsetAsync(count.get(), 0, sizeof(unsigned long long), stream));
+    w8a8_count_mismatches<<<256, 256, 0, stream>>>((const uint8_t *) a.qx.get(), (const uint8_t *) b.qx.get(), Tp*a.K, count.get());
+    w8a8_count_mismatches<<<256, 256, 0, stream>>>(a.sy.get(), b.sy.get(), Tp*(a.K/32), count.get());
+    w8a8_count_mismatches<<<64, 256, 0, stream>>>((const uint8_t *) a.dt.get(), (const uint8_t *) b.dt.get(), Tp*4, count.get());
+    unsigned long long h = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&h, count.get(), sizeof(h), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return (int64_t) h;
 }
 
 void ggml_cuda_w8a8_quantize(ggml_backend_cuda_context & ctx, ggml_cuda_w8a8_act & act, const void * x, const bool x_f16,

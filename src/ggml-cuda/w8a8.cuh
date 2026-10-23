@@ -36,18 +36,7 @@
 #define W8A8_DEVICE_OK 0
 #endif
 
-#ifndef W8A8_BM
-#define W8A8_BM       128   // tokens per block tile (128: 4 warps, two blocks per SM; 256: 8 warps, one block per SM)
-#endif
-#define W8A8_BN       128   // output channels per block tile
-#define W8A8_BK       64    // K values per pipeline stage (2 sub-scale groups)
-#ifndef W8A8_WM
-#define W8A8_WM       64    // tokens per warp tile (64: 128 accumulators per thread; 32: 64, twice the warps)
-#endif
-#define W8A8_MF       (W8A8_WM/16)        // m16 fragments per warp
-#define W8A8_WARPS_M  (W8A8_BM/W8A8_WM)
-#define W8A8_NTHREADS (W8A8_WARPS_M*64)   // W8A8_WARPS_M (tokens) x 2 (channels) warps, W8A8_WM x 64 outputs each
-#define W8A8_MINBLOCKS ((W8A8_WM == 64 ? 256 : 512)/W8A8_NTHREADS > 1 ? (W8A8_WM == 64 ? 256 : 512)/W8A8_NTHREADS : 1)
+#include "w8a8-format.cuh"
 
 #ifndef W8A8_STAGES
 #define W8A8_STAGES   3
@@ -55,17 +44,6 @@
 
 static constexpr int w8a8_stage_bytes() { return W8A8_BM*W8A8_BK + W8A8_BN*W8A8_BK + 2*W8A8_BM; }
 static constexpr int w8a8_smem_bytes()  { return W8A8_STAGES*w8a8_stage_bytes(); }
-
-// position of row r (0..BM-1) of a token tile in its sy block: r = wm*WM + mf*16 + h*8 + gid  ->
-// wm*WM + gid*2*MF + mf*2 + h (a thread's 2*MF values of one group are consecutive bytes)
-static __host__ __device__ __forceinline__ int w8a8_sy_pos(const int r) {
-    const int wm = r / W8A8_WM, mf = (r % W8A8_WM) >> 4, h = (r >> 3) & 1, gid = r & 7;
-    return wm*W8A8_WM + gid*2*W8A8_MF + mf*2 + h;
-}
-
-static __host__ __device__ __forceinline__ int64_t w8a8_pad_tokens(const int64_t T) {
-    return (T + W8A8_BM - 1) / W8A8_BM * W8A8_BM;
-}
 
 // ---- weights: Q4_K / Q5_K rows -> int8 rows with a per-row scale (single pass, the row max computed in the kernel) ----
 
