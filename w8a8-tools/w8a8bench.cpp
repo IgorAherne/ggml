@@ -119,6 +119,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    size_t free0 = 0, total = 0;
+    ggml_backend_dev_memory(dev, &free0, &total);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!buf) { fprintf(stderr, "alloc failed\n"); return 2; }
     uint32_t seed = 1234;
@@ -149,6 +151,11 @@ int main(int argc, char** argv) {
     printf("%s %s K %lld N %lld T %lld: median %.3f ms (min %.3f), %.1f T/s, hash %016llx, sum %.6g, |sum| %.6g\n", op.c_str(),
            argv[3], (long long) K, (long long) N, (long long) T, med * 1e3, times[0] * 1e3, flops / med / 1e12,
            (unsigned long long)fnv(host.data(), host.size()), sum, asum);
+    size_t free1 = 0;
+    ggml_backend_dev_memory(dev, &free1, &total);
+    // the tensors' buffer + the backend's pool after the runs (the pool keeps its peak) + kernels / library memory
+    printf("   device memory used by this run: %.1f MiB (tensors %.1f MiB; the rest = pool peak + module / library memory)\n",
+           (double) (free0 - free1) / 1048576.0, (double) ggml_backend_buffer_get_size(buf) / 1048576.0);
     if (const char* dump = getenv("MMBENCH_DUMP")) {
         FILE* fh = fopen(dump, "wb");
         if (fh) { fwrite(host.data(), 1, host.size(), fh); fclose(fh); }
