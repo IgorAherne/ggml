@@ -268,3 +268,12 @@ later optimisation: ~22 ms a step); W8g256 (dropped by the coordinator).
 Full ggml-cuda target with the release GPU list (build-relcheck.cmd: CMAKE_CUDA_ARCHITECTURES 61;70;75;80;86;89;90;100;120,
 the release's CUDA flags): BUILD OK in 13 min 14 s, no errors (build-relcheck.log); ggml-cuda.dll 341.9 MB with cubins
 sm_61 .. sm_120.
+
+## Merge of spellcast-perf (2026-10-23 ~04:40)
+spellcast-perf gained the coordinator's research hooks (e43fa740: w8a8-emu.cu/.cuh + GGML_CUDA_ACT_DUMP) after this
+branch started; merged into this branch (d47db4e9): the emulation hook once, the W8A8 dispatch right after it, the act
+dump hook in the MMQ branch as there; w8a8-emu.cu = spellcast-perf's + the K-split control. Against spellcast-perf the
+branch now adds only: ggml-cuda.cu +104 lines, w8a8-emu.cu +15/-2, w8a8.cuh, w8a8-mm.cu/.cuh, notes, tools.
+After the merge (rebuilt build-sm86): w8a8bench hashes unchanged - mm q4_K 4096^3 e65cf1a2d9d23f7d, glu 4096
+beb8864db98f4545, SCALE+mm q5_K T 4145 8eb416686829375f, 3 x mm T 4145 579847c482e3ba17 (= the verified run).
+The sd-cli folder used for every picture / bench: scratchpad w8a8\bin_w8a8 (sd.cpp build-sm86 bin + this ggml-cuda.dll).
