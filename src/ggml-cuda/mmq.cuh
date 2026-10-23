@@ -437,6 +437,10 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 
 #include "mmq-load-tiles.cuh"
 #include "mmq-vec-dot.cuh"
+// mmq-async.cuh calls this one with explicit template arguments before its definition further down: declared here,
+// since GCC-hosted nvcc (C++17) does not take an undeclared name followed by "<" as a template (MSVC does)
+template <ggml_type type, int J, bool fallback>
+static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_back();
 #include "mmq-async.cuh"
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
