@@ -2433,6 +2433,71 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// Research hook, inactive unless GGML_CUDA_ACT_DUMP=<dir> is set: every activation that goes through the quantized
+// matmul (ggml_cuda_mul_mat_q) is copied to the host and written with the weight's name - its per-channel max |x| and
+// sum x^2 over all tokens for every call, and a subsample of up to 256 token rows for the calls whose per-weight
+// index is listed in GGML_CUDA_ACT_DUMP_ROWS (comma-separated, 0-based). Synchronous; for offline precision studies.
+static void ggml_cuda_act_dump(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+    static const char * dir = getenv("GGML_CUDA_ACT_DUMP");
+    if (dir == nullptr || src1->type != GGML_TYPE_F32 || src1->ne[1] < 32 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            src1->nb[0] != sizeof(float)) {
+        return;
+    }
+    static std::vector<int> row_calls = [] {
+        std::vector<int> v;
+        const char * e = getenv("GGML_CUDA_ACT_DUMP_ROWS");
+        for (const char * q = e; q && *q; ) {
+            char * end = nullptr;
+            v.push_back((int) strtol(q, &end, 10));
+            q = (end && *end == ',') ? end + 1 : end;
+        }
+        return v;
+    }();
+    static std::map<std::string, int> counters;
+    static int serial = 0;
+    static FILE * index = nullptr;
+    if (index == nullptr) {
+        index = fopen((std::string(dir) + "/index.txt").c_str(), "a");
+        if (index == nullptr) {
+            return;
+        }
+    }
+    const int     call = counters[src0->name]++;
+    const int64_t K    = src1->ne[0];
+    const int64_t T    = src1->ne[1];
+    std::vector<float> h((size_t) K * T);
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+    CUDA_CHECK(cudaMemcpy2D(h.data(), K * sizeof(float), src1->data, src1->nb[1], K * sizeof(float), T, cudaMemcpyDeviceToHost));
+    std::vector<float> cmax(K, 0.0f), csq(K, 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+        const float * row = h.data() + t * K;
+        for (int64_t k = 0; k < K; ++k) {
+            const float a = fabsf(row[k]);
+            cmax[k] = fmaxf(cmax[k], a);
+            csq[k] += a * a;
+        }
+    }
+    const bool    rows   = std::find(row_calls.begin(), row_calls.end(), call) != row_calls.end();
+    const int64_t stride = rows ? std::max<int64_t>(1, T / 256) : 0;
+    const int32_t nrows  = rows ? (int32_t) ((T + stride - 1) / stride) : 0;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%06d.bin", dir, serial);
+    FILE * f = fopen(path, "wb");
+    if (f != nullptr) {
+        const int32_t header[4] = { 0x31544341, (int32_t) K, (int32_t) T, nrows };
+        fwrite(header, sizeof(header), 1, f);
+        fwrite(cmax.data(), sizeof(float), K, f);
+        fwrite(csq.data(), sizeof(float), K, f);
+        for (int64_t t = 0; rows && t < T; t += stride) {
+            fwrite(h.data() + t * K, sizeof(float), K, f);
+        }
+        fclose(f);
+    }
+    fprintf(index, "%06d %d %s %" PRId64 " %" PRId64 " %d %s\n", serial, call, src0->name, K, T, nrows, ggml_type_name(src0->type));
+    fflush(index);
+    serial++;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -2507,6 +2572,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        ggml_cuda_act_dump(ctx, src0, src1);
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
