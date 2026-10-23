@@ -2062,12 +2062,13 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
-    // Cards without fast fp16 (GTX 10xx: cc 6.1) take F16 sources with F32 compute. Instead of converting both to
-    // F32 in pool buffers first (the im2col of a 512-pixel VAE tile is 1.4 GB as F16, 2.7 GB converted, per
-    // convolution), one plain GEMM hands them to cuBLAS as F16 with F32 compute: the kernels convert as they load.
-    // GGML_CUDA_F16_SGEMM=off restores the conversion path.
-    static const bool f16_sgemm_off = getenv("GGML_CUDA_F16_SGEMM") != nullptr && std::string(getenv("GGML_CUDA_F16_SGEMM")) == "off";
-    const bool pass_f16 = compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && !f16_sgemm_off &&
+    // Opt-in (GGML_CUDA_F16_SGEMM=on) for cards without fast fp16 (GTX 10xx: cc 6.1), which take F16 sources with
+    // F32 compute: a plain GEMM hands them to cuBLAS as F16 with F32 compute instead of converting both to F32 in
+    // pool buffers first (the im2col of a 512-pixel VAE tile is 1.4 GB as F16, 2.7 GB converted, per convolution).
+    // It saves that memory but cuBLAS's F16-input kernels are slower on a GTX 1070 Ti (a 1024x1024 decode in 512-px
+    // tiles 17.0 s against 14.3 s, 2026-10-23), so the conversion path stays the default.
+    static const bool f16_sgemm_on = getenv("GGML_CUDA_F16_SGEMM") != nullptr && std::string(getenv("GGML_CUDA_F16_SGEMM")) == "on";
+    const bool pass_f16 = compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1 && f16_sgemm_on &&
                           src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F16 &&
                           !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc);
 
