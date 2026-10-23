@@ -223,3 +223,45 @@ W8A8 (this branch): 1120.1 ms of kernels per step
 -> matmul route 1173.2 -> 821.0 ms (-352 ms, -30 %); the step's kernels 1458.4 -> 1120.1 ms (-23 %); wall: the suite's
    steady 1.44-1.47 -> 1.11-1.12 s/it, the hub's 8 GB re-roll drawing 36.96 -> 28.31 s.
    (The brief's yardstick "1,160 ms of MMQ kernels" was the mmq3 agent's per-call list; measured here 1173.2.)
+With an example picture (bench_pair.py w8a8_8gb_ref ... --references knight_front.png; step 0 = 8,360 tokens):
+installed: run 1 44.7 s (references 0.71, prompt 1.36, drawing 40.15, finishing 1.82); run 2 41.5 s (drawing 38.88)
+W8A8:      run 1 35.8 s (references 0.65, prompt 1.28, drawing 31.51, finishing 1.81); run 2 32.9 s (drawing 30.33)
+-> -20 % / -21 %, the 8 GB plan holds at 8,360 tokens.
+
+## Rounding-only control of the EMULATION itself (this branch's w8a8-emu.cu: GGML_CUDA_W8A8_EMU_KSPLIT=2 computes the
+## same f32 SGEMM as two half-K GEMMs accumulated in dst: the same values, another f32 summation order; suite tag
+## sub8_ksplit2, GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:8, 6 pictures)
+PSNR rgb dB                  chest  knight potion fox    knight_back ork_right
+sub8_ksplit2 vs sub8_nofuse  36.38  43.84  41.21  33.76  28.72       36.27     <- the emulation against itself
+w8a8k_f16 vs sub8_nofuse     35.04  44.07  36.28  32.78  35.49       30.88
+w8a8k_f32 vs sub8_nofuse     38.23  43.42  35.94  25.97  28.82       39.80
+w8a8k_f16 vs sub8_ksplit2    42.31  44.38  37.31  36.04  28.79       32.43
+w8a8k_f32 vs sub8_ksplit2    41.99  43.93  34.83  25.31  34.78       35.04
+sub8_ksplit2 vs ctrl_nofuse  31.09  38.97  37.18  19.49  23.93       33.44     (sub8_nofuse vs ctrl: 31.79 38.81 37.00 19.54 25.15 32.36)
+Reading: a summation-order change inside the emulation moves its own pictures by 28.7..43.8 dB, the same class as the
+kernel's 26.0..44.1 dB against it: the brief's "> 40 dB vs sub8_nofuse" is not reachable by any implementation that
+does not repeat cuBLAS's exact f32 summation order (ours sums exactly in int32). The kernel's pictures differ from the
+emulation's by rounding only, and reproduce its distance to today's pictures (rows "vs ctrl_nofuse" above).
+
+## Final DLL = the measured one: after removing the what-if branches and the per-device attribute fix, the SASS of all 48
+## w8a8 kernels in ggml-cuda.dll is identical (cuobjdump, addresses stripped: md5 76bba4c77b77b171540b9612c35fa05d both).
+
+## Final regression with the final DLL (2026-10-23 ~04:30; out/final_*.log)
+test_gemm: 0 differences from the int64 reference on all 9 shapes (incl. T 4145 / 1811 / 8360 / 100); test_formats: 0
+differences (weights Q4_K/Q5_K, activations synthetic / SCALE / f16 / 2 real dumps); verify1: the same numbers as
+before to the last digit (rel L2 vs the emulation 8.1e-07 .. 1.97e-06 on the products, GLU f32 = fusion off 2.1e-04,
+f16 2.3e-03). Pictures with the final DLL (tag w8a8k_final: chest, fox): pixel-identical to w8a8k_f16 (PSNR inf) - the
+path is deterministic from run to run.
+
+## Status (for the hand-over)
+Verified: format bit-identity (weights, activations, sub-scales, row scales, SCALE pre-op, f16 input, GLU interleave)
+against verbatim copies of the emulation and ggml's dequantizers; GEMM exactness against int64; ggml-level outputs
+vs the emulation in the same DLL at T 1811 / 4096 / 4145 / 8360 on all shapes, the GLU chain, the SCALE fusion, the
+shared-src1 fusion, real DiT activations; kernel-only speed (nsys) >= 76 T/s on the three shapes; per-step kernels
+(stepprof) 1458 -> 1120 ms; pictures (rounding class against the emulation, the emulation's own summation-order
+control in the same class; the emulation's distance to today reproduced); memory (+~30 MiB; the hub's 8 GB plan
+text-only and with an example picture); compile for sm_61/70/75/80/86/89/90/100/120 (changed files per arch; the full
+ggml-cuda target with the release GPU list: see below).
+Not verified / not done: other GPUs than the RTX 3060 (sm_80/89/90/100/120 only compiled, never run); the release build
+of stable-diffusion.cpp itself (only this ggml's ggml-cuda target); the norm-writer fusion into this format (the brief's
+later optimisation: ~22 ms a step); W8g256 (dropped by the coordinator).
