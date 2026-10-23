@@ -325,3 +325,8 @@ Suite steady (6 prompts): on 1.10-1.11 s/it text only, 1.29-1.30 with an example
 ## Compile: relcheck.py with norm.cu added: w8a8-mm.cu, ggml-cuda.cu, w8a8-emu.cu, norm.cu x sm_61/70/75/80/86/89/90/
 ## 100/120: all 36 OK. The new norm variant is plain CUDA (no sm_80 instructions), compiled everywhere; the host launches
 ## it only when every consumer passes ggml_cuda_w8a8_supported, which requires an sm_80+ card with sm_80+ kernels.
+## In-engine byte check on the real model (suite tag w8a8k_normcheck, GGML_CUDA_W8A8_CHECK_NORM=1, chest and
+## knight_back): every fused call of the picture compared with the unfused chain (ggml's NORM + MUL, then the quantizer):
+chest: 1,409+ calls checked (the last report "check 1409 ... 0 bytes differ (total 0)"); knight_back (example picture):
+the same, total 0. Both pictures pixel-identical to w8a8k_f16. (Step 0 with the prefix in the STORE graph slices and
+concatenates the modulated tokens, so its norms are not this pattern; the later steps' 64 calls a step are fused.)
