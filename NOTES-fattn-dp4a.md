@@ -1,8 +1,8 @@
 # FlashAttention with INT8 (dp4a) Q.K^T scores for GTX 10xx: notes (2026-10-24)
 
-Nothing is committed or pushed. The ggml working tree has `src/ggml-cuda/fattn.cu` modified, plus three new files
-(`src/ggml-cuda/fattn-tile-dp4a.cu`, `src/ggml-cuda/fattn-tile-dp4a.cuh`, `tests/test_fattn_dp4a.cpp`).
-`build-sm61` (compute_61 only) holds a build of this state, with the path on by default.
+Committed as c6e96c02 (in the engine release spellcast-perf-6a82e8d). The sections below up to "Real GTX 1070 Ti"
+are the writing agent's, measured on the RTX 3060 emulation (compute_61 code, `GGML_CUDA_FAKE_CC=610`); the real
+card's figures are at the end. `build-sm61` (compute_61 only) holds a build of this state, with the path on by default.
 
 ## Result in short
 
@@ -249,3 +249,33 @@ is the same as here, without FAKE_CC.
   as in `launch_fattn`; sd-cli ran fine.
 - The pool buffer (~35 MB per call for Qwen) replaces the tile path's 128 MB `dst_tmp`. I derived the parallel_blocks
   = 2 choice of `launch_fattn` by reading the code (occupancy 2), not by instrumenting it.
+
+## Real GTX 1070 Ti (2026-10-24, a rented vast.ai pod, the Linux build of the same commits)
+
+Seed 4242 (potion: 7), 25 steps, 1024x1024, 512-pixel VAE tiles, sd-cli through `code/devtools/qwen-speed/run_sd.py`
+of the hub; on / off = `GGML_CUDA_FATTN_DP4A`.
+
+| measure | F32 tile kernel | dp4a |
+|---|---|---|
+| 25-step sampling, chest / knight / potion | 216.4 / 216.4 / 216.5 s | 174.1 / 178.7 / 178.4 s (-18..-20 %) |
+| the hub's own launcher (qwen_bench, text only, one picture) | 228.4 s (drawing 213.6) | 188.1 s (drawing 173.2) |
+| a drawing step | ~8.5 s | ~6.9 s |
+
+Per step before the change (per-node dump with times only, 1024², F32 kernel): the quantized matmuls 5.6 s (the dp4a
+MMQ near the card's int8 peak for this 20B model), the attention 2.8 s, everything else ~0.6 s. So the attention went
+~2.8 -> ~1.1 s, about the 1.9-2.3x expected; what is left of a step is the matmuls at the hardware limit.
+
+Pictures against the F32 tile kernel of the same binary (PSNR RGB / alpha), with rounding-only controls on the same
+card (the F32 kernel unchanged; only the attention as plain matmuls, or only the text encoder on the CPU):
+
+| picture | dp4a | control: no flash attention | control: text encoder on the CPU |
+|---|---|---|---|
+| chest | 34.69 / 33.84 dB | 37.09 dB RGB (vs the shipped build) | 32.34 dB RGB |
+| knight | 30.34 / 28.28 dB | 31.44 / 23.70 dB | 29.69 / 23.73 dB |
+| potion | 38.03 / 33.59 dB | - | - |
+
+The real card diverges more than the emulation (chest 42 -> 35 dB): a 25-step sampler amplifies any rounding change,
+and the rounding-only controls move these pictures by as much or more. By eye: the same objects and quality; bistable
+details flip - the chest's lock gains a raised hasp (the RTX 3060's own picture has it too; the text encoder on the
+CPU gives a third, flat variant), the knight's strap ring grows, while both controls also lengthen the tabard strip
+and add a sword hilt. The release keeps the path on for cc 6.x.
