@@ -377,3 +377,160 @@ concatenates the modulated tokens, so its norms are not this pattern; the later 
   0c8db733ba5d4c3d, 17b8aa1c7fb199a1; real 8e40232aa34fcb3b, 7d8a06505e3df471, b3cfdae904fac809, 1bb4b45b49ac9f86).
 - Release architectures (relcheck.py): w8a8-mm.cu, ggml-cuda.cu, w8a8-emu.cu, norm.cu x 9 archs: 36 OK; the GEMM 255
   registers on sm_80 .. sm_120 (stacks 0-32 B as before), stubs on sm_61 / 70 / 75.
+
+# Turing port, 2026-10-24 (RTX 3060 emulation)
+Brief: scratchpad brief_turing.md (session befd2abf). The W8A8 GEMM for cc 7.5 (RTX 20xx / GTX 16xx): sm_75 has int8
+tensor cores but neither cp.async nor the m16n8k32 int8 MMA, so w8a8_gemm compiles to an empty stub there and Turing
+kept MMQ. No Turing card was available: everything below ran on the RTX 3060 - the kernel's compute_75 PTX through the
+driver's JIT (a compute_75-only build) with GGML_CUDA_FAKE_CC=750 for the host dispatch (ours and MMQ's).
+CAVEAT: this measures the Turing CODE on Ampere hardware (the same int8 tensor rate per SM per clock as Turing, but
+twice the FP32 lanes, a 128 KB L1/shared (100 KB shared) instead of 96 KB (64 KB), a 170 W power cap). It validates
+correctness fully and gives a speed PROXY; the comparisons are against MMQ's own Turing path under the same emulation.
+
+## Files
+- src/ggml-cuda/w8a8-turing.cuh (new): w8a8t_gemm<epi> + w8a8t_gemm_cuda (w8a8_gemm_cuda's signature). Device code
+  only for __CUDA_ARCH__ == 750 (W8A8T_DEVICE_OK; stubs elsewhere); W8A8T_ANY_ARCH (tests only) compiles it for every
+  arch >= 7.5 so that one sm_86 binary runs both kernels. w8a8.cuh is unchanged.
+- src/ggml-cuda/w8a8-mm.cu / .cuh: w8a8_turing_device(cc) = cc == 750 (NVIDIA) and ggml_cuda_highest_compiled_arch(cc)
+  == 750 (sm_75 / compute_75 code in the build) and GGML_CUDA_W8A8_TURING != 0; w8a8_device_ok takes it with the
+  shared-memory check (smpbo >= 49,152); w8a8_product launches w8a8t_gemm_cuda; the log line says "int8 tensor cores,
+  sm_75 kernel". Default: `constexpr bool W8A8_TURING_DEFAULT = true;` (one line, w8a8-mm.cu). GGML_CUDA_W8A8_KERNEL=off
+  still turns the whole path off.
+- w8a8-tools/test_gemm.cu: W8A8_KERNEL=turing selects the Turing kernel (check / bench / hash); `cmp` = both kernels
+  on the same inputs, every epilogue (f32, GLU f16, GLU f32, i32) x tile orders 0 4 -4 1 3 -2 -8 16, outputs compared
+  byte for byte (+ a position-dependent hash; realistic d_t / dW incl. a zero row and large dW for the f16 clamp);
+  `hash` = the selected kernel's hashes for comparing binaries. build_tool.cmd: NVCC_ARCH overrides -arch=sm_86.
+- w8a8-tools/ubench_imma.cu (m8n8k16 / m16n8k32 peaks), ubench_issue.cu (MMA next to IMAD / IADD / FFMA),
+  ubench_icache.cu (loop-size knee).
+- stable-diffusion.cpp/build-sm75.cmd: build-sm61.cmd with CMAKE_CUDA_ARCHITECTURES=75, build-sm75, -j 12.
+
+## Design (final: W8A8T_WM 32, 3 slots, 2 pieces, gap 1, L2::128B)
+- MMA: per m16n8k32 of the sm_80 kernel (same ldmatrix x4 fragments) four mma.sync.aligned.m8n8k16.row.col.satfinite.
+  s32.s8.s8.s32 (exists from sm_75; ggml's mma.cuh maps it the same way): rows gid (a0, a2) and gid+8 (a1, a3), k 0-15
+  with b0 and a zero C, then k 16-31 with b1 through C. The 32-value product P is the same exact int32 (|P| <=
+  32*127^2, so satfinite can never trigger, as with the sm_80 kernel's zero-C MMA), then the same IMAD c += sy * P.
+- Tile: block 128 x 128 x 64 (the sy layout is per 128-token tile), 8 warps of 32 tokens x 64 channels (4 x 2), 256
+  threads, 64 accumulators a thread, __launch_bounds__(256, 1). A warp slice's 2*MF = 4 sub-scales of a group are
+  consecutive bytes in w8a8_sy_pos order (read as one u32 at w8a8_sy_pos(wm*32 + gid)), the serpentine m order and
+  fragment schedule are w8a8_gemm's, the epilogue's expressions are verbatim (MF 2, WM 32).
+- Pipeline without cp.async: 3 shared slots of 16 KB (A 8 KB + B 8 KB swizzled as in w8a8_gemm; 49,152 B dynamic,
+  the epilogue's 8 x 4,608 B staging reuses it); each thread copies 4 16-byte chunks a stage (w8a8_gemm's chunk layout:
+  row (c%2)*64 + tid/4, chunk tid%4) with ld.global.nc.L2::128B into 16 staging registers: stage kt+2 is loaded during
+  stage kt (A at pair q 1, B at q 5) and stored during stage kt+1 (q 0 / 4), one barrier per stage at q 7 (before the
+  next stage's first fragment loads, w8a8_gemm's place), so a load has a whole stage to arrive and the barrier never
+  waits for one. The sub-scales: ld.global.nc.u32 one k step ahead (no shared stage for them).
+- Resources (cuobjdump -res-usage of an sm_75 compile, w8a8-tools/test_gemm built with NVCC_ARCH=-arch=sm_75):
+  w8a8t_gemm<0..3> REG 234-235, STACK 0, LOCAL 0 (ptxas: 0 bytes spill); k loop (one stage, 2 k steps) 319-323
+  instructions = 5 KB: 128 IMMA.8816.S8.S8.SAT, 128-135 IMAD, 12 LDSM, 6 LDG, 4 STS, 1 BAR, 1-7 MOV.
+  Occupancy for cc 7.5 (cuda_occupancy.h with 64 KB shared / 64K registers per SM, no per-block reserve - an
+  assumption, Ampere reserves 1 KB): 1 block of 8 warps per SM (registers and shared memory both at the limit). The
+  64 x 64 alternative (W8A8T_WM=64: 4 warps, 2 slots of 16 KB, sub-scales from global memory) fits 2 blocks (8 warps);
+  the sm_80 kernel's own 3 x 16.6 KB would allow 1 block of 4 warps.
+
+## How it got there (test_gemm bench, cmp.sh 3 interleaved rounds, the compute_75 binary through the JIT; T/s of
+## [0] 4096^3 f32 / [1] 4096x24576x4096 SwiGLU f16 / [2] 4096x4096x12288 f32; the sm_80 kernel: 80.2 / 78.2 / 76.5)
+- First port (the sm_80 kernel's 64 x 64 warp tile, 2 slots, a row per thread copied): 47.3 / 48.6 / 41.2, exact on
+  the first try; 255 registers + 32-88 B stack, 45-100 MOVs a stage in the loop (accumulators shuffled).
+- w8a8_gemm's chunk layout for the copies (coalesced): 56.6 / 51.3 / 56.4; + the L2::128B hint 59.4 / 53.2 / 59.6;
+  prefetch.global.L2 of the next stages 22-38 (rejected); 2 or 8 pieces instead of 4: 38-40 (spills / latency).
+- The cost of m8n8k16 itself: w8a8_gemm (cp.async) with its MMA replaced by 4 m8n8k16 drops to 45.4 / 47.8 / 30.8
+  (24 LDL + 16 STL a stage). Not the MMA rate: ubench_imma: m8n8k16 102.4 T/s = m16n8k32 102.7 on the 3060; the
+  zero-C pair + 1 IMAD per output 96.4. ubench_issue: next to each m8n8k16, 1 IMAD -10 %, 2 -20 %, 3 -42 %; IADD free
+  up to 3; FFMA like IMAD. ubench_icache: a 12-16 KB loop -7..12 % against 8 KB (mild). Reading: ptxas hoists the many
+  independent m8n8k16 and their products fill the registers -> spills and moves at 128 accumulators a thread.
+- 32 x 64 warp tile (64 accumulators): 0 spills, 1-7 MOVs; 2 slots: 53.5 / 59.9 / 55.2 (whole stage per piece);
+  3 slots, 2 pieces: 58.5 / 59.3 / 59.3; store-to-load gap 1 pair: 58.6 / 60.2 / 61.2 (final; repeat 57.9 / 60.2 /
+  61.2). Load kinds (nc, nc.L2::128B, cg, cg.L2::128B, default, L1::no_allocate): all within +-1.5 %.
+- What-ifs with the real data kept in shared memory (no copies in the k loop): 75.3 / 80.0 / 82.1 at 1,927 MHz; no
+  epilogue stores: 64.4 / 61.8 / 62.6 (the epilogue does not overlap another block: one block per SM); stores of the
+  prologue's data without the loads: 67.9 / 80.1 / 70.8. So the global -> register -> shared copy costs ~25 % on the
+  3060. TRAP: a what-if that fills shared memory with constants runs the card cooler and faster (1,965 MHz at ~74 W vs
+  1,815 MHz at the 170 W cap): it overstates the ceiling (80.5 T/s at K 12288); keep real data in such what-ifs.
+- Tile order (W8A8_GROUP 4 2 1 8 -2 -4 -8 16 -16): 4, 8, -2, -4, -8 within +-2 %; 1 -15..-23 %; w8a8_default_group
+  kept (4 for N >= 16384, else -4).
+
+## Exactness (all on the RTX 3060; out files in the session scratch turing/)
+- test_gemm against the int64 reference, 15 shapes (T 4096 / 4145 / 1811 / 8360 / 100 / 1, N 4096 / 12288 / 24576 /
+  384, K 4096 / 12288 / 1024): 0 differences - the sm_86 binary's Turing kernel, the compute_75 binary's (JIT, the
+  engine's code), and w8a8_gemm.
+- test_gemm cmp (sm_86 binary, both kernels): 15 shapes x 4 epilogues x 8 tile orders = 480 runs, 0 bytes differ,
+  hashes equal. The 64 x 64 variant: 5 shapes x 32 runs, 0 bytes differ.
+- Across binaries: the 480 output hashes of the compute_75 binary's Turing kernel = the sm_86 binary's w8a8_gemm's.
+- ggml level (w8a8bench through the engine DLLs: weight conversion + quantizer + GEMM + fusions; build-sm75 with
+  GGML_CUDA_FAKE_CC=750 vs an sm_86 build of the same sources): 16 cases, all hashes identical - mm q4_K 4096^2 at T
+  4096 / 8360 / 4145 / 1811 (7a9b31ec0f5211c9, 526839cf860f3fc1, 6eb456aac43e4fae, 1b76f55a1f55be66), q5_K
+  e3edb9d64bf26024, K 12288 b411cd044aed1b46, SCALE + mm 9bf45f4b580af1d9, 3 x mm 0b91937729d117fc, GLU f16
+  f8d3242a490c36aa (T 4145 338a1513960e0618), GLU f32 f85e0b0448a13456, normmm3 241475e86d5ac296, normglu
+  d81ebe63abc78400, real activations to_q 3fae212fb11cf919, down d28a8ca030879537, GLU a7dd9bb63e9a61dc (the first
+  ten = this file's Task 3 hashes).
+- The sm_86 SASS of all 53 w8a8_* / mul_add_norm_mul kernels of the sm_86 build with these changes = the earlier
+  build-sm86 DLL's (sass_cmp.py): the Ampere path is untouched.
+- Release architectures (relcheck.py's procedure on w8a8-mm.cu, the build's flags, 61 70 75 80 86 89 90 100 120):
+  9 OK; w8a8t_gemm real only on sm_75 (128 IMMA, 952-1,344 instructions, 0 LDL), 6-16-instruction stubs elsewhere;
+  w8a8_gemm real on sm_80+ and stubs below, as before.
+- Not verified: on Turing HARDWARE the GLU epilogues' expf and division (fast-math MUFU approximations) might round
+  differently from Ampere's; the f32 and i32 epilogues are plain IEEE multiplies (identical by construction).
+
+## Speed under the emulation
+Kernel only (nsys, w8a8bench, medians of 12 calls; MMQ = GGML_CUDA_W8A8_KERNEL=off, the same build and FAKE_CC):
+  mm q4_K 4096^3: w8a8t_gemm 2,438.9 us (56.4 T/s) vs mul_mat_q 4,007.3 (34.3) -39 %; q5_K 2,439 vs 4,160 -41 %;
+  K 12288: 6,792.7 vs 12,220.9 -44 %; GLU chain: gate|up 14,009 (SwiGLU f16 epilogue) vs 23,516 -40 %, down 6,795
+  vs 11,615 -41 %; conversion 108-609 us and quantizers 253-756 us as on Ampere; MMQ's q8_1 quantizers 258-1,486 us.
+ggml level (w8a8bench median ms incl. conversion + quantization; Turing / MMQ75 / [sm_86 W8A8 / sm_86 MMQ]):
+  mm 4096^2 T 4096 2.814 / 3.970 -29 % [2.173 / 2.915]; T 8360 5.609 / 8.749 -36 %; T 4145 2.872 / 4.075 -30 %;
+  T 1811 1.407 / 2.080 -32 %; q5_K 2.826 / 4.422 -36 %; K 12288 7.917 / 12.667 -38 %; SCALE + mm 2.811 / 4.219 -33 %;
+  3 x mm 10.381 / 14.964 -31 %; GLU T 4096 22.645 / 37.586 -40 %; T 4145 23.452 / 38.518 -39 %; GLU f32 22.188;
+  normmm3 12.485 / 16.828 -26 %; normglu 24.725 / 39.968 -38 %; real to_q 2.714 / 4.240 -36 %, down 8.112 / 12.997
+  -38 %, GLU 23.384 / 38.547 -39 %. (TRAP: the first call of a kernel after the DLL changed includes its JIT: one
+  MMQ q5_K reading of 30 ms was that; a warm cache gives 4.42.)
+Per drawing step (stepprof.py, nsys of sd-cli at 2 and 6 steps, chest 1024^2, FAKE_CC=750; tags turing75_w8a8 /
+turing75_mmq): kernels 2,686.0 -> 2,093.6 ms (-22 %); the matmul route mul_mat_q 1,441.4 + 116.1 + q8_1 quantizers
+55.3 = 1,612.8 ms -> w8a8t_gemm 503.2 + 427.3 + conversion 45.2 + quantizers 23.6 = 999.3 ms (-38 %); the norm writer
+46.7 -> 49.4 (its W8A8 form). The flash attention (Turing path) is now half the step: 994 ms.
+sd-cli (run_sd.py, chest seed 4242, 4 steps, twice each): steady steps 2.06-2.07 s/it (W8A8) vs 2.69-2.72 (MMQ) -23 %;
+sampling 16.90 / 16.99 s vs 19.47 / 19.67 s (step 1 includes ~8 s of loading). The same runs on the native sm_86
+build: 1.43-1.44 (W8A8) vs 1.78 (MMQ).
+
+## Pictures (imgcmp: PSNR rgb / alpha; the Turing emulation vs the sm_86 build differ in other kernels too - the
+## flash attention takes its Turing path - so pixel identity is not expected)
+- 2 steps: W8A8 Turing-emulated vs W8A8 sm_86: 39.02 / 31.80 dB (max abs 255, 52 % of pixels); control MMQ emulated vs
+  MMQ sm_86: 41.21 / 32.58; W8A8 vs MMQ under the emulation 36.33 / 29.25 (the format change, as on Ampere).
+- 4 steps: W8A8 Turing-emulated vs sm_86 45.10 / 46.84 (max 30); control MMQ vs MMQ 45.36 / 45.85; two runs of each
+  emulated configuration pixel-identical (deterministic).
+
+## GTX 16xx (TU116 / TU117: cc 7.5 without the RTX cards' tensor cores)
+ggml dispatches by compute capability only: turing_mma_available(cc) is true for every cc 7.5 card, so MMQ runs its
+int8 MMA (m8n8k16) path on a GTX 1650 / 1660 too; ggml_cuda_init merely logs "suboptimal performance due to a lack of
+tensor cores" for names "NVIDIA GeForce GTX 16*", MX450 and MX550. The Turing W8A8 kernel keeps parity: every cc 7.5
+card takes it (same MMA instruction class as MMQ there). Not measured on a GTX 16xx.
+
+## Not verified
+Speed and power on a real Turing card (RTX 2060 Super / 2070 / 2080 Ti); a GTX 16xx; the Linux (gcc) compile of the
+new code (no Linux nvcc on this host; the sdlinux container was off-limits to this task - the code uses no macros in
+#pragma, only standard C++17); the GLU epilogues' MUFU rounding on Turing hardware; the hub's 8 GB plan on Turing (the
+path's memory is the Ampere path's: the GEMM needs no device memory beyond shared memory).
+TRAP met: another agent's work in progress in w8a8-dp4a.cuh (included by w8a8-mm.cu) broke the build for an hour
+(a generated header that did not exist yet); the measured DLLs were built with -DW8A8D_NO_SASS (the dp4a kernel is not
+used on cc 7.5 / 8.6). One source tree per concurrent agent avoids this.
+
+## Follow-up: 30 minutes on a rented RTX 2070 / 2080 Ti (Linux pod; build locally in Docker, never on the pod)
+Local (Docker, the CUDA 12.8 devel image, a tree of its own - not another agent's container):
+  cmake ... -DCMAKE_CUDA_ARCHITECTURES=75 (the pod README's engine build), then in the same container
+  nvcc -O3 -std=c++17 -arch=sm_75 -use_fast_math -extended-lambda -I ggml/src/ggml-cuda ggml/w8a8-tools/test_gemm.cu -o test_gemm
+  (the same with -DW8A8T_WM=64 -o test_gemm_wm64, and ubench_imma.cu / ubench_issue.cu with -arch=sm_75), w8a8bench.cpp
+  against the build's libggml; scp the engine to /workspace/sdcpp-turing, the tools + cmp.sh + the 3060's hash file
+  (scratch turing/h_amp86.txt) to /workspace/w8a8t.
+On the pod (cd /workspace/w8a8t; CUDA_VISIBLE_DEVICES=0):
+  W8A8_KERNEL=turing ./test_gemm                                   # 0 differences on the 9 default shapes, timings
+  W8A8_KERNEL=turing ./test_gemm hash 4096 4096 4096 4096 24576 4096 4096 4096 12288 4145 4096 4096 1811 4096 4096 \
+      8360 4096 4096 4145 24576 4096 1811 4096 12288 100 384 1024 1 384 1024 1 4096 4096 4145 12288 4096 \
+      8360 24576 4096 4096 384 1024 8360 4096 12288 > hash_real.txt  # compare with h_amp86.txt (f32 / i32 must match;
+                                                                    # GLU differences = MUFU rounding of the card)
+  export W8A8_KERNEL=turing; ROUNDS=3 GLU_EPI=1 ./cmp.sh test_gemm test_gemm_wm64   # the two designs on the card
+  ./ubench_imma 1 8; ./ubench_issue 1 8                            # the card's m8n8k16 peak, IMAD interference
+  nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv -lms 200 (beside a long bench: the power cap)
+  python run_sd.py --bin /workspace/sdcpp-turing --out t/chest4.png --steps 4 [--env GGML_CUDA_W8A8_TURING=0]
+      (twice each, alternating; steady s/it; the log must say "int8 tensor cores, sm_75 kernel"; --extra
+      "--vae-tiling --vae-tile-size 512" on an 8 GB card), then --steps 25 once each for the drawing time.
+Decision rule: keep W8A8_TURING_DEFAULT = true if the drawing step is faster than with GGML_CUDA_W8A8_TURING=0; if the
+64 x 64 binary wins on the card, set W8A8T_WM 64 (its defaults follow).

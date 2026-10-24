@@ -68,6 +68,8 @@ peak at 4, 8 or 16 warps per SM, while the fully unrolled stage (~1,600 instruct
 stalled at 43 % whatever was changed around it; the same code as a ~690-instruction loop runs at 63 %. Static stall
 counts (decoded from the control words, `ctrl.py` in the session's scratch) were all 1 except 13-cycle waits after a
 few shared loads, so the schedule itself was fine. Register bank conflicts: 15 % of the dp4a (157 of 1,024).
+(Corrected in "Register banks" below: that outer product's 73 % came from its own extra instructions - it runs at 95 %
+of its issue ceiling - and `ctrl.py` misread the dual-issue pairs; the GEMM's bank conflicts cost nothing measurable.)
 
 ## Not done / open
 
@@ -112,3 +114,92 @@ graph-level fusions, so it shows the VAE's permute copies around every RMS norm 
 real graph never runs (the fork fuses cont(permute) -> RMS_NORM -> MUL -> cont(permute) into one kernel). A tiled
 2D-transpose copy added to `cpy.cu` for permutes that merge into one transpose (bit-identical, ggml's CPY / CONT
 tests pass, the dump's copies 1,542 -> 557 ms) therefore changed the real decode by nothing measurable (8.5 s both).
+
+## Register banks, 2026-10-24 (GTX 1070 pod)
+
+The question: the GEMM runs at ~60 % of the card's dp4a peak; is the loss beyond its issue mix ptxas's register
+allocation on Pascal's 4 register banks (bank = register mod 4; operands of one instruction in one bank are read one
+after the other unless one comes from the reuse cache)? **No.** The plan was to rename the registers of the sm_61
+cubin and load it at runtime; the measurements below stopped it at the validation step, so nothing of it ships.
+Tools: `w8a8-tools/sass_banks.py` (analyze: bank statistics, stall counts; whatif: NOPs / dropped waits / bank pairs
+removed, timing only; synth: the patterns below), `w8a8-tools/bank_bench.cu` (the synthetic kernel, clock64-timed, so
+its figures do not depend on the clock), `test_dp4a` with `W8A8D_CUBIN=<cubin>` (runs that cubin's kernels in place of
+the compiled ones; the check mode compares their outputs with the compiled kernels' byte for byte).
+
+**Synthetic: a register-only 8x8 dp4a outer product** (`bank_bench`, 512 dp4a per iteration, 16 warps per SM; % of
+the dp4a issue rate, 4 warp-instructions per clock per SM; the same instructions and control words, only registers /
+reuse flags edited):
+
+| variant | % |
+|---|---|
+| ptxas's code (a reused across each 8-dp4a run; 33 same-bank pairs per 512 statically) | **99.5** |
+| conflict-free with a reused / conflict-free without any reuse | 98.8 / 99.5 |
+| the conflict-free registers without the reuse flags (a read every time, often in c's bank) | 74.5 |
+| every dp4a: a and b in one bank (the same bank 8 times in a row) / a, b and c in one bank | 59.5 / 39.3 |
+| a/b in one bank on the first dp4a of each run only (a then reused) / b and c in one bank, a reused | 92.5 / 91.4 |
+| every 2nd dp4a a same-bank pair, the banks otherwise free / every dp4a, always the same bank | 97.9 / 50.0 |
+| one bank read 3 times per 2 instructions | 66.6 |
+
+So a same-bank pair inside one instruction is nearly free when the next instructions read other banks (0.03-0.09
+clock); what costs is a bank asked for more than one read per instruction over several instructions in a row. Reuse
+cache (probe = a dp4a whose a operand shares b's bank): a flagged operand serves a later reader of the same slot also
+across an instruction that reads another register there unflagged (99.4 % vs 97.6 % without the flag), across a flagged
+one (99.4), across a MOV (99.5 vs 97.6); a hit without the flag releases it (the next read misses: 71.6 %). The earlier
+"73 % of the peak" of the outer product (`p6/outer.cu`) came from its own 38 non-dp4a instructions per 128 dp4a: a
+77 % issue ceiling, of which it reached 95 %. The earlier bank count (157 of 1,024) and stall decode used a parser that
+took the second instruction of a dual-issue pair (cuobjdump prints its encoding on the next line) for a control word.
+
+**The GEMM's sm_61 code** (the Linux build of 1b054db): inner (group) loop 700 instructions = 512 IDP, 72 I2F, 64 FFMA,
+33 LDS, 19 other; stall counts 106 dual-issue pairs, 538 x 1, 43 x 2, 6 x 4, 1 x 5, 6 x 13 = 731 clocks per 700
+instructions of one warp, not binding with 4 warps per scheduler; 43 instructions wait on a scoreboard (IDP / FFMA
+after shared loads). Same-bank operand reads (reuse counted conservatively): `w8a8d_gemm<0>` 63 per group loop (IDP 55,
+all between the two LDS.128 fragment quads - a_i and b_j with i % 4 == j % 4 on the first dp4a of a run: the
+4-register alignment fixes their banks, no renaming can move them; FFMA 8), `<1>` 50 (IDP 45, FFMA 5); outer (stage)
+loop 11 (STS / IADD between quads). ptxas already keeps the 64 accumulators out of the b operands' banks.
+
+What-if on the real kernel (`sass_banks.py whatif --fix-banks`: 81 % of those pairs removed by reading another lane,
+wrong results, everything else unchanged), T/s medians of 4 runs at 4096^3 / glu 4096x24576x4096 / 4096x4096x12288:
+compiled 14.07 / 14.62 / 14.31, without the pairs 14.04 / 14.59 / 14.32; per clock (SM clock sampled every 50 ms,
+median while above 90 W, 3 runs) 8.92 / 9.15 / 9.07 vs 8.95 / 9.18 / 9.13 T/s per GHz: +0.3..0.7 %, the noise.
+Nothing to gain.
+
+**Where the time goes instead** (SASS what-ifs on the same code, results wrong; the T/s ranges are medians of 3 or 4
+runs in separate sessions, per GHz = T/s at the median SM clock):
+
+| what-if (stage = the K-stage loop) | T/s 4096^3 / glu / down | SM clock | T/s per GHz |
+|---|---|---|---|
+| none (the compiled kernel) | 14.1-14.3 / 14.4-14.6 / 14.1-14.3 | 1544-1582 MHz | 8.92 / 9.15 / 9.07 |
+| the 7 LDG.128 of a stage NOPed | +11..17 %: 15.6-16.2 / 16.4-16.6 / 16.4-16.6 | 1771 MHz | 9.06 / 9.28 / 9.32 (+1.4..2.8 %) |
+| (a build whose stage loop skips the global loads, a temporary source edit: 234 registers) | 15.6 / 16.3 / 16.2 | | |
+| the 33 shared loads of the group loop NOPed | +7..15 %: 16.1-16.2 / 16.4 / 15.1-15.3 | 1645-1657 MHz | 9.78 / 9.85 / 9.20 (+1.4..9.6 %) |
+| no wait for the global loads before the stores (DEPBAR SB5 and waits dropped) | -2..0 % | | |
+| only the sub-scale load NOPed (the DEPBAR on its address registers at the loop top) | +-0 | | |
+| no barrier / no shared stores | 0..+2 % / +1..3 % | | |
+| tile order `W8A8_GROUP` -2, -8, -16, +2 / +8, +16 | within 1.5 % / 4..28 % slower | | |
+
+The GTX 1070 runs this GEMM at its 130 W cap (~1.55-1.6 GHz). The global loads' latency is hidden (dropping the waits
+changes nothing); their cost is energy: without them the clock rises 12-15 % at nearly the same work per clock - the
+L2-to-SM traffic of the 128x64 tile (12 KB per block and 64-value stage, 1.5 bytes per output per 64 values of K).
+DRAM is not it (the tile order changes nothing). The shared loads cost both: up to ~10 % of the clocks (the scoreboard
+waits) and power. Per clock the kernel issues dp4a at 59 % of the card's peak (9.1 of 15.36 T/s per GHz) against an
+issue ceiling of 69 % (1,024 dp4a per 1,477 instructions of a stage): 86 % of its ceiling. The levers left are
+therefore less traffic per output (a bigger register or block tile: fewer global and shared loads per dp4a; the
+128-channel block tile was 4 % slower on the GTX 1070 Ti, 18.5 vs 19.3 T/s, and was not measured on this power-capped
+card) and fewer instructions per dp4a (the scaling), not the register allocation or the schedule's stall counts.
+On a power-capped card compare variants per clock as well as in T/s: a variant that does less work per output can
+win by its clock alone.
+
+Exactness, re-checked with the test's default shapes (100 x 24576 x 4096 and 4145 x 4096 x 12288 added): exact mode,
+0 of the sampled accumulators differ from the int64 reference at all 11 shapes; f32 mode, max relative error
+1.6e-7 .. 1.0e-6 at K <= 4096 and 2e-4 .. 2.3e-3 at K 12288 (outputs near zero, as in the review). Traps: cuobjdump
+puts the encoding of a dual-issue pair's second instruction on the next line; nvdisasm rejects a NOP whose control
+field still sets a scoreboard (clear the barrier bits); the kernel names differ between Linux and Windows builds
+(int64_t is `long` / `long long`: `..._Pvliiii` / `..._Pvxiiii`).
+
+The 128-channel block tile on this card (test_dp4a built with `-DW8A8D_BN=128`: 256 threads, one block per SM, <0> /
+<1> 231 / 233 registers, no spills, 33,280 B shared; exact mode 0 differences from the int64 reference at 4096^3 and
+4145 x 4096 x 12288), medians of 4 runs interleaved with the default tile, 4096^3 / glu / down: **13.53 / 14.23 /
+13.48 T/s at 1680 / 1651 / 1632 MHz = 8.05 / 8.62 / 8.26 T/s per GHz**, against BN 64 (242 / 243 registers) 14.29 /
+14.54 / 14.23 T/s at 1600 / 1588 / 1569 MHz = 8.94 / 9.13 / 9.09 per GHz.
+So a third less L2-to-SM traffic per output buys 4-5 % of clock, but one block per SM (8 warps, no second block to
+fill a block's barrier and load phase) loses 6-10 % per clock: 2-5 % slower overall; the default stays.

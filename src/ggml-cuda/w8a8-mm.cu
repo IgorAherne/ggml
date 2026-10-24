@@ -1,10 +1,13 @@
 #include "w8a8-mm.cuh"
 #include "w8a8.cuh"
-#if W8A8_BM == 128 && W8A8_WM == 64   // the dp4a kernel's token mapping (research builds with other tiles: no dp4a path)
+#if W8A8_BM == 128 && W8A8_WM == 64   // the dp4a / Turing kernels' token mapping (research builds with other tiles: neither)
 #define W8A8_HAS_DP4A 1
 #include "w8a8-dp4a.cuh"
+#define W8A8_HAS_TURING 1
+#include "w8a8-turing.cuh"
 #else
 #define W8A8_HAS_DP4A 0
+#define W8A8_HAS_TURING 0
 #endif
 
 #include <cstdlib>
@@ -13,6 +16,11 @@
 
 namespace {
 
+// Turing (cc 7.5: RTX 20xx, GTX 16xx) takes the path with the sm_75 variant of the tensor-core GEMM (w8a8-turing.cuh)
+// by default; GGML_CUDA_W8A8_TURING=0 keeps ggml's MMQ there (as GGML_CUDA_W8A8_KERNEL=off does on every card).
+// Measured on the RTX 3060 running the compute_75 code (NOTES-w8a8.md, "Turing port"); not yet on a Turing card.
+constexpr bool W8A8_TURING_DEFAULT = true;
+
 struct w8a8_config {
     bool        enabled    = true;
     int64_t     min_tokens = 1024;
@@ -20,6 +28,7 @@ struct w8a8_config {
     bool        glu_f16    = true;
     bool        norm_fuse  = true;
     bool        norm_check = false;
+    bool        turing     = W8A8_TURING_DEFAULT;
 };
 
 const w8a8_config & w8a8_cfg() {
@@ -48,25 +57,42 @@ const w8a8_config & w8a8_cfg() {
         if (const char * e = getenv("GGML_CUDA_W8A8_CHECK_NORM")) {
             c.norm_check = atoi(e) != 0;
         }
+        if (const char * e = getenv("GGML_CUDA_W8A8_TURING")) {
+            c.turing = strcmp(e, "off") != 0 && strcmp(e, "0") != 0;
+        }
         return c;
     }();
     return cfg;
 }
 
-// the dp4a kernel's cards: Pascal with dp4a (cc 6.1 / 6.2; the GTX 10xx); Volta and Turing keep MMQ (Turing's MMQ runs
-// on its int8 tensor cores; neither was measured with the dp4a kernel)
+// the dp4a kernel's cards: Pascal with dp4a (cc 6.1 / 6.2; the GTX 10xx); Volta keeps MMQ (no int8 tensor cores; not
+// measured with the dp4a kernel), Turing has its own tensor-core kernel (below)
 bool w8a8_dp4a_device(const int cc) {
     return W8A8_HAS_DP4A && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
 }
 
+// the Turing kernel's cards: cc 7.5 with sm_75 / compute_75 code in the build (another arch's code below 8.0 would be
+// the kernel's empty stub). Like ggml's MMQ, which takes its int8 MMA path on every cc 7.5 card, this includes the
+// GTX 16xx, whose MMA instructions run without the RTX cards' tensor cores (ggml only logs a warning for them).
+bool w8a8_turing_device(const int cc) {
+    return W8A8_HAS_TURING && w8a8_cfg().turing && GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING &&
+        ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING;
+}
+
 // the device side: an sm_80+ card whose kernels were compiled with the path (the release build also carries
-// sm_61 .. sm_75 code, where the tensor-core kernels are empty), or a dp4a card (w8a8-dp4a.cuh)
+// sm_61 .. sm_75 code, where the sm_80 tensor-core kernels are empty), a dp4a card (w8a8-dp4a.cuh) or a Turing card
+// (w8a8-turing.cuh)
 bool w8a8_device_ok(const int device) {
     const int cc = ggml_cuda_info().devices[device].cc;
     if (w8a8_dp4a_device(cc)) {
         return true;
     }
+#if W8A8_HAS_TURING
+    if (w8a8_turing_device(cc)) {
+        return ggml_cuda_info().devices[device].smpbo >= (size_t) w8a8t_smem_bytes();
+    }
+#endif
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_AMPERE &&
         ggml_cuda_info().devices[device].smpbo >= (size_t) w8a8_smem_bytes();
 }
@@ -82,7 +108,8 @@ void w8a8_log_once(const int device) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     GGML_LOG_INFO("ggml_cuda: W8A8 int8 matmul path (W8 x A8-sub32, %s) on %s (cc %d): Q4_K/Q5_K products with >= %lld tokens%s%s%s, "
                   "SwiGLU intermediate %s, norm writer %s%s, sub-scales 1..%d\n",
-                  w8a8_dp4a_device(ggml_cuda_info().devices[device].cc) ? "dp4a" : "int8 tensor cores",
+                  w8a8_dp4a_device(ggml_cuda_info().devices[device].cc) ? "dp4a" :
+                  w8a8_turing_device(ggml_cuda_info().devices[device].cc) ? "int8 tensor cores, sm_75 kernel" : "int8 tensor cores",
                   prop.name, ggml_cuda_info().devices[device].cc, (long long) c.min_tokens,
                   c.names.empty() ? "" : ", weights named *", c.names.c_str(), c.names.empty() ? "" : "*", c.glu_f16 ? "f16" : "f32",
                   c.norm_fuse ? "fused" : "off", c.norm_check ? " (checked)" : "", W8A8_SY_MAX);
@@ -208,6 +235,11 @@ static void w8a8_product(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 #if W8A8_HAS_DP4A
     if (w8a8_dp4a_device(ggml_cuda_info().devices[ctx.device].cc)) {
         CUDA_CHECK(w8a8d_gemm_cuda(epi, act.qx.ptr, act.sy.ptr, act.dt.ptr, qw.get(), dw.get(), dst, ldd, (int) act.T, (int) N, (int) K, stream));
+    } else
+#endif
+#if W8A8_HAS_TURING
+    if (w8a8_turing_device(ggml_cuda_info().devices[ctx.device].cc)) {
+        CUDA_CHECK(w8a8t_gemm_cuda(epi, act.qx.ptr, act.sy.ptr, act.dt.ptr, qw.get(), dw.get(), dst, ldd, (int) act.T, (int) N, (int) K, stream));
     } else
 #endif
     {

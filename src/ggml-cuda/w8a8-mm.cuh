@@ -3,8 +3,8 @@
 #include "common.cuh"
 #include "w8a8-format.cuh"
 
-// The "W8 x A8-sub32" matmul path (kernels in w8a8.cuh; the dp4a GEMM of the GTX 10xx in w8a8-dp4a.cuh) for the Q4_K / Q5_K
-// products of large token counts on sm_80+ and on Pascal (cc 6.1):
+// The "W8 x A8-sub32" matmul path (kernels in w8a8.cuh; the dp4a GEMM of the GTX 10xx in w8a8-dp4a.cuh; the sm_75 GEMM of
+// Turing in w8a8-turing.cuh) for the Q4_K / Q5_K products of large token counts on sm_80+, Turing (cc 7.5) and Pascal (cc 6.1):
 // int8 weights per output channel (converted from the k-quant blocks at every call, into pool memory) x int8
 // activations per token with 5-bit integer sub-scales per 32 values (W8A8_SY_MAX), on the int8 tensor cores with one
 // int32 accumulator per output (the GTX 10xx: dp4a, the 32-value group sums scaled into f32 accumulators; exact int32
@@ -12,7 +12,9 @@
 // bit for bit.
 //
 // Environment:
-//   GGML_CUDA_W8A8_KERNEL     off | on (default on where supported: an sm_80+ or cc 6.1 / 6.2 card and kernels compiled for it)
+//   GGML_CUDA_W8A8_KERNEL     off | on (default on where supported: an sm_80+, cc 7.5 or cc 6.1 / 6.2 card and kernels
+//                             compiled for it)
+//   GGML_CUDA_W8A8_TURING     0 | 1: the path on cc 7.5 cards (default 1: W8A8_TURING_DEFAULT in w8a8-mm.cu; 0 = MMQ there)
 //   GGML_CUDA_W8A8_MIN_TOKENS the products with fewer tokens (src1 rows) keep MMQ (default 1024)
 //   GGML_CUDA_W8A8_NAMES      only weights whose name contains this text (default "transformer_blocks": the scope the
 //                             format was judged on, the diffusion transformer; "*" = every Q4_K / Q5_K weight)
