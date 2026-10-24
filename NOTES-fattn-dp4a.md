@@ -4,6 +4,8 @@ Committed as c6e96c02 (in the engine release spellcast-perf-6a82e8d). The sectio
 are the writing agent's, measured on the RTX 3060 emulation (compute_61 code, `GGML_CUDA_FAKE_CC=610`); the real
 card's figures are at the end. `build-sm61` (compute_61 only) holds a build of this state, with the path on by default.
 
+**2026-10-24, later: the P.V product in INT8 as well (branch `spellcast-pv8`): see "INT8 P.V" at the end.**
+
 ## Result in short
 
 - **Speed** (RTX 3060 running the compute_61 code with `GGML_CUDA_FAKE_CC=610`; relative numbers only):
@@ -282,3 +284,135 @@ and the rounding-only controls move these pictures by as much or more. By eye: t
 details flip - the chest's lock gains a raised hasp (the RTX 3060's own picture has it too; the text encoder on the
 CPU gives a third, flat variant), the knight's strap ring grows, while both controls also lengthen the tabard strip
 and add a sword hilt. The release keeps the path on for cc 6.x.
+
+## INT8 P.V (2026-10-24, branch spellcast-pv8, an Opus agent; measured on the RTX 3060 emulation only)
+
+The P.V product of the dp4a kernel in INT8 too: `GGML_CUDA_FATTN_DP4A_PV` = `int8` (default) | `f32` (the kernel
+above, unchanged: bit-identical pictures) | `int8-all` / `int8-f32` (research: no outlier blocks / the new kernel's F32
+path for every block). Commits on `spellcast-pv8` (from `spellcast-dp4a` 421b2cb1): 6a31623e (first version), 41e1ab0e
+(numerator rounding without F2I, unroll macros, test), b1158241 (score sums read without I2F), plus these notes.
+
+### Format (chosen on real Q/K/V of the model)
+
+- P: the online softmax's numerators of one query over one 32-key block (one iteration) as **u8 relative to the
+  block's largest**: q = rint(255 * exp2(s - s_max_block)), scale exp2(s_max_block - m)/255. The block's largest key is
+  exact (255); a block of small numerators keeps its own relative precision. The denominator sums the same dequantised
+  numerators (scale * sum q), so the weights stay normalised (an exact-p denominator was measured slightly worse).
+- V: **int8 per (channel, 32-key block)**, scale = the block's |max| of the channel / 127, from a prologue kernel.
+- **Outlier blocks keep the F32 P.V**: a block with a key whose V (|max| over the channels) is above 4x or below 1/4x
+  the mean over the head's keys. In Qwen-Image these are the text tokens: attention sinks (keys 44-48 at step 0 take
+  ~98 % of the weight in most heads, with V norms ~1/30 of the typical) and outliers 7-20x the typical (keys 1, 14, 30,
+  33, 37). Measured: 2 of 130 blocks per head (1.3-1.5 %); `GGML_CUDA_FATTN_DP4A_PV_RATIO` changes the 4.
+
+Study (`scratchpad pv8/study.py` on dumps of 8 calls of the chest picture, steps 0 / 12-13 / 24, 512 queries x 32
+heads each, against F64 attention of the same inputs; numbers = Frobenius error of the whole call relative to its
+norm):
+
+| call (step, block) | today: INT8 scores, F32 P.V | P.V only: u8 P, V per channel | per (channel, block) | per token folded into P | V 16 bit (2 dp4a digits) | **chosen: per (ch, block) + outlier blocks** |
+|---|---|---|---|---|---|---|
+| 0 (0, 0) | 9.79e-3 | 1.54e-1 | 8.13e-2 | 6.65e-3 | 4.82e-3 | **2.52e-3** |
+| 13 (0, 13) | 8.96e-3 | 8.60e-3 | 5.61e-3 | 3.59e-3 | 3.32e-3 | **2.77e-3** |
+| 31 (0, 31) | 4.29e-3 | 2.40e-3 | 1.58e-3 | 4.31e-3 | 1.04e-3 | **1.17e-3** |
+| 400 (12, 16) | 8.63e-3 | 7.87e-3 | 4.72e-3 | 4.02e-3 | 3.03e-3 | **3.35e-3** |
+| 415 (12, 31) | 4.87e-3 | 4.87e-3 | 2.99e-3 | 3.56e-3 | 1.42e-3 | **2.79e-3** |
+| 431 (13, 15) | 8.23e-3 | 7.39e-3 | 4.79e-3 | 3.76e-3 | 2.80e-3 | **3.04e-3** |
+| 780 (24, 12) | 8.32e-3 | 9.99e-3 | 5.80e-3 | 3.09e-3 | 3.27e-3 | **2.51e-3** |
+| 799 (24, 31) | 6.25e-3 | 6.25e-3 | 3.74e-3 | 4.16e-3 | 1.53e-3 | **3.23e-3** |
+
+- The chosen format's P.V error is 24-57 % of what the INT8 scores already add; both together are 3-16 % above the
+  scores alone (they add in quadrature). The F16 P.V of the tensor-core kernels: 2e-5..1.7e-4.
+- Per-channel V scales fail at step 0 (15 %): the sink's tiny V row sits under the channel's scale. Per-token scales
+  folded into P fix that but break on the outlier tokens (one row at 12 % in call 415). 16-bit V (two dp4a passes)
+  is as good as the chosen format but costs twice the dp4a.
+- The kernel's real output (a second dump, of the INT8 P.V kernel itself): 1.01e-2, 9.36e-3, 4.94e-3, 9.32e-3,
+  5.53e-3, 8.95e-3, 8.70e-3, 7.09e-3 for the same calls (today's format on those inputs: 9.79e-3, 8.91e-3, 4.80e-3,
+  8.69e-3, 4.81e-3, 8.40e-3, 8.34e-3, 6.20e-3); kernel vs the Python emulation of the format 1e-5..1.3e-4 (rounding
+  flips).
+
+### Kernel (`flash_attn_tile_dp4a_pv8`, `flash_attn_dp4a_quantize_v`, `flash_attn_dp4a_v_flags`)
+
+- Prologue: one CTA per (head, 32-key block) quantizes V straight from its type (F32 strided view or F16: the F16
+  conversion of V is skipped in this mode) into words of 4 keys of one channel ([head][block][key/4][128]), the
+  channel scales, and per block the min / max / sum of the keys' |V| max; one CTA per head sums the blocks in a fixed
+  order (deterministic) and writes the outlier flags.
+- Main kernel: the F32 kernel's structure (8 warps, 64 queries, 32 keys an iteration, INT8 scores unchanged). After the
+  softmax a lane writes its 8 numerators as bytes into [key/4][query] words (8 STS.U8, as many stores as the F32
+  numerators); q is the low byte of fma(255, e, 1.5*2^23) (no F2I, a quarter-rate instruction on Pascal).
+- P.V: a lane still owns 8 queries x 4 channels; per word of 4 keys one LDS.128 of V words + two broadcast LDS.128 of
+  P words, then 32 `dp4a.u32.s32` (SASS IDP.4A.U8.S8). The int32 sums start at the bits of 1.5*2^23 (|sum| <= 32 x 255
+  x 127 < 2^22), so one FADD reads them as floats (no I2F); then acc += (p_scale * v_scale) * sum. Per lane and 32 keys:
+  256 dp4a + 96 FADD/FMUL/FFMA + 27 LDS.128, against 1024 FFMA + 96 LDS.128 in the F32 kernel.
+- The same trick for the score sums (|sum| <= 128 x 127 x 127 < 2^22): bit-identical, -3 % on the 3060.
+- Outlier blocks: F32 values loaded straight from V into the shared tile (no prefetch, rare), the F32 numerators and
+  the F32 P.V loop of the old kernel (unrolled 2).
+- sm_61: 128 registers, no spill in the unmasked main loop (the masked variant spills 48 B, as the old one 72 B),
+  41.9 KB static shared memory (+2.3 KB), 2 blocks per SM. Main loop 13.8 KB of SASS (old kernel 13.2 KB with its 6 KB
+  P.V loop run twice per iteration). `FDP4A_PV8_SC_UNROLL` / `_KW_UNROLL` / `_F32_UNROLL` shrink it (2/2: 9.7 KB,
+  +2 % on the 3060) if the real card shows an instruction-cache problem.
+
+### Checks
+
+- `test_fattn_dp4a --pvexact --scale 1e-4` (new): Q INT8-exact, all keys of a 32-key block identical (so every
+  unmasked key has numerator 255), a random 0/-inf mask, V integers with |max| 127 in every (channel, block), every 9th
+  block with one key at 1/8 (an outlier block). GPU vs F64: max 3.4e-7 (GQA 2:1; 2 sequences; F32 K/V), the F32 path
+  for every block (`int8-f32`) 7.3e-7 = the old kernel's 7.3e-7.
+- `--emu` (new): a CPU emulation of the format (the kernel's quantizer roundings, the key mean summed in its order).
+  GPU vs emulation, median 1.3e-7..1.6e-7 per row; a few rows up to 1.8e-3 (rounding-boundary flips: the fast-math
+  reciprocal in the quantizers, ex2.approx); the emulation vs F64 equals the GPU's error to 3 digits. Cases: Qwen size,
+  block mask, causal + ALiBi + 3 sequences + GQA, F32 K/V, `int8-all`.
+- softcap declines to the F32 tile kernel as before; `GGML_CUDA_FATTN_DP4A_PV=f32` reproduces today's chest picture
+  bit for bit.
+
+### Speed (RTX 3060 executing the compute_61 code, `GGML_CUDA_FAKE_CC=610`; relative numbers only)
+
+| measure | F32 P.V (today) | INT8 P.V |
+|---|---|---|
+| Qwen-size call (4096 q x 4145 keys x 32 heads), isolated op, `test_fattn_dp4a --bench 30` | 26.85 ms | **16.09 ms (-40 %)** |
+| the same in sd-cli, per-node eval dump (`SD_EVAL_DUMP`, `SD_EVAL_DUMP_STATS=0`), median of 64 calls | 26.77 ms | **16.67 ms (-38 %)** |
+| 32 big calls of a step | 857 ms | 534 ms |
+| 25 steps, 1024x1024 (suite, steady s/it; sampling), text-only cases | 3.89 s/it; 99.1 s | 3.57 s/it; 91.0 s (*) |
+| the same, cases with a reference image (knight_back / ork_right) | 4.77 / 4.72 s/it; 131.3 / 123.9 s | 4.12 / 4.10 s/it; 114.9 / 107.9 s (*) |
+
+(*) measured with 41e1ab0e; b1158241 takes another ~0.45 ms a call (~15 ms a step) off, bit-identical outputs.
+
+On the 3060 a dp4a issues at half the FFMA rate; on Pascal at the same rate, so the P.V's share should shrink more
+there: if the F32 P.V took ~26 of the ~40 ms a call on the GTX 1070 Ti, the call should land around 20-24 ms (the
+attention ~1.3 -> ~0.7 s a step, ~15 s off a 25-step picture). **Not measured**: the rented GTX 1070 Ti pod's CUDA was
+broken the whole session (cuInit -> CUDA_ERROR_NOT_INITIALIZED at 02:30 and 03:26 UTC). Two Pascal-only unknowns to
+check first there: the instruction cache (main loop 13.8 KB, the old kernel's 13.2 KB; try `FDP4A_PV8_SC_UNROLL` /
+`FDP4A_PV8_KW_UNROLL` 4 or 2) and the cost of the broadcast LDS.128 of the numerator words.
+
+### Pictures (Qwen-Image 2.1, the six suite cases, 25 steps, 1024 px, 512-px VAE tiles, emulation on the 3060)
+
+All against today's kernel (`pv8_base`: the same engine, 421b2cb1 + the inactive dump hook) through the same
+compute_61 engine; PSNR RGB / alpha, LPIPS (compare.py). Controls of today's kernel: the text encoder on the CPU
+(`--backend te=cpu`) and no flash attention (`run_sd.py --no-fa`: the attention as plain F32/F16 matmuls, i.e. without
+the INT8 scores). Last column: two builds of the INT8 kernel that differ only in rare rounding ties of the numerators
+(6a31623e vs 41e1ab0e), the sampler's own noise floor for each case.
+
+| case | INT8 P.V (b1158241 = 41e1ab0e) | control: TE on CPU | control: no FA | INT8 tie-rounding variant vs INT8 |
+|---|---|---|---|---|
+| chest | **44.99 / 40.06, 0.0025** | 31.11 / 26.61, 0.0366 | 44.45 / 39.69, 0.0048 | 45.45 / 41.50 |
+| knight | **44.75 / 41.27, 0.0015** | 30.94 / 25.72, 0.0225 | 40.96 / 40.85, 0.0032 | 45.15 / 48.43 |
+| potion | **41.34 / 35.97, 0.0020** | 34.58 / 32.17, 0.0094 | 40.04 / 38.65, 0.0036 | 41.69 / 36.79 |
+| fox | **27.40 / 27.32, 0.0237** | 21.99 / 24.14, 0.0647 | 23.97 / 23.89, 0.0439 | 26.15 / 26.69 |
+| knight_back | **24.73 / 20.93, 0.0363** | 25.81 / 26.78, 0.0423 | 30.23 / 29.24, 0.0146 | 26.87 / 22.87 |
+| ork_right | **26.62 / 22.64, 0.0381** | 37.09 / 34.17, 0.0071 | 27.55 / 23.49, 0.0310 | 31.95 / 29.36 |
+
+- Closer to today's picture than both controls in chest, knight, potion and fox; knight_back and ork_right sit at the
+  controls' level and at the level of the tie-rounding variant (these two flip under any perturbation).
+- By eye at 100 % (`scratchpad pv8/view/full100_<case>.png`: today | INT8 P.V | TE on CPU | no FA): the same objects,
+  style and detail class; no streaks, halos, noise or banding. Bistable details flip: the orc's mechanical hand
+  (the knuckle lights and claw arrangement, the knee guard) - the no-FA control flips it the same way; the
+  knight_back's cape outline and right-hand pose shift by a few pixels (the alpha numbers), while TE on CPU turns its
+  tassets into mail; the fox's backpack is unchanged (TE on CPU changes it and the tail).
+- `GGML_CUDA_FATTN_DP4A_PV=f32` on the new engine reproduces today's chest bit for bit; the 2-step chest of 41e1ab0e
+  and b1158241 is bit-identical.
+
+### Traps met
+
+- `subprocess.call(["bash", ...])` from a Windows Python runs WSL's bash: environment variables such as
+  `GGML_CUDA_FAKE_CC` do not reach the Windows test program, which then measures the F32 tile kernel on the real
+  cc 8.6 and looks perfect. Call Git's `C:\Program Files\Git\usr\bin\bash.exe` by its full path.
+- Python string patches of C sources eat `\` + newline (macro continuations) and turn `\n` into a real newline.
+- From step 1 on Qwen-Image's V arrives as F16 (the prefix cache), at step 0 as the F32 strided view: test both.
