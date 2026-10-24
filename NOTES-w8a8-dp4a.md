@@ -14,6 +14,12 @@ Turing keep MMQ). The same buffers, number formats, fusions and epilogues as the
   `GGML_CUDA_W8A8_KERNEL=off` in the same build gives the old engine's picture pixel for pixel (178.8 s).
 - Pictures: chest 30.8 dB / LPIPS 0.040 against the MMQ engine, the class of the RTX 30xx switch from MMQ to this
   format (31.2 dB on the same chest); same composition and materials, the bistable lock hasp flips.
+- The six-prompt suite under the Pascal emulation (a compute_61-only build + `GGML_CUDA_FAKE_CC=610` on the RTX 3060;
+  the GTX 1070 Ti pod's CUDA had failed), against the same build with `GGML_CUDA_W8A8_KERNEL=off` (MMQ), PSNR dB rgb
+  chest / knight / potion / fox / knight_back / ork_right: **37.0 / 38.5 / 33.2 / 22.2 / 23.8 / 24.7** (LPIPS 0.011 /
+  0.007 / 0.013 / 0.068 / 0.047 / 0.056); the rounding-only control (the text encoder on the CPU) 30.0 / 30.5 / 33.6 /
+  18.3 / 21.0 / 30.0 (LPIPS 0.047 / 0.026 / 0.012 / 0.110 / 0.082 / 0.019). Closer than the control on five of six; the
+  orc's cybernetic forearm sits a little lower (a pose shift, same detail and sharpness at 100 %).
 - Exactness (RTX 3060, `W8A8D_SCALE_F32=0`): the int32 accumulators equal an int64 reference, and the f32 and the
   SwiGLU f16 outputs are byte-identical to `w8a8_gemm`'s at the Qwen shapes and odd token counts (4096 / 4145 / 1811 /
   8360 / 100 tokens; 0 of up to 101 M values differ). The default f32 mode: max relative error 7e-7 .. 1e-6 against
