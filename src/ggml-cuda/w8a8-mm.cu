@@ -1,6 +1,11 @@
 #include "w8a8-mm.cuh"
 #include "w8a8.cuh"
+#if W8A8_BM == 128 && W8A8_WM == 64   // the dp4a kernel's token mapping (research builds with other tiles: no dp4a path)
+#define W8A8_HAS_DP4A 1
 #include "w8a8-dp4a.cuh"
+#else
+#define W8A8_HAS_DP4A 0
+#endif
 
 #include <cstdlib>
 #include <cstring>
@@ -51,7 +56,7 @@ const w8a8_config & w8a8_cfg() {
 // the dp4a kernel's cards: Pascal with dp4a (cc 6.1 / 6.2; the GTX 10xx); Volta and Turing keep MMQ (Turing's MMQ runs
 // on its int8 tensor cores; neither was measured with the dp4a kernel)
 bool w8a8_dp4a_device(const int cc) {
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA &&
+    return W8A8_HAS_DP4A && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_DP4A && cc < GGML_CUDA_CC_VOLTA &&
         ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A;
 }
 
@@ -77,7 +82,7 @@ void w8a8_log_once(const int device) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     GGML_LOG_INFO("ggml_cuda: W8A8 int8 matmul path (W8 x A8-sub32, %s) on %s (cc %d): Q4_K/Q5_K products with >= %lld tokens%s%s%s, "
                   "SwiGLU intermediate %s, norm writer %s%s, sub-scales 1..%d\n",
-                  w8a8_dp4a_device(ggml_cuda_info().devices[device].cc) ? (W8A8D_SCALE_F32 ? "dp4a, f32 group sums" : "dp4a") : "int8 tensor cores",
+                  w8a8_dp4a_device(ggml_cuda_info().devices[device].cc) ? "dp4a" : "int8 tensor cores",
                   prop.name, ggml_cuda_info().devices[device].cc, (long long) c.min_tokens,
                   c.names.empty() ? "" : ", weights named *", c.names.c_str(), c.names.empty() ? "" : "*", c.glu_f16 ? "f16" : "f32",
                   c.norm_fuse ? "fused" : "off", c.norm_check ? " (checked)" : "", W8A8_SY_MAX);
@@ -200,9 +205,12 @@ static void w8a8_product(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     w8a8_convert_weights_cuda(src0->data, src0->type == GGML_TYPE_Q5_K, glu, (int64_t) src0->nb[1], qw.get(), dw.get(), (int) N, (int) K,
                               stream);
     CUDA_CHECK(cudaGetLastError());
+#if W8A8_HAS_DP4A
     if (w8a8_dp4a_device(ggml_cuda_info().devices[ctx.device].cc)) {
         CUDA_CHECK(w8a8d_gemm_cuda(epi, act.qx.ptr, act.sy.ptr, act.dt.ptr, qw.get(), dw.get(), dst, ldd, (int) act.T, (int) N, (int) K, stream));
-    } else {
+    } else
+#endif
+    {
         CUDA_CHECK(w8a8_gemm_cuda(epi, act.qx.ptr, act.sy.ptr, act.dt.ptr, qw.get(), dw.get(), dst, ldd, (int) act.T, (int) N, (int) K, stream));
     }
 }
