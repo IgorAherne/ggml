@@ -385,6 +385,17 @@ static __global__ void flash_attn_tile_dp4a(
 
 static constexpr int FDP4A_PV_BLK = 32;                    // keys a P / V scale block (= FDP4A_NBATCH)
 
+// Unroll depths of the INT8 P.V kernel's loops (instruction-cache size on Pascal; see NOTES-fattn-dp4a.md):
+#ifndef FDP4A_PV8_SC_UNROLL
+#define FDP4A_PV8_SC_UNROLL 8    // the score loop over 8 chunks of 16 channels
+#endif
+#ifndef FDP4A_PV8_KW_UNROLL
+#define FDP4A_PV8_KW_UNROLL 8    // the INT8 P.V loop over the 8 words of 4 keys
+#endif
+#ifndef FDP4A_PV8_F32_UNROLL
+#define FDP4A_PV8_F32_UNROLL 2   // the F32 P.V of outlier blocks (rare) over the 32 keys
+#endif
+
 enum fdp4a_pv_mode {
     FDP4A_PV_F32      = 0, // the F32 P.V kernel above
     FDP4A_PV_INT8     = 1, // INT8 P.V, outlier blocks in F32
@@ -656,7 +667,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
         for (int i = 0; i < NB/4; ++i) {
             sacc[i] = 0;
         }
-#pragma unroll
+#pragma unroll FDP4A_PV8_SC_UNROLL
         for (int kc = 0; kc < D/16; ++kc) {
             const int4 q = *(const int4 *) &Q8s[jc*QKS + kc*4];
 #pragma unroll
@@ -703,14 +714,17 @@ static __global__ void flash_attn_tile_dp4a_pv8(
             l_run = l_run*corr + l_add;
         } else {
             // numerators relative to the block's largest: 0 .. 255 (an all-masked block: scale 0)
+            // q = rint(255 e) as the low byte of the bits of 1.5*2^23 + 255 e (FFMA instead of FMUL + F2I, a
+            // quarter-rate conversion on Pascal); a NaN of an all-masked block (byte 255) meets the scale 0.
             const float sc = exp2f(s_max - m_new) * (1.0f/255.0f);
-            int qsum = 0;
+            unsigned int qbits = 0;
 #pragma unroll
             for (int i = 0; i < NB/4; ++i) {
-                const int q = __float2int_rn(255.0f*exp2f(s[i] - s_max));
-                qsum += q;
-                ((unsigned char *) P8s)[4*(i*NC + jc) + g] = (unsigned char) q;
+                const unsigned int qb = __float_as_uint(fmaf(255.0f, exp2f(s[i] - s_max), 12582912.0f));
+                qbits += qb;
+                ((unsigned char *) P8s)[4*(i*NC + jc) + g] = (unsigned char) qb;
             }
+            const int qsum = int(qbits - (NB/4)*0x4B400000u);
             l_run = l_run*corr + sc*float(qsum);
             if (g == 0) {
                 Pss[jc] = sc;
@@ -756,7 +770,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
         __syncthreads();
 
         if (flag_cur) {
-#pragma unroll 4
+#pragma unroll FDP4A_PV8_F32_UNROLL
             for (int t = 0; t < NB; ++t) {
                 const float4 v  = *(const float4 *) &VA[t*D + 4*lane];
                 const float4 p0 = *(const float4 *) &Ps[t*PS + 8*w + 0];
@@ -781,7 +795,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
                     isum[cc][d] = 0x4B400000;
                 }
             }
-#pragma unroll
+#pragma unroll FDP4A_PV8_KW_UNROLL
             for (int kw = 0; kw < KW; ++kw) {
                 const int4 v  = *(const int4 *) &V8s[kw*D + 4*lane];
                 const int4 p0 = *(const int4 *) &P8s[kw*NC + 8*w + 0];
@@ -1155,7 +1169,12 @@ static void ggml_cuda_flash_attn_ext_tile_dp4a_impl(ggml_backend_cuda_context & 
         }
         flash_attn_dp4a_v_flags<<<nkh*nseq, 256, 0, stream>>>(Vstat, Vflag, nblk, nk, ggml_cuda_fattn_dp4a_pv_ratio(), pv_mode);
         CUDA_CHECK(cudaGetLastError());
-#define FDP4A_PV8_LAUNCH(use_mask, TV)         flash_attn_tile_dp4a_pv8<use_mask, TV><<<grid, block, 0, stream>>>(             Q8, Qs, K8, Ks, V8, Vsc, Vflag, V_data, use_mask ? mask_data : nullptr, use_mask ? KV_max : nullptr,             (float *) dst->data, nq, nq_pad, nk, nk_pad, nh, gqa_ratio, nb21, nb22, nb23,             use_mask ? stride_mask : 0, use_mask ? stride_mask3 : 0, use_mask ? ne31 : 1, use_mask ? ne33 : 1,             max_bias, m0, m1, n_head_log2)
+#define FDP4A_PV8_LAUNCH(use_mask, TV) \
+        flash_attn_tile_dp4a_pv8<use_mask, TV><<<grid, block, 0, stream>>>( \
+            Q8, Qs, K8, Ks, V8, Vsc, Vflag, V_data, use_mask ? mask_data : nullptr, use_mask ? KV_max : nullptr, \
+            (float *) dst->data, nq, nq_pad, nk, nk_pad, nh, gqa_ratio, nb21, nb22, nb23, \
+            use_mask ? stride_mask : 0, use_mask ? stride_mask3 : 0, use_mask ? ne31 : 1, use_mask ? ne33 : 1, \
+            max_bias, m0, m1, n_head_log2)
         if (V->type == GGML_TYPE_F16) {
             if (mask) {
                 FDP4A_PV8_LAUNCH(true, half);
