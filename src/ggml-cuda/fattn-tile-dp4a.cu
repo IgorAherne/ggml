@@ -662,10 +662,12 @@ static __global__ void flash_attn_tile_dp4a_pv8(
     }
 
     for (int k0 = 0; k0 < k_max; k0 += NB) {
+        // the dot products start at the bits of 1.5*2^23 (|sum| <= 128*127*127 < 2^22): one FADD reads one as a
+        // float, exactly as I2F would (a quarter-rate instruction on Pascal)
         int sacc[NB/4];
 #pragma unroll
         for (int i = 0; i < NB/4; ++i) {
-            sacc[i] = 0;
+            sacc[i] = 0x4B400000;
         }
 #pragma unroll FDP4A_PV8_SC_UNROLL
         for (int kc = 0; kc < D/16; ++kc) {
@@ -687,7 +689,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
             const int t = 4*i + g;
             float x = -FLT_MAX;
             if (k0 + t < k_max) {
-                x = float(sacc[i]) * (qs*Kss[t]);
+                x = (__int_as_float(sacc[i]) - 12582912.0f) * (qs*Kss[t]);
                 if (use_mask) {
                     x += slope*__half2float(maskh[k0 + t]);
                 }
