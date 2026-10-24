@@ -460,7 +460,8 @@ per 32 keys, outlier blocks).
 Tried and dropped (bench): the score loop unrolled 4 instead of 8 (+0.9 - 1.3 ms); the 16-byte chunks as two LDS.64
 (+0.9 ms, an 8 B spill; plain 8-byte loads are re-merged into LDS.128 by ptxas even across the unrolled chunks, so
 they need `ld.volatile.shared`). A further lever would be one barrier per iteration with double-buffered K / V / P
-tiles; the shared-memory budget (the outlier blocks' F32 tiles) is the obstacle. Not tried.
+tiles; the shared-memory budget (the outlier blocks' F32 tiles) is the obstacle. Not tried. (Tried in the next round:
+slower, see "Fixed costs per iteration".)
 
 **Identity checks** (all byte / pixel comparisons, the unmodified kernel built in the same tree as the control):
 - the attention dump hook (`GGML_CUDA_FATTN_DUMP`, every query) of calls 0, 17 (step 0, V an F32 strided view), 32,
@@ -472,3 +473,162 @@ tiles; the shared-memory budget (the outlier blocks' F32 tiles) is the obstacle.
   `GGML_CUDA_FATTN_DP4A_PV=f32` pixel-identical, 25 steps pixel-identical to the published engine's `new_direct.png`.
 Not checked: a real-data masked call (Qwen-Image passes no mask; the bench's synthetic masked cases are identical),
 other Pascal cards (GTX 1070 Ti / 1080 / 1060: same sm_61 code).
+
+## Fixed costs per iteration, 2026-10-24 (GTX 1070 pod)
+
+An Opus agent; built locally (Docker `sdlinux`, sm_61), measured on the rented GTX 1070 pod (GPU 0, under
+`flock /workspace/gpu.lock`). The question: the INT8 P.V kernel spends a third of its time outside its two dp4a loops;
+where, and what of it can go with a bit-identical output. Result: the "rest" has no dominant fixed cost; one change
+(the iteration's branch layout + the maxima as two shuffle chains) takes a call **41.9 -> 40.1 Mclk (-4.3 %)**, in
+sd-cli **27.05 -> 25.85 ms (-4.4 %, nvprof)**, bit-identical.
+
+### Method
+
+- What-ifs on the real kernel in `w8a8-tools/bench_attn.cu` (synthetic Qwen size: 4096 queries x 4145 keys x 32 heads,
+  64 of 4160 blocks outliers), each a copy of the kernel file with parts removed (wrong results, timing only).
+- **Per clock**: the GTX 1070 runs this kernel at its 130 W cap and its clock moves between runs (1,585 - 1,751 MHz
+  within one run of 30 calls), and a faster variant draws more power and runs at a lower clock. The kernel file has a
+  compiled-out timing hook (`-DFDP4A_BENCH_CLK`, bench builds only): thread 0 of every block writes clock64 and
+  %globaltimer at its start and end and its SM; the bench prints the call in clocks (per SM the span from its first
+  block's start to its last block's end in that SM's clock64; the slowest SM; median of the repetitions) and the SM
+  clock (clocks / ns). Medians of 3 rounds of 30 calls (the final pair: 4 rounds); the clock figures repeat to
+  +-0.1 % between rounds and sessions, the milliseconds to +-1.5 %. The hook costs nothing measurable (24.73 vs
+  24.78 ms, one run each).
+- **Occupancy what-if without touching the kernel**: `bench_attn --blocker` starts one 48 KB-shared-memory block per SM
+  that waits beside the kernel (a chain of dependent L2 loads, a mapped host flag read once per 1000 of them), so only
+  one attention block fits per SM.
+- The model of the call: 2048 blocks of 8 warps, 130 iterations of 32 keys, 2 blocks per SM on 15 SMs = 8,875 "rounds"
+  of 16 warps per SM. The INT8 path of an iteration is 930 warp instructions (SASS census), 512 of them IDP.4A: an
+  issue bound of 930 x 16 / 4 x 8,875 = 33.0 Mclk and a dp4a bound of 18.2 Mclk, against 42.0 Mclk measured.
+
+### What-if table (the published kernel of 1b054db + the hook; Mclk a call)
+
+| what-if (wrong results) | Mclk | change |
+|---|---|---|
+| none (the published kernel) | 41.99 | |
+| (e) outlier path never taken (`--mode int8-all`) | 41.29 | -0.69 (-1.7 %) |
+| (e2) outlier code compiled out (int8-all) | 39.56 | -1.73 vs int8-all (-4.2 %) |
+| (a) no barriers (both `__syncthreads` of the loop) | 38.97 | -3.02 (-7.2 %) |
+| (a1) / (a2) only the first / only the second barrier removed (int8-all) | 40.17 / 40.11 | -1.10 / -1.16 vs int8-all |
+| (b) no K / V tile staging (stale tiles; int8-all) | 40.99 | -0.29 vs int8-all (-0.7 %) |
+| (b1) no global loads in the loop (stale registers stored; int8-all) | 41.21 | -0.07 vs int8-all |
+| (a)+(b) no barriers, no staging (int8-all) | 38.07 | -3.21 vs int8-all |
+| (c) no softmax math (scores as raw bits, no maxima shuffles, no exp2) | 40.07 | -1.92 (-4.6 %) |
+| (c2) no maxima shuffles (each lane's own partial maxima) | 40.63 | -1.36 (-3.2 %) |
+| (c3) no exp2 (no MUFU / RRO) | 41.71 | -0.27 (-0.7 %) |
+| (c1) no score scaling / bounds tests | 43.70 | +1.71 (*) |
+| (d) no numerator stores (u8 codes, scales) | 41.84 | -0.14 (-0.3 %) |
+| no rescale of the accumulators | 40.69 | -1.30 (-3.1 %) |
+| P.V epilogue (2 scales, FADD, FFMA) as one FADD | 39.58 | -2.41 (-5.7 %) |
+| score loop's shared loads hoisted (6 LDS.128 an iteration instead of 48) | 38.94 | -3.05 (-7.3 %) |
+| P.V loop's shared loads hoisted (3 instead of 24) | 38.95 | -3.04 (-7.2 %) |
+| no score loop | 31.40 | -10.58 (-25 %) |
+| no INT8 P.V loop | 32.24 | -9.75 (-23 %) |
+| only the two dp4a loops left (everything above removed, int8-all) | 18.22 | -23.77 (-57 %) |
+| (f) one block per SM (`--blocker`): 8 warps instead of 16 | 60.59 | +18.60 (+44 %); a block 441 instead of 608 kclk |
+
+(*) raw-bit scores are huge: the running maximum moves at every block and the rescale runs every iteration.
+
+The barriers, on the intermediate one-branch layout (int8-all 39.83 Mclk): no barriers -2.02; the barriers as per-warp
+named barriers (BAR.SYNC of 32 threads + its MEMBAR.CTA, no waiting for other warps) -0.99; as half-block barriers
+(4 warps) -0.17. So about half of the barriers' cost is the BAR.SYNC + MEMBAR.CTA pair itself (ptxas adds a MEMBAR.CTA
+after every bar.sync on sm_61, named barriers too) and half the waiting, which does not shrink with 4-warp groups.
+
+What it says:
+- The two dp4a loops alone run at the card's dp4a issue rate (18.22 Mclk = the 18.2 bound): their shared loads cost
+  nothing by themselves; they cost by competing with the rest.
+- 57 % of the call is the rest, and no single fixed cost dominates it: the barriers (7 %), the P.V epilogue (5.7 %),
+  the maxima shuffles (3.2 %), the rescale (3.1 %), the outlier code (1.7 % taken, 4.2 % merely present), the shared
+  loads inside both loops (7 % each); staging (0.7 %), the numerator stores (0.3 %) and exp2 (0.7 %) are small. The
+  instruction stream as a whole runs at 79 % of its issue bound (33.0 of 42.0 Mclk); the non-dp4a instructions (418 of
+  930 an iteration) are mostly the necessary ones (score scaling, u8 quantization, the P.V epilogue: their count is
+  set by the format, their order by the bit-identity).
+- 16 warps per SM are far from enough to hide this kernel's latencies (one block per SM: +44 %), so whatever stalls
+  a block (a barrier) is only partly covered by the other one.
+- The 2.2-clock price of a broadcast LDS.128 (`lds_bench`) does not bind here: removing 42 of the score loop's loads
+  saved 0.5 clock each, 21 of the P.V loop's 1.0 clock each, and narrower loads made it slower (below).
+
+### What was changed (bit-identical; `flash_attn_tile_dp4a_pv8` only)
+
+1. **The iteration's branch layout.** An iteration tested the block's outlier flag three times (numerators, value
+   tile, P.V); ptxas placed the outlier code first each time, so the common INT8 path branched around it three times an
+   iteration. Now the INT8 blocks run in an inner loop that an outlier block leaves with a `break`; the outlier block's
+   code (the same F32 numerators, value tile and P.V as before) follows the loop, and the INT8 loop resumes. The
+   common path has one branch to it. (ptxas still places the outlier code before the INT8 code: neither the `if/else`
+   order nor `__builtin_expect` changes that.) One `if/else` per iteration measured 40.54 Mclk; this loop shape 40.09,
+   with the same instruction count (932 vs 931 an iteration; a different schedule).
+2. **The maxima as two chains**: both tile queries' maxima over g (xor 8, 16), then over h (xor 1): 6 shuffles 3 deep
+   instead of 4 shuffles 4 deep (-0.31 Mclk alone). fmaxf is order-free: the same maxima.
+
+Why the output is unchanged: both paths compute the same expressions in the same order as before (the scores, the u8
+codes, the denominator updates, the rescale, the P.V products; the outlier code is moved, not changed), and the maxima
+do not depend on the order of fmaxf. Checked by byte / pixel identity below. The F32 P.V kernel
+(`GGML_CUDA_FATTN_DP4A_PV=f32`) is untouched: its sm_61 SASS is identical before / after (both mask variants); of the
+library's 6,490 kernels only the four `flash_attn_tile_dp4a_pv8` variants differ from the published library's.
+
+sm_61 resources (Linux build): unmasked variants 127 registers, 0 spill (was 128, 0); masked variants 128 registers,
+8 B stack (was 16); 42,112 B static shared memory (unchanged); 2 blocks per SM.
+
+### Measured
+
+| measure | published (1b054db) | this change |
+|---|---|---|
+| bench, Mclk a call (with the timing hook; median of 4 x 30) | 41.90 (1,649 MHz) | **40.09 (-4.3 %)** (1,634 MHz) |
+| the same, `--mode int8-all` / masked variant (10 % -inf) | 41.27 / 47.22 | 39.45 (-4.4 %) / 42.56 (-9.9 %) |
+| bench, ms a call (no hook; median of 5 x 30, interleaved) | 25.46 | 24.72 (-2.9 %: the faster code runs at a lower clock) |
+| the same, masked variant | 28.96 | 26.72 (-7.7 %) |
+| sd-cli, nvprof timeline of a 2-step chest: avg ms a call (32 calls each), V as F16 / as the F32 view, two runs | 27.00 / 26.92; 27.10 / 27.19 | **25.72 / 25.77; 26.05 / 25.86** |
+| 25-step chest (seed 4242, `--vae-conv-direct`), `sampling completed`, same session, one run each | 137.79 s | 135.50 s |
+
+The per-call gain in sd-cli (-1.2 ms, -4.4 %) is ~1 s of a 25-step picture (32 calls a step x 25 steps x 1.2 ms =
+0.96 s); the 25-step pair differs by 2.3 s, the rest of it is the card's clock.
+
+### Tried and dropped (all measured; the two one-barrier variants also ran the 12 identity cases: byte-identical)
+
+| variant | Mclk vs its base | why it was dropped |
+|---|---|---|
+| one barrier an iteration: K / V tiles double-buffered, the outlier path without shared tiles (numerators by shuffles, V straight from global) | +4.17 vs published (int8-all +2.27) | 24 B spill; an outlier block 4x dearer; 30.5 KB shared |
+| the same with the outlier numerators in shared memory and its F32 values in half tiles (47.9 KB shared) | +2.20 vs the one-if/else layout | 24 B spill; its single barrier costs 2.6 Mclk, more than the two barriers of the one-if/else layout (2.0) |
+| the next tiles' global loads after the second barrier | +0.07 | the MEMBAR.CTA after the barrier does not wait for them (or it does not matter) |
+| the global loads after the P.V loop (registers free during it) | +0.68 | 8 B spill |
+| the rescale after the second barrier | +2.27 | 8 B spill |
+| the numerator words of the P.V loop as 4 volatile LDS.64 / 8 LDS.32 (not 2 LDS.128) | +0.24 / +3.37 | more instructions; the broadcast-load price does not bind |
+| the rescale skipped per query whose maximum did not move | +0.06 | |
+| the outlier P.V not unrolled (and its staging) | -0.33 / -0.14 (old layout); -0.11 on the one-if/else one | noise level |
+| 32-bit element offsets for the tile loads | +0.37 (masked -1.29) | the unmasked variant is the one used |
+
+### Identity checks (all run)
+
+- bench (`bench_attn`, the published kernel file vs this one, same flags), 12 cases byte-identical: INT8 P.V with /
+  without mask, `int8-f32` with / without mask, `int8-all`, the F32 P.V kernel with / without mask, 1100 x 1001 GQA 2:1
+  with / without mask, `int8-f32` 1100 x 1001, 1024 queries x 77 keys, `int8-f32` 1024 x 40 keys.
+- engine (`/workspace/sdcpp-attn2` = a copy of the published engine with this `libggml-cuda.so`): the 2-step chest
+  pixel-identical to the published engine's 2-step chest (and to the previous round's `b2_v1.png`); the 2-step chest
+  with `GGML_CUDA_FATTN_DP4A_PV=f32` pixel-identical to the published engine's (and to `f32_v1.png`); the 25-step chest
+  pixel-identical to `/workspace/tests/v2/new_direct.png` (and to the published engine's 25-step chest of the same
+  session).
+- Compiles for 61;70;75;80;86;89;90;100;120a with Linux nvcc 12.8 (GCC host) and with MSVC-hosted nvcc 12.8
+  (build-sm61's command line; sm_61 alone and all architectures).
+
+### Traps
+
+- **MSVC-hosted nvcc is not deterministic for these kernels.** Of 8 Windows compiles (sm_61) of this file and its
+  variants, 3 produced one kernel each with another register allocation and schedule (once `pv8<0, half>`, once each
+  F32 P.V kernel variant, whose source did not change); the other 5, among them 3 in a row of the same file and the
+  final file, matched the Linux build kernel for kernel, and the Linux builds always repeated. A Windows-vs-Linux SASS
+  comparison from one compile proves nothing either way. The other `pv8<0, half>` (its sm_61 cubin run on the pod
+  through the driver API, a scratch variant of the bench): byte-identical output; 24.33 - 24.66 against 24.26 -
+  24.59 ms for the Linux code, interleaved (not measured in clocks).
+- `--blocker`: polling the mapped flag in a tight loop made the attention kernel 10x slower; CUDA's lazy loading
+  deadlocks when the attention kernel is first loaded while the blocker spins (launch it once before it, or run with
+  `CUDA_MODULE_LOADING=EAGER`); `cudaDeviceSynchronize` waits for the blocker (sync the stream instead).
+- Small register changes move this kernel by several percent (127 vs 128 registers, an 8 B spill): measure every
+  variant, per clock.
+- On this power-capped card a faster kernel runs at a lower clock: -4.3 % in clocks was -2.9 % in ms in the bench.
+
+### Not verified
+
+- The Windows build on a real GTX 10xx (its sm_61 code runs on the Linux pod; see Traps for the compile variance).
+- Other Pascal cards (GTX 1060 / 1070 Ti / 1080: the same sm_61 code); a real-data masked call (Qwen-Image passes no
+  mask; the bench's masked cases are byte-identical).
+- The 25-step time beyond one run each.

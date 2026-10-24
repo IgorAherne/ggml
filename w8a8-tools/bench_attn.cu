@@ -11,12 +11,19 @@
 //     -DKERNEL_FILE='"<path>/fattn-tile-dp4a.cu"' bench_attn.cu -o bench_x -L<build>/bin -lggml-cuda -lggml-base
 //     -Xlinker -rpath -Xlinker <engine dir> -Xlinker --allow-shlib-undefined     (one command line)
 //   bench_x [--mode f32|int8|int8-f32|int8-all] [--mask] [--nq N] [--nk N] [--nh N] [--gqa R] [--reps N] [--out file]
+//           [--blocker]
 // (check with cuobjdump -sass that the bench's kernel SASS equals the library's: same flags, same code.)
+// Built with -DFDP4A_BENCH_CLK (the kernel file's timing hook, INT8 P.V modes only) it also prints the call in clocks:
+// per SM the span from its first block's start to its last block's end in clock64, the slowest SM's span (median of
+// the repetitions), and the SM clock (clocks / ns); the GTX 1070 runs at its power cap, so compare variants per clock.
+// --blocker: one 48 KB-shared-memory block per SM waits beside the kernel, so that only one attention block fits per SM
+// (an occupancy what-if without changing the kernel's code).
 #include KERNEL_FILE
 
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,13 +33,37 @@
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { std::printf("%s: %s\n", #x, cudaGetErrorString(e_)); return 1; } } while (0)
 
+// --blocker: one block of this kernel per SM holds 48 KB of shared memory, so only one attention block fits beside it
+// (occupancy what-if without changing the attention kernel's code); it waits on a flag in mapped host memory. (Polling
+// that flag in a tight loop made the attention kernel ten times slower: keep the chain of L2 loads below.)
+static __global__ void bench_blocker(volatile int * flag, int * smids, const int * chase) {
+    __shared__ int pad[48*1024/4];
+    unsigned int smid;
+    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+    if (threadIdx.x == 0) {
+        smids[blockIdx.x] = int(smid);
+        __threadfence_system();
+    }
+    // waits without taking issue slots or memory bandwidth from the attention block beside it: a chain of dependent
+    // L2 loads (~250 clocks each, one instruction), the host flag read once per 1000 of them
+    int idx = 0;
+    while (flag[0] == 0) {
+        for (int k = 0; k < 1000; ++k) {
+            idx = ((volatile int *) chase)[idx];
+        }
+        if (threadIdx.x == 999) pad[idx] = 0; // keeps the array
+    }
+    if (threadIdx.x == 1000) smids[0] = pad[5];
+}
+
 int main(int argc, char ** argv) {
     int nq = 4096, nk = 4145, nh = 32, gqa = 1, reps = 20, mode = FDP4A_PV_INT8;
-    bool use_mask = false;
+    bool use_mask = false, blocker = false;
     const char * out = nullptr;
     for (int i = 1; i < argc; ++i) {
         const char * a = argv[i];
         if (!strcmp(a, "--mask")) use_mask = true;
+        else if (!strcmp(a, "--blocker")) blocker = true;
         else if (!strcmp(a, "--nq") && i + 1 < argc) nq = atoi(argv[++i]);
         else if (!strcmp(a, "--nk") && i + 1 < argc) nk = atoi(argv[++i]);
         else if (!strcmp(a, "--nh") && i + 1 < argc) nh = atoi(argv[++i]);
@@ -128,10 +159,53 @@ int main(int argc, char ** argv) {
                 0.0f, 1.0f, 1.0f, 32);
         }
     };
+    const int nblocks = grid.x * grid.z;
+#ifdef FDP4A_BENCH_CLK
+    const bool clk_on = mode != FDP4A_PV_F32;              // the hook is in the INT8 P.V kernel only
+    unsigned long long * clk = nullptr;
+    CK(cudaMalloc(&clk, size_t(nblocks) * 5 * 8));
+    CK(cudaMemcpyToSymbol(fdp4a_bench_clk, &clk, sizeof(clk)));
+    std::vector<unsigned long long> hclk(size_t(nblocks) * 5);
+    std::vector<double> kcyc, kfreq, kbusy;
+#endif
+    int nsm = 0;
+    CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0));
+    volatile int * hflag = nullptr;
+    int * hsmids = nullptr;
+    cudaStream_t bstream;
+    if (blocker) {
+        // the attention kernel is loaded (CUDA's lazy loading) before the blocker runs: loading a kernel while another
+        // one spins waits for it (a deadlock)
+        launch();
+        CK(cudaDeviceSynchronize());
+        CK(cudaHostAlloc((void **) &hflag, 4, cudaHostAllocMapped));
+        CK(cudaHostAlloc((void **) &hsmids, nsm * 4, cudaHostAllocMapped));
+        hflag[0] = 0;
+        for (int i = 0; i < nsm; ++i) hsmids[i] = -1;
+        int * dflag; int * dsm;
+        CK(cudaHostGetDevicePointer((void **) &dflag, (void *) hflag, 0));
+        CK(cudaHostGetDevicePointer((void **) &dsm, hsmids, 0));
+        CK(cudaStreamCreateWithFlags(&bstream, cudaStreamNonBlocking));
+        int * chase;
+        CK(cudaMalloc(&chase, 4));
+        CK(cudaMemset(chase, 0, 4));
+        bench_blocker<<<nsm, 32, 0, bstream>>>(dflag, dsm, chase);
+        CK(cudaGetLastError());
+        for (int it = 0; it < 100000; ++it) {
+            bool all = true;
+            for (int i = 0; i < nsm; ++i) all = all && ((volatile int *) hsmids)[i] >= 0;
+            if (all) break;
+        }
+        std::vector<int> s(hsmids, hsmids + nsm);
+        std::sort(s.begin(), s.end());
+        std::printf("blocker SMs:");
+        for (int v : s) std::printf(" %d", v);
+        std::printf("\n");
+    }
     launch();
     launch();
     CK(cudaGetLastError());
-    CK(cudaDeviceSynchronize());
+    CK(cudaStreamSynchronize(0)); // not the device: a --blocker kernel runs until the end
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
     std::vector<float> ms;
@@ -143,6 +217,36 @@ int main(int argc, char ** argv) {
         float t = 0.0f;
         cudaEventElapsedTime(&t, e0, e1);
         ms.push_back(t);
+#ifdef FDP4A_BENCH_CLK
+        // per SM: the span from its first block's start to its last block's end in its own clock64 (comparable
+        // within one SM) and in globaltimer ns
+        if (clk_on) {
+            CK(cudaMemcpy(hclk.data(), clk, hclk.size() * 8, cudaMemcpyDeviceToHost));
+            std::vector<long long> c0(nsm, LLONG_MAX), c1(nsm, 0), g0(nsm, LLONG_MAX), g1(nsm, 0);
+            double busy = 0.0;
+            for (int b = 0; b < nblocks; ++b) {
+                const unsigned long long * p = &hclk[size_t(b) * 5];
+                const int sm = int(p[4]);
+                c0[sm] = std::min(c0[sm], (long long) p[0]); c1[sm] = std::max(c1[sm], (long long) p[2]);
+                g0[sm] = std::min(g0[sm], (long long) p[1]); g1[sm] = std::max(g1[sm], (long long) p[3]);
+                busy += double(p[2] - p[0]);
+            }
+            double cmax = 0.0, fsum = 0.0; int n = 0;
+            for (int sm = 0; sm < nsm; ++sm) {
+                if (c1[sm] == 0) continue;
+                cmax = std::max(cmax, double(c1[sm] - c0[sm]));
+                fsum += double(c1[sm] - c0[sm]) / double(g1[sm] - g0[sm]);
+                ++n;
+            }
+            kcyc.push_back(cmax);
+            kfreq.push_back(fsum / n);
+            kbusy.push_back(busy / nblocks);
+        }
+#endif
+    }
+    if (blocker) {
+        hflag[0] = 1;
+        CK(cudaStreamSynchronize(bstream));
     }
     CK(cudaGetLastError());
     std::sort(ms.begin(), ms.end());
@@ -153,6 +257,14 @@ int main(int argc, char ** argv) {
     for (float v : hO) { if (std::isfinite(v)) sum += v; else ++nonfinite; }
     std::printf("mode %d mask %d nq %d nk %d nh %d gqa %d: flagged blocks %d of %d; median %.3f ms min %.3f max %.3f; checksum %.6e nonfinite %d\n",
         mode, int(use_mask), nq, nk, nh, gqa, nflag, nkh * nblk, ms[ms.size() / 2], ms.front(), ms.back(), sum, nonfinite);
+#ifdef FDP4A_BENCH_CLK
+    if (clk_on) {
+        std::sort(kcyc.begin(), kcyc.end()); std::sort(kfreq.begin(), kfreq.end()); std::sort(kbusy.begin(), kbusy.end());
+        std::printf("  clocks: kernel %.3f Mclk (slowest SM span, median of reps; min %.3f), SM clock %.0f MHz (median; %.0f..%.0f), block %.1f kclk (mean)\n",
+            kcyc[kcyc.size() / 2] * 1e-6, kcyc.front() * 1e-6, kfreq[kfreq.size() / 2] * 1e3, kfreq.front() * 1e3, kfreq.back() * 1e3,
+            kbusy[kbusy.size() / 2] * 1e-3);
+    }
+#endif
     if (out) {
         FILE * f = std::fopen(out, "wb");
         std::fwrite(hO.data(), 4, hO.size(), f);

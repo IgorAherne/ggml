@@ -383,6 +383,13 @@ static __global__ void flash_attn_tile_dp4a(
 // Shared memory as the F32 kernel's (+2.3 KB): the F32 value tile and the INT8 one (+ its scales) share a buffer; the
 // F32 numerators and the INT8 ones are separate (a warp rewrites its numerators while other warps may still read theirs).
 
+// Timing hook of w8a8-tools/bench_attn.cu (compiled only into that bench, -DFDP4A_BENCH_CLK): thread 0 of every block of
+// the INT8 P.V kernel writes clock64 and %globaltimer at its start and end and its SM, so that the bench can report a
+// call in clocks (the GTX 1070 runs at its power cap: the clock moves between runs) and the SM clock.
+#ifdef FDP4A_BENCH_CLK
+__device__ unsigned long long * fdp4a_bench_clk;          // per block: clock start, ns start, clock end, ns end, SM
+#endif
+
 static constexpr int FDP4A_PV_BLK = 32;                    // keys a P / V scale block (= FDP4A_NBATCH)
 static constexpr int FDP4A_P8S    = FDP4A_NCOLS + 8;       // words a row of 4 keys of the INT8 numerators (padded: the
                                                            // byte stores of the 2 x 4 score tile hit 16 distinct banks)
@@ -581,6 +588,18 @@ static __global__ void flash_attn_tile_dp4a_pv8(
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
     const int tid  = w*WARP_SIZE + lane;
+#ifdef FDP4A_BENCH_CLK
+    if (tid == 0) {
+        unsigned long long ns;
+        unsigned int smid;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+        unsigned long long * pc = fdp4a_bench_clk + 5*(int64_t(blockIdx.z)*gridDim.x + blockIdx.x);
+        pc[0] = clock64();
+        pc[1] = ns;
+        pc[4] = smid;
+    }
+#endif
 
     const int col0 = blockIdx.x*NC;
     const int hs   = blockIdx.z;                           // sequence*nh + head
@@ -688,95 +707,115 @@ static __global__ void flash_attn_tile_dp4a_pv8(
         load_K(NB);
     }
 
-    for (int k0 = 0; k0 < k_max; k0 += NB) {
-        // the dot products start at the bits of 1.5*2^23 (|sum| <= 128*127*127 < 2^22): one FADD reads one as a
-        // float, exactly as I2F would (a quarter-rate instruction on Pascal)
-        // the 2 x 4 tile: sacc0 query jq0, sacc1 query jq1, [j] key 8*j + 4*h + g
-        constexpr int TK = NB/8;                           // keys a lane: 4
-        int sacc0[TK];
-        int sacc1[TK];
-#pragma unroll
-        for (int j = 0; j < TK; ++j) {
-            sacc0[j] = 0x4B400000;
-            sacc1[j] = 0x4B400000;
-        }
-#pragma unroll FDP4A_PV8_SC_U
-        for (int kc = 0; kc < D/16; ++kc) {
-            const int4 qa = *(const int4 *) &Q8s[jq0*QKS + kc*4];
-            const int4 qb = *(const int4 *) &Q8s[jq1*QKS + kc*4];
-#pragma unroll
-            for (int j = 0; j < TK; ++j) {
-                const int4 k = *(const int4 *) &K8s[(8*j + 4*h + g)*QKS + kc*4];
-                sacc0[j] = ggml_cuda_dp4a(qa.x, k.x, sacc0[j]);
-                sacc0[j] = ggml_cuda_dp4a(qa.y, k.y, sacc0[j]);
-                sacc0[j] = ggml_cuda_dp4a(qa.z, k.z, sacc0[j]);
-                sacc0[j] = ggml_cuda_dp4a(qa.w, k.w, sacc0[j]);
-                sacc1[j] = ggml_cuda_dp4a(qb.x, k.x, sacc1[j]);
-                sacc1[j] = ggml_cuda_dp4a(qb.y, k.y, sacc1[j]);
-                sacc1[j] = ggml_cuda_dp4a(qb.z, k.z, sacc1[j]);
-                sacc1[j] = ggml_cuda_dp4a(qb.w, k.w, sacc1[j]);
-            }
-        }
+    // Iteration layout (2026-10-24, GTX 1070 pod; NOTES-fattn-dp4a.md "Fixed costs per iteration"): the INT8 blocks run
+    // in an inner loop that an outlier block leaves with a break; the outlier block's code follows that loop, then the
+    // INT8 loop resumes. Before, an iteration tested the block's flag three times (numerators, value tile, P.V) and
+    // ptxas placed the outlier code first each time, so the common INT8 path branched around it three times. With one
+    // test, this loop shape and the maxima as two shuffle chains (below) a Qwen-size call measured 40.1 instead of
+    // 41.9 Mclk (bench_attn, 64 of 4160 blocks outliers). Both paths compute the same expressions in the same order as
+    // before (the outlier code is moved, not changed; fmaxf is order-free): the output is bit-identical.
+    constexpr int TK = NB/8;                               // keys a lane in the score tile: 4
+    int k0 = 0;
+    // the iteration's scores and softmax values (the outlier block's code after the inner loop reads them too)
+    float s0[TK];
+    float s1[TK];
+    float s_max0, s_max1, s_max, m_new, corr;
 
-        float s0[TK];
-        float s1[TK];
-        float s_max0 = -FLT_MAX;
-        float s_max1 = -FLT_MAX;
+    // the accumulators of a query whose maximum moved
+    auto rescale = [&]() {
+        if (!__all_sync(0xFFFFFFFF, corr == 1.0f)) {
 #pragma unroll
-        for (int j = 0; j < TK; ++j) {
-            const int t = 8*j + 4*h + g;
-            float x0 = -FLT_MAX; // a key past the end: exp2 gives 0
-            float x1 = -FLT_MAX;
-            if (k0 + t < k_max) {
-                const float ks = Kss[t];
-                x0 = (__int_as_float(sacc0[j]) - 12582912.0f) * (qs0*ks);
-                x1 = (__int_as_float(sacc1[j]) - 12582912.0f) * (qs1*ks);
-                if (use_mask) {
-                    x0 += slope*__half2float(maskh0[k0 + t]);
-                    x1 += slope*__half2float(maskh1[k0 + t]);
+            for (int cc = 0; cc < 8; ++cc) {
+                const float corr_cc = __shfl_sync(0xFFFFFFFF, corr, cc, WARP_SIZE);
+#pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    acc[cc][d] *= corr_cc;
                 }
             }
-            s0[j]  = x0;
-            s1[j]  = x1;
-            s_max0 = fmaxf(s_max0, x0);
-            s_max1 = fmaxf(s_max1, x1);
         }
-        // the maxima over the 32 keys: this lane's query jc with lane ^ 1's half of it, then over g; then the
-        // tile's other query from lane ^ 1 (whose query it is)
-        float s_max = h ? s_max1 : s_max0;
-        s_max = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFF, h ? s_max0 : s_max1, 1, WARP_SIZE));
-        s_max = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFF, s_max,  8, WARP_SIZE));
-        s_max = fmaxf(s_max, __shfl_xor_sync(0xFFFFFFFF, s_max, 16, WARP_SIZE));
-        {
-            const float s_max_x = __shfl_xor_sync(0xFFFFFFFF, s_max, 1, WARP_SIZE);
-            s_max0 = h ? s_max_x : s_max;
-            s_max1 = h ? s_max : s_max_x;
+    };
+    // the keys of the next iteration to shared memory, the global loads of the values of the next one and of the keys
+    // of the one after it
+    auto stage_next = [&]() {
+        if (k0 + NB < k_max) {
+            store_K();
+            load_V8(k0 + NB);
         }
+        if (k0 + 2*NB < k_max) {
+            load_K(k0 + 2*NB);
+        }
+    };
 
-        const float m_new = fmaxf(m_run, s_max + 3.0f);    // query jc
-        const float corr  = exp2f(m_run - m_new);
-        m_run = m_new;
+    while (true) {
+        for (; k0 < k_max; k0 += NB) {
+            // the dot products start at the bits of 1.5*2^23 (|sum| <= 128*127*127 < 2^22): one FADD reads one as a
+            // float, exactly as I2F would (a quarter-rate instruction on Pascal)
+            // the 2 x 4 tile: sacc0 query jq0, sacc1 query jq1, [j] key 8*j + 4*h + g
+            int sacc0[TK];
+            int sacc1[TK];
+#pragma unroll
+            for (int j = 0; j < TK; ++j) {
+                sacc0[j] = 0x4B400000;
+                sacc1[j] = 0x4B400000;
+            }
+#pragma unroll FDP4A_PV8_SC_U
+            for (int kc = 0; kc < D/16; ++kc) {
+                const int4 qa = *(const int4 *) &Q8s[jq0*QKS + kc*4];
+                const int4 qb = *(const int4 *) &Q8s[jq1*QKS + kc*4];
+#pragma unroll
+                for (int j = 0; j < TK; ++j) {
+                    const int4 k = *(const int4 *) &K8s[(8*j + 4*h + g)*QKS + kc*4];
+                    sacc0[j] = ggml_cuda_dp4a(qa.x, k.x, sacc0[j]);
+                    sacc0[j] = ggml_cuda_dp4a(qa.y, k.y, sacc0[j]);
+                    sacc0[j] = ggml_cuda_dp4a(qa.z, k.z, sacc0[j]);
+                    sacc0[j] = ggml_cuda_dp4a(qa.w, k.w, sacc0[j]);
+                    sacc1[j] = ggml_cuda_dp4a(qb.x, k.x, sacc1[j]);
+                    sacc1[j] = ggml_cuda_dp4a(qb.y, k.y, sacc1[j]);
+                    sacc1[j] = ggml_cuda_dp4a(qb.z, k.z, sacc1[j]);
+                    sacc1[j] = ggml_cuda_dp4a(qb.w, k.w, sacc1[j]);
+                }
+            }
 
-        __syncwarp(); // the warp's P.V reads of its numerators (previous iteration) are done before they are rewritten
-        if (flag_cur) {
-            const float m_new_x = __shfl_xor_sync(0xFFFFFFFF, m_new, 1, WARP_SIZE);
-            const float m_new0  = h ? m_new_x : m_new;
-            const float m_new1  = h ? m_new : m_new_x;
+            s_max0 = -FLT_MAX;
+            s_max1 = -FLT_MAX;
 #pragma unroll
             for (int j = 0; j < TK; ++j) {
                 const int t = 8*j + 4*h + g;
-                Ps[t*PS + jq0] = exp2f(s0[j] - m_new0);
-                Ps[t*PS + jq1] = exp2f(s1[j] - m_new1);
+                float x0 = -FLT_MAX; // a key past the end: exp2 gives 0
+                float x1 = -FLT_MAX;
+                if (k0 + t < k_max) {
+                    const float ks = Kss[t];
+                    x0 = (__int_as_float(sacc0[j]) - 12582912.0f) * (qs0*ks);
+                    x1 = (__int_as_float(sacc1[j]) - 12582912.0f) * (qs1*ks);
+                    if (use_mask) {
+                        x0 += slope*__half2float(maskh0[k0 + t]);
+                        x1 += slope*__half2float(maskh1[k0 + t]);
+                    }
+                }
+                s0[j]  = x0;
+                s1[j]  = x1;
+                s_max0 = fmaxf(s_max0, x0);
+                s_max1 = fmaxf(s_max1, x1);
             }
-            __syncwarp();
-            // the denominator of query jc over its keys 4*i + g in today's order (an F32 sum: the order matters)
-            float l_add = 0.0f;
-#pragma unroll
-            for (int i = 0; i < NB/4; ++i) {
-                l_add += Ps[(4*i + g)*PS + jc];
+            // the maxima of both tile queries over the 32 keys: over g (xor 8, 16), then over h (xor 1); fmaxf is
+            // order-free, so these are the maxima of before (two chains of 3 shuffles instead of one of 4)
+            s_max0 = fmaxf(s_max0, __shfl_xor_sync(0xFFFFFFFF, s_max0,  8, WARP_SIZE));
+            s_max1 = fmaxf(s_max1, __shfl_xor_sync(0xFFFFFFFF, s_max1,  8, WARP_SIZE));
+            s_max0 = fmaxf(s_max0, __shfl_xor_sync(0xFFFFFFFF, s_max0, 16, WARP_SIZE));
+            s_max1 = fmaxf(s_max1, __shfl_xor_sync(0xFFFFFFFF, s_max1, 16, WARP_SIZE));
+            s_max0 = fmaxf(s_max0, __shfl_xor_sync(0xFFFFFFFF, s_max0,  1, WARP_SIZE));
+            s_max1 = fmaxf(s_max1, __shfl_xor_sync(0xFFFFFFFF, s_max1,  1, WARP_SIZE));
+            s_max = h ? s_max1 : s_max0;                   // query jc
+
+            m_new = fmaxf(m_run, s_max + 3.0f);            // query jc
+            corr  = exp2f(m_run - m_new);
+            m_run = m_new;
+
+            __syncwarp(); // the warp's P.V reads of its numerators (previous iteration) are done before they are rewritten
+            if (flag_cur) {
+                break;                                     // an outlier block: its code follows the loop
             }
-            l_run = l_run*corr + l_add;
-        } else {
+
             // numerators relative to the block's largest: 0 .. 255 (an all-masked block: scale 0)
             // q = rint(255 e) as the low byte of the bits of 1.5*2^23 + 255 e (FFMA instead of FMUL + F2I, a
             // quarter-rate conversion on Pascal); a NaN of an all-masked block (byte 255) meets the scale 0.
@@ -801,63 +840,17 @@ static __global__ void flash_attn_tile_dp4a_pv8(
             if (g == 0) {
                 Pss[jc] = sc;
             }
-        }
 
-        if (!__all_sync(0xFFFFFFFF, corr == 1.0f)) {
-#pragma unroll
-            for (int cc = 0; cc < 8; ++cc) {
-                const float corr_cc = __shfl_sync(0xFFFFFFFF, corr, cc, WARP_SIZE);
-#pragma unroll
-                for (int d = 0; d < 4; ++d) {
-                    acc[cc][d] *= corr_cc;
-                }
-            }
-        }
+            rescale();
 
-        __syncthreads(); // all warps are done with K8s and with the previous value tile; the numerators are complete
-        if (flag_cur) {
-            // an outlier block: its values in F32 straight from V (rare: no prefetch)
-#pragma unroll
-            for (int m = 0; m < NB/FDP4A_NWARPS; ++m) {
-                const int t = k0 + w + FDP4A_NWARPS*m;
-                float vv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                if (t < nk) {
-                    fdp4a_load4((const TV *) (Vh + t*nbv1) + 4*lane, vv);
-                }
-                *(float4 *) &VA[(w + FDP4A_NWARPS*m)*D + 4*lane] = make_float4(vv[0], vv[1], vv[2], vv[3]);
-            }
-        } else {
+            __syncthreads(); // all warps are done with K8s and with the previous value tile; the numerators are complete
             *(int4 *) &V8s[4*tid] = v8reg;
             if (tid < D/4) {
                 *(float4 *) &Vscs[4*tid] = vsreg;
             }
-        }
-        if (k0 + NB < k_max) {
-            store_K();
-            load_V8(k0 + NB);
-        }
-        if (k0 + 2*NB < k_max) {
-            load_K(k0 + 2*NB);
-        }
-        __syncthreads();
+            stage_next();
+            __syncthreads();
 
-        if (flag_cur) {
-#pragma unroll FDP4A_PV8_F32_U
-            for (int t = 0; t < NB; ++t) {
-                const float4 v  = *(const float4 *) &VA[t*D + 4*lane];
-                const float4 p0 = *(const float4 *) &Ps[t*PS + 8*w + 0];
-                const float4 p1 = *(const float4 *) &Ps[t*PS + 8*w + 4];
-                const float p[8]  = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
-                const float vv[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-                for (int cc = 0; cc < 8; ++cc) {
-#pragma unroll
-                    for (int d = 0; d < 4; ++d) {
-                        acc[cc][d] += p[cc]*vv[d];
-                    }
-                }
-            }
-        } else {
             // per output 8 dp4a over the block's 32 keys into an int32 that starts at the bits of 1.5*2^23
             int isum[8][4];
 #pragma unroll
@@ -894,8 +887,64 @@ static __global__ void flash_attn_tile_dp4a_pv8(
                     acc[cc][d] = fmaf(ps[cc]*vsa[d], __int_as_float(isum[cc][d]) - 12582912.0f, acc[cc][d]);
                 }
             }
+            flag_cur = flag_next;
+        }
+        if (k0 >= k_max) {
+            break;
+        }
+
+        // an outlier block (k0): the F32 numerators and P.V
+        const float m_new_x = __shfl_xor_sync(0xFFFFFFFF, m_new, 1, WARP_SIZE);
+        const float m_new0  = h ? m_new_x : m_new;
+        const float m_new1  = h ? m_new : m_new_x;
+#pragma unroll
+        for (int j = 0; j < TK; ++j) {
+            const int t = 8*j + 4*h + g;
+            Ps[t*PS + jq0] = exp2f(s0[j] - m_new0);
+            Ps[t*PS + jq1] = exp2f(s1[j] - m_new1);
+        }
+        __syncwarp();
+        // the denominator of query jc over its keys 4*i + g in the 1 x 8 tile's order (an F32 sum: the order matters)
+        float l_add = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NB/4; ++i) {
+            l_add += Ps[(4*i + g)*PS + jc];
+        }
+        l_run = l_run*corr + l_add;
+
+        rescale();
+
+        __syncthreads(); // all warps are done with K8s and with the previous value tile; the numerators are complete
+        // its values in F32 straight from V (rare: no prefetch)
+#pragma unroll
+        for (int m = 0; m < NB/FDP4A_NWARPS; ++m) {
+            const int t = k0 + w + FDP4A_NWARPS*m;
+            float vv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (t < nk) {
+                fdp4a_load4((const TV *) (Vh + t*nbv1) + 4*lane, vv);
+            }
+            *(float4 *) &VA[(w + FDP4A_NWARPS*m)*D + 4*lane] = make_float4(vv[0], vv[1], vv[2], vv[3]);
+        }
+        stage_next();
+        __syncthreads();
+
+#pragma unroll FDP4A_PV8_F32_U
+        for (int t = 0; t < NB; ++t) {
+            const float4 v  = *(const float4 *) &VA[t*D + 4*lane];
+            const float4 p0 = *(const float4 *) &Ps[t*PS + 8*w + 0];
+            const float4 p1 = *(const float4 *) &Ps[t*PS + 8*w + 4];
+            const float p[8]  = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+            const float vv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int cc = 0; cc < 8; ++cc) {
+#pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    acc[cc][d] += p[cc]*vv[d];
+                }
+            }
         }
         flag_cur = flag_next;
+        k0 += NB;
     }
 
     l_run += __shfl_xor_sync(0xFFFFFFFF, l_run,  8, WARP_SIZE);
@@ -911,6 +960,15 @@ static __global__ void flash_attn_tile_dp4a_pv8(
                 make_float4(acc[cc][0]*inv, acc[cc][1]*inv, acc[cc][2]*inv, acc[cc][3]*inv);
         }
     }
+#ifdef FDP4A_BENCH_CLK
+    if (tid == 0) {
+        unsigned long long ns;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
+        unsigned long long * pc = fdp4a_bench_clk + 5*(int64_t(blockIdx.z)*gridDim.x + blockIdx.x);
+        pc[2] = clock64();
+        pc[3] = ns;
+    }
+#endif
 #else
     GGML_UNUSED_VARS(Q8, Qs, K8, Ks, V8, Vsc, Vflag, V, mask, KV_max, dst, nq, nq_pad, nk, nk_pad, nh, gqa_ratio,
         nbv1, nbv2, nbv3, stride_mask, stride_mask3, ne31, ne33, max_bias, m0, m1, n_head_log2);
