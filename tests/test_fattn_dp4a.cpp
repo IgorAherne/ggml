@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -80,7 +81,7 @@ int main(int argc, char ** argv) {
         nkh = atoi(argv[5]);
         argi = 6;
     }
-    bool use_mask = false, f32kv = false, exact = false, causal = false;
+    bool use_mask = false, f32kv = false, exact = false, causal = false, pvexact = false, emu = false;
     float scale_arg = 0.0f;
     double bias = 1.5;
     unsigned seed = 1234;
@@ -97,6 +98,15 @@ int main(int argc, char ** argv) {
             f32kv = true;
         } else if (a == "--causal") {
             use_mask = causal = true; // key s visible to query t if s <= t (fully masked key tiles: the KV_max path)
+        } else if (a == "--pvexact") {
+            // INT8-exact P.V as well: Q integer rows (|max| 127); all keys of a 32-key block identical (blocks 2j and
+            // 2j+1 opposite, a trailing partial block zero: key mean 0) so that every unmasked key of a block has the
+            // block's maximum score (numerator 255 exactly); a random 0 / -inf mask; V integers with |max| 127 in
+            // every (channel, block); every 9th block holds one key at 1/8 (an outlier block: the F32 path). The
+            // INT8 P.V kernel must then match the reference to F32 rounding. Use with --scale (e.g. 1e-4).
+            pvexact = use_mask = true;
+        } else if (a == "--emu") {
+            emu = true; // also compare with a CPU emulation of the INT8 P.V format (GGML_CUDA_FATTN_DP4A_PV=int8)
         } else if (a == "--exact") {
             exact = true; // integer Q / K rows with |max| = 127 and K pairs t, t + nk/2 of opposite sign (key mean 0):
                           // the INT8 rows are exact, the dp4a kernel must match the reference to F32 rounding
@@ -184,9 +194,52 @@ int main(int argc, char ** argv) {
             if (nk % 2) for (int d = 0; d < D; ++d) k[(size_t(h) * nk + nk - 1) * D + d] = 0.0f;
         }
     }
+    if (pvexact) {
+        std::uniform_int_distribution<int> ui(-60, 60), uv(-126, 126);
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        for (size_t r = 0; r < q.size() / D; ++r) {
+            for (int d = 0; d < D; ++d) q[r * D + d] = float(ui(rng));
+            q[r * D + (r % D)] = (r & 1) ? 127.0f : -127.0f;
+        }
+        const int nfull = (nk / 64) * 64; // pairs of full blocks; the rest zero keys
+        for (int h = 0; h < nkh * ns; ++h) {
+            std::vector<float> kb(D);
+            for (int t = 0; t < nk; ++t) {
+                const int b = t / 32;
+                if (t % 64 == 0 && t < nfull) {
+                    for (int d = 0; d < D; ++d) kb[d] = float(ui(rng));
+                    kb[(b / 2) % D] = 127.0f;
+                }
+                for (int d = 0; d < D; ++d) {
+                    k[(size_t(h) * nk + t) * D + d] = t >= nfull ? 0.0f : (b % 2 ? -kb[d] : kb[d]);
+                }
+            }
+        }
+        // V: [ns][nkh][nk][D] in v
+        for (int h = 0; h < nkh * ns; ++h) {
+            for (int t = 0; t < nk; ++t) {
+                for (int d = 0; d < D; ++d) v[(size_t(h) * nk + t) * D + d] = float(uv(rng));
+            }
+            for (int b0 = 0; b0 < nk; b0 += 32) {
+                const int nb = std::min(32, nk - b0);
+                for (int d = 0; d < D; ++d) v[(size_t(h) * nk + b0 + (d % nb)) * D + d] = (d & 1) ? -127.0f : 127.0f;
+                if ((b0 / 32) % 9 == 4) {
+                    for (int d = 0; d < D; ++d) v[(size_t(h) * nk + b0 + nb - 1) * D + d] *= 0.125f;
+                }
+            }
+        }
+    }
     // mask [nk, nq]: blocks of -inf, some ALiBi-like gradient
     std::vector<float> maskf;
-    if (use_mask) {
+    if (pvexact) {
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        maskf.resize(size_t(nq) * nk);
+        for (int t = 0; t < nq; ++t) {
+            for (int s2 = 0; s2 < nk; ++s2) {
+                maskf[size_t(t) * nk + s2] = (u01(rng) < 0.3f && s2 != t % nk) ? -INFINITY : 0.0f;
+            }
+        }
+    } else if (use_mask) {
         maskf.resize(size_t(nq) * nk);
         for (int t = 0; t < nq; ++t) {
             for (int s = 0; s < nk; ++s) {
@@ -310,6 +363,62 @@ int main(int argc, char ** argv) {
         quantize_groups(qsage[h], nq, 16);
     }
 
+    // CPU emulation of the dp4a kernel with the INT8 P.V (--emu): per-row INT8 Q (raw Q, scale x softmax scale x
+    // log2 e) and key-mean-smoothed K, numerators per 32-key block as rint(255 exp2(s - block max)), V INT8 per
+    // (channel, 32-key block), outlier blocks (a key's |V| max above ratio x / below 1/ratio x the mean over the keys)
+    // exact; the F32 roundings of the kernel's quantizers, the rest in F64.
+    const float ratio_env = getenv("GGML_CUDA_FATTN_DP4A_PV_RATIO") ? float(atof(getenv("GGML_CUDA_FATTN_DP4A_PV_RATIO"))) : 4.0f;
+    const char * pv_env = getenv("GGML_CUDA_FATTN_DP4A_PV");
+    const bool emu_all = pv_env && std::string(pv_env) == "int8-all";
+    const int nblk = (nk + 31) / 32;
+    std::vector<std::vector<float>> ek8(nkh * ns), eks(nkh * ns), ev8(nkh * ns), evs(nkh * ns);
+    std::vector<std::vector<char>> eflag(nkh * ns);
+    int n_flagged = 0;
+    if (emu) {
+        for (int h = 0; h < nkh * ns; ++h) {
+            std::vector<double> mean(D, 0.0);
+            for (int t = 0; t < nk; ++t) for (int d = 0; d < D; ++d) mean[d] += k[(size_t(h) * nk + t) * D + d];
+            ek8[h].resize(size_t(nk) * D); eks[h].resize(nk);
+            for (int t = 0; t < nk; ++t) {
+                float x[128], amax = 0.0f;
+                for (int d = 0; d < D; ++d) {
+                    x[d] = k[(size_t(h) * nk + t) * D + d] - float(mean[d] / nk);
+                    amax = std::max(amax, std::fabs(x[d]));
+                }
+                const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+                for (int d = 0; d < D; ++d) ek8[h][size_t(t) * D + d] = float(std::max(-127, std::min(127, int(std::nearbyint(x[d] * inv)))));
+                eks[h][t] = amax / 127.0f;
+            }
+            ev8[h].resize(size_t(nk) * D); evs[h].resize(size_t(nblk) * D); eflag[h].resize(nblk);
+            std::vector<float> tam(nk);
+            double tsum = 0.0;
+            for (int t = 0; t < nk; ++t) {
+                float a = 0.0f;
+                for (int d = 0; d < D; ++d) a = std::max(a, std::fabs(v[(size_t(h) * nk + t) * D + d]));
+                tam[t] = a;
+                tsum += a;
+            }
+            const float meanv = float(tsum / nk);
+            for (int b = 0; b < nblk; ++b) {
+                const int t0 = b * 32, t1 = std::min(nk, t0 + 32);
+                float mn = FLT_MAX, mx = 0.0f;
+                for (int t = t0; t < t1; ++t) { mn = std::min(mn, tam[t]); mx = std::max(mx, tam[t]); }
+                eflag[h][b] = !emu_all && (mx > ratio_env * meanv || mn * ratio_env < meanv);
+                n_flagged += eflag[h][b];
+                for (int d = 0; d < D; ++d) {
+                    float c = 0.0f;
+                    for (int t = t0; t < t1; ++t) c = std::max(c, std::fabs(v[(size_t(h) * nk + t) * D + d]));
+                    const float inv = c > 0.0f ? 127.0f / c : 0.0f;
+                    evs[h][size_t(b) * D + d] = c / 127.0f;
+                    for (int t = t0; t < t1; ++t) {
+                        ev8[h][size_t(t) * D + d] = float(std::max(-127, std::min(127, int(std::nearbyint(v[(size_t(h) * nk + t) * D + d] * inv)))));
+                    }
+                }
+            }
+        }
+    }
+    std::vector<double> rel_emu(jobs.size(), 0.0), rel_emu_ref(jobs.size(), 0.0);
+
     std::vector<double> rel_gpu(jobs.size()), rel_f16(jobs.size()), rel_sage(jobs.size()), abs_gpu(jobs.size());
     std::atomic<size_t> next{0};
     auto worker = [&]() {
@@ -366,6 +475,61 @@ int main(int argc, char ** argv) {
             ne = 0;
             for (int d = 0; d < D; ++d) ne += (alt[d] - ref[d]) * (alt[d] - ref[d]);
             rel_sage[j] = std::sqrt(ne / nr);
+            if (emu) {
+                // Q row as the kernel quantizes it
+                float qx[128], qam = 0.0f;
+                for (int d = 0; d < D; ++d) { qx[d] = q[(size_t(H) * nq + t) * D + d]; qam = std::max(qam, std::fabs(qx[d])); }
+                const float qinv = qam > 0.0f ? 127.0f / qam : 0.0f;
+                const float qsc  = qam / 127.0f * (scale * 1.4426950408889634f);
+                int qi[128];
+                for (int d = 0; d < D; ++d) qi[d] = std::max(-127, std::min(127, int(std::nearbyint(qx[d] * qinv))));
+                const float slope2 = float(slope_h) * 1.4426950408889634f;
+                for (int u = 0; u < nk; ++u) {
+                    int dot = 0;
+                    for (int d = 0; d < D; ++d) dot += qi[d] * int(ek8[kh][size_t(u) * D + d]);
+                    float x = float(dot) * (qsc * eks[kh][u]);
+                    if (use_mask) x += slope2 * maskf[size_t(t) * nk + u];
+                    s[u] = x;
+                }
+                double M = -INFINITY;
+                for (int u = 0; u < nk; ++u) M = std::max(M, s[u]);
+                std::vector<double> num(D, 0.0), bsum(D);
+                double den = 0.0;
+                for (int bb = 0; bb < nblk; ++bb) {
+                    const int t0 = bb * 32, t1 = std::min(nk, t0 + 32);
+                    double smax = -INFINITY;
+                    for (int u = t0; u < t1; ++u) smax = std::max(smax, s[u]);
+                    if (std::isinf(smax)) continue;
+                    if (eflag[kh][bb]) {
+                        for (int u = t0; u < t1; ++u) {
+                            const double pu = std::exp2(s[u] - M);
+                            den += pu;
+                            for (int d = 0; d < D; ++d) num[d] += pu * v[(size_t(kh) * nk + u) * D + d];
+                        }
+                    } else {
+                        const double sc = std::exp2(smax - M) / 255.0;
+                        double qsum = 0.0;
+                        std::fill(bsum.begin(), bsum.end(), 0.0);
+                        for (int u = t0; u < t1; ++u) {
+                            const double qu = std::nearbyint(255.0 * std::exp2(s[u] - smax));
+                            qsum += qu;
+                            for (int d = 0; d < D; ++d) bsum[d] += qu * ev8[kh][size_t(u) * D + d];
+                        }
+                        den += sc * qsum;
+                        for (int d = 0; d < D; ++d) num[d] += sc * evs[kh][size_t(bb) * D + d] * bsum[d];
+                    }
+                }
+                double ne2 = 0, nr2 = 0, ne3 = 0;
+                for (int d = 0; d < D; ++d) {
+                    const double e = num[d] / den;
+                    const double g = res[((size_t(b) * nq + t) * nh + h) * D + d];
+                    ne2 += (g - e) * (g - e);
+                    nr2 += e * e;
+                    ne3 += (e - ref[d]) * (e - ref[d]);
+                }
+                rel_emu[j]     = std::sqrt(ne2 / nr2);
+                rel_emu_ref[j] = std::sqrt(ne3 / nr);
+            }
         }
     };
     std::vector<std::thread> threads;
@@ -383,6 +547,13 @@ int main(int argc, char ** argv) {
         g.max_rel, g.p99_rel, g.median_rel, g.max_abs, n_nonfinite);
     std::printf("  CPU Q,K as F16   : rel L2 per row  max %.3e  p99 %.3e  median %.3e\n", f.max_rel, f.p99_rel, f.median_rel);
     std::printf("  CPU sage-style   : rel L2 per row  max %.3e  p99 %.3e  median %.3e\n", sg.max_rel, sg.p99_rel, sg.median_rel);
+    if (emu) {
+        const Stats ge = summarize(rel_emu, 0.0);
+        const Stats er = summarize(rel_emu_ref, 0.0);
+        std::printf("  GPU vs PV8 emu   : rel L2 per row  max %.3e  p99 %.3e  median %.3e   (outlier blocks %d of %d)\n",
+            ge.max_rel, ge.p99_rel, ge.median_rel, n_flagged, nblk * nkh * ns);
+        std::printf("  PV8 emu vs F64   : rel L2 per row  max %.3e  p99 %.3e  median %.3e\n", er.max_rel, er.p99_rel, er.median_rel);
+    }
     ok = ok && n_nonfinite == 0;
     ggml_gallocr_free(alloc);
     ggml_free(ctx);
