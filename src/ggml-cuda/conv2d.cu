@@ -290,6 +290,299 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     }
 }
 
+// Spellcast3D: the F32 implicit GEMM for NVIDIA cards before Volta (the GTX 10xx), in place of the SIMT branch above
+// (which stays for MooreThreads). Its output is bit-identical to that branch's: the same F16 operands converted to F32
+// exactly, one F32 accumulator per output, `c += a * b` (one FFMA under -use_fast_math, as there) for every k of the
+// split in increasing order, starting from 0. What differs is only data movement and tiling:
+//   - a block computes TM*16 output channels x 128 positions (TM = 9: 144 channels, a divisor of the Wan VAE's 144 ..
+//     1152, 3456), a thread TM channels x 8 positions, reading its operands of one k with four 16-byte shared loads
+//     (and one 4-byte load for the 9th channel); 2 blocks of 256 threads a SM;
+//   - the weights are transposed once per call into k rows of the block's channels (conv2d_simt_weights), so that a k
+//     tile of them is one contiguous copy;
+//   - the operands are converted F16 -> F32 when a k tile is staged into shared memory (global -> registers before the
+//     current tile's math, registers -> the other shared buffer after it, one barrier per tile; no cp.async on Pascal);
+//   - the input tile is gathered per k row (any shape), read as rows of 4 values (1x1, stride 1), or, for 3x3 / stride 1
+//     maps whose width is a multiple of 64, staged a channel (9 k) at a time from the 3 input rows of each 64-position
+//     run: every input value is loaded and converted once and stored at its 3 kx shifts.
+// The reference zero-pads its last 64-wide k tile: those products are 0 * 0 and leave every sum as it is, except that
+// they turn a -0 (a negative sum flushed to zero by FTZ) into +0; the epilogue repeats that when the split's 64-wide
+// range ends past k_total. The split_k policy and conv2d_reduce_split_k are unchanged.
+enum conv2d_simt_mode {
+    CONV2D_SIMT_GATHER = 0,  // any shape: per k row, one 16-bit load per position (k tiles of 8)
+    CONV2D_SIMT_ROWS   = 1,  // 1x1, stride 1, no padding, maps of whole 128-position tiles (k tiles of 8)
+    CONV2D_SIMT_SEG3   = 2,  // 3x3, stride 1, dilation 1, width % 64 == 0, whole tiles, split_k == 1 (k tiles of 9)
+    CONV2D_SIMT_NARROW = 3,  // <= 8 output channels, 3x3, stride 1, dilation 1, width % 8 == 0, split_k == 1
+    CONV2D_SIMT_64     = 4,  // other shapes with <= 16 output channels: the 64x64 kernel itself (wastes less of a tile)
+};
+
+// Thread row ty (0..15) owns the block's channels 8 ty .. 8 ty + 7 and, for TM 9, 128 + ty: a k row of the weight tile
+// is the block's BM channels in order, read by a thread as two 16-byte pieces and (TM 9) one value.
+template <int TM> struct conv2d_simt_tile {
+    static_assert(TM == 8 || TM == 9, "8 or 9 channels a thread");
+    static constexpr int THR_M = 16, THR_N = 16;  // the thread grid
+    static constexpr int TN    = 8;               // positions per thread: two groups of 4, 64 apart
+    static constexpr int BM = TM * THR_M, BN = TN * THR_N;
+};
+
+// The weights transposed: [M tile][k < k_pad][BM channels], zero outside OC x k_total. A block transposes the BM
+// channels x 32 k of one M tile through shared memory (grid: k_pad / 32 x M tiles).
+template <int TM>
+static __global__ void __launch_bounds__(256) conv2d_simt_weights(const half * __restrict__ w,
+                                                                 half * __restrict__ wt,
+                                                                 const int oc,
+                                                                 const int k_total,
+                                                                 const int k_pad) {
+    static constexpr int BM = conv2d_simt_tile<TM>::BM, KT = 32;
+    __shared__ half      t[BM][KT + 2];
+    const int            mt = blockIdx.y, k0 = blockIdx.x * KT;
+    for (int e = threadIdx.x; e < BM * KT; e += blockDim.x) {
+        const int c = e / KT, kk = e - c * KT, co = mt * BM + c, k = k0 + kk;
+        t[c][kk]    = co < oc && k < k_total ? w[int64_t(co) * k_total + k] : __float2half(0.0f);
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < BM * KT; e += blockDim.x) {
+        const int kk = e / BM, c = e - kk * BM;
+        if (k0 + kk < k_pad) {
+            wt[(int64_t(mt) * k_pad + k0 + kk) * BM + c] = t[c][kk];
+        }
+    }
+}
+
+// An empty asm that takes the value, so that the load producing it stays before the math: left alone, the compiler sinks
+// the next tile's loads to their use after the math and their latency shows (GTX 1070: 4.7 -> 5.1 TFLOPS with this).
+static __device__ __forceinline__ void conv2d_simt_issue(const uint32_t v) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    asm volatile("" ::"r"(v));
+#else
+    GGML_UNUSED(v);
+#endif
+}
+
+template <int KW, int KH, int TM, int MODE>
+static __global__ void __launch_bounds__(256, 2) conv2d_implicit_gemm_simt_f32(const half * __restrict__ input,
+                                                                              const half * __restrict__ wt,
+                                                                              float * __restrict__ output,
+                                                                              const conv_params P,
+                                                                              const int         split_k,
+                                                                              const int         k_pad) {
+    using T                       = conv2d_simt_tile<TM>;
+    static constexpr int nthreads = 256, nwarps = 8;
+    static constexpr int BM = T::BM, BN = T::BN, TN = T::TN;
+    static constexpr int BK        = MODE == CONV2D_SIMT_SEG3 ? 9 : 8;
+    static constexpr int A_VEC     = BK * BM / 8;  // 8-value (16-byte) pieces of a weight tile
+    static constexpr int A_PER     = (A_VEC + nthreads - 1) / nthreads;
+    static_assert(A_PER == 1, "a thread stages one 16-byte piece of the weight tile");
+    static constexpr int A_S       = A_PER * 8 * nthreads;  // >= BK * BM: every thread stores its pieces (no branch)
+    static constexpr int SEG_WORDS = 2 * 3 * 33;            // SEG3: 2 runs of 64 positions x 3 input rows x 66 values
+    // A k row of the input tile: the two runs of 64 positions with 4 guard values on each side (SEG3 stores the values
+    // that fall off a run there instead of branching): position p at 4 + p + 8 (p / 64).
+    static constexpr int BS = 2 * (64 + 8);
+    static_assert(BN == 4 * 32 && nwarps == 8 && BK % 8 == (MODE == CONV2D_SIMT_SEG3 ? 1 : 0), "tile layout");
+    static_assert(MODE != CONV2D_SIMT_SEG3 || (KW == 3 && KH == 3), "SEG3 is 3x3 only");
+    __shared__ __align__(16) float a_s[2][A_S];
+    __shared__ __align__(16) float b_s[2][BK * BS];
+    __shared__ int                 pos_s[MODE == CONV2D_SIMT_GATHER ? BN : 1];
+
+    const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
+    const int iw = int(P.IW), ih = int(P.IH), ow = int(P.OW), oh = int(P.OH);
+    const int kw = KW ? KW : int(P.KW), kh = KH ? KH : int(P.KH);
+    const int ic = int(P.IC), oc = int(P.OC);
+    const int sx = int(P.ST_X), sy = int(P.ST_Y);
+    const int dx = int(P.DL_X), dy = int(P.DL_Y);
+    const int n = blockIdx.z / split_k, split = blockIdx.z % split_k;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int k_total = ic * kw * kh, npos = ow * oh, ihw = ih * iw;
+
+    // The reference's split of k: 64-wide tiles, `begin` and `end` multiples of 64; `end` may pass k_total.
+    const int tiles = (k_total + 63) / 64;
+    const int begin = int(int64_t(tiles) * split / split_k) * 64;
+    const int end   = int(int64_t(tiles) * (split + 1) / split_k) * 64;
+    const int kend  = min(end, k_total);
+
+    const half * in_n = input + int64_t(n) * ic * ihw;
+
+    // B staging, per mode. GATHER: the block's positions, clamped to the map (the extra columns are computed, never
+    // stored). SEG3: thread t < SEG_WORDS loads the 32-bit word wd of input row ky of run r (the map row of positions
+    // n0 + 64 r .. +63 and the two below it), values 2 wd and 2 wd + 1, and stores value e at its 3 kx shifts, position
+    // 64 r + e - kx of k row ky*3 + kx (in a guard when e - kx is -1 or 64); the threads past SEG_WORDS repeat the last
+    // word's loads and stores (same values, same places).
+    const half * b_p     = MODE == CONV2D_SIMT_ROWS ? in_n + n0 + 4 * lane : in_n;
+    int          seg_dst = 0;
+    if (MODE == CONV2D_SIMT_GATHER && tid < BN) {
+        const int s = min(n0 + tid, npos - 1);
+        const int y = s / ow, x = s - y * ow;
+        pos_s[tid]  = y * sy * iw + x * sx;
+    }
+    if (MODE == CONV2D_SIMT_SEG3) {
+        const int t = min(tid, SEG_WORDS - 1);
+        const int r = t / 99, ky = t % 99 / 33, wd = t % 33;
+        const int s = n0 + 64 * r, y = s / ow, x = s - y * ow;
+        b_p     = in_n + (y + ky) * iw + x + 2 * wd;
+        seg_dst = ky * 3 * BS + 4 + 72 * r + 2 * wd;
+    }
+
+    // The loads of a tile go to registers unconditionally (the threads past A_VEC load a piece again and store it past
+    // the tile): a load whose use is conditional is sunk by the compiler to that use, after the math.
+    int4     ra[A_PER];
+    half     rb[4];
+    uint2    rv;
+    uint32_t rs;
+    // a_t: the thread's piece of the tile's weights; b_t: SEG3 the thread's input word, ROWS the warp's k row's offset
+    // from b_p
+    auto     load_tile = [&](const int k0, const int4 * a_t, const half * b_t_seg, const int b_t) {
+#pragma unroll
+        for (int r = 0; r < A_PER; ++r) {
+            ra[r] = a_t[0];
+            conv2d_simt_issue(ra[r].x);
+            conv2d_simt_issue(ra[r].y);
+            conv2d_simt_issue(ra[r].z);
+            conv2d_simt_issue(ra[r].w);
+        }
+        if (MODE == CONV2D_SIMT_GATHER) {
+            const int    ki = k0 + warp;
+            const int    ci = ki / (kw * kh), kr = ki - ci * (kw * kh), ky = kr / kw, kx = kr - ky * kw;
+            const bool   ok   = ki < k_total;
+            const half * src  = in_n + (ok ? ci * ihw + ky * dy * iw + kx * dx : 0);
+            const half   zero = __float2half(0.0f);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const half v = src[pos_s[lane + 32 * j]];
+                conv2d_simt_issue(__half_as_ushort(v));
+                rb[j] = ok ? v : zero;
+            }
+        } else if (MODE == CONV2D_SIMT_ROWS) {
+            const bool  ok = k0 + warp < k_total;
+            const uint2 v  = *(const uint2 *) (b_p + (ok ? b_t : 0));
+            conv2d_simt_issue(v.x);
+            conv2d_simt_issue(v.y);
+            rv = ok ? v : make_uint2(0, 0);
+        } else {
+            rs = *(const uint32_t *) b_t_seg;
+            conv2d_simt_issue(rs);
+        }
+    };
+    auto store_tile = [&](const int buf) {
+#pragma unroll
+        for (int r = 0; r < A_PER; ++r) {
+            const half2 * h = (const half2 *) &ra[r];
+            float4 *      d = (float4 *) &a_s[buf][8 * (tid + nthreads * r)];
+            d[0]            = make_float4(__low2float(h[0]), __high2float(h[0]), __low2float(h[1]), __high2float(h[1]));
+            d[1]            = make_float4(__low2float(h[2]), __high2float(h[2]), __low2float(h[3]), __high2float(h[3]));
+        }
+        if (MODE == CONV2D_SIMT_GATHER) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                b_s[buf][warp * BS + 4 + 8 * (j / 2) + lane + 32 * j] = __half2float(rb[j]);
+            }
+        } else if (MODE == CONV2D_SIMT_ROWS) {
+            const half2 lo = *(const half2 *) &rv.x, hi = *(const half2 *) &rv.y;
+            *(float4 *) &b_s[buf][warp * BS + 4 + 8 * (lane / 16) + 4 * lane] =
+                make_float4(__low2float(lo), __high2float(lo), __low2float(hi), __high2float(hi));
+        } else {
+            const half2 h  = *(const half2 *) &rs;
+            const float e0 = __low2float(h), e1 = __high2float(h);
+            float *     d  = &b_s[buf][seg_dst];
+#pragma unroll
+            for (int kx = 0; kx < 3; ++kx) {
+                d[kx * (BS - 1)]     = e0;
+                d[kx * (BS - 1) + 1] = e1;
+            }
+        }
+    };
+
+    // The math: warp w covers thread rows 4 (w / 2) .. +3 and thread columns 8 (w % 2) .. +7.
+    const int ty = warp / 2 * 4 + lane / 8, tx = warp % 2 * 8 + lane % 8;
+    float     acc[TM][TN] = {};
+    int       cur         = 0;
+    if (MODE == CONV2D_SIMT_GATHER) {
+        __syncthreads();  // pos_s
+    }
+    const int    b_step = MODE == CONV2D_SIMT_ROWS ? BK * ihw : 0;
+    const int4 * a_t    = (const int4 *) (wt + (int64_t(blockIdx.y) * k_pad + begin) * BM) + min(tid, A_VEC - 1);
+    const half * b_t_seg = b_p + begin / 9 * ihw;
+    int          b_t     = MODE == CONV2D_SIMT_ROWS ? (begin + warp) * ihw : 0;
+    if (begin < kend) {
+        load_tile(begin, a_t, b_t_seg, b_t);
+        store_tile(0);
+    }
+    __syncthreads();
+    for (int k0 = begin; k0 < kend; k0 += BK) {
+        // the next tile (the last tile again at the end)
+        const bool more = k0 + BK < kend;
+        a_t             = more ? a_t + A_VEC : a_t;
+        b_t_seg         = more ? b_t_seg + ihw : b_t_seg;
+        b_t             = more ? b_t + b_step : b_t;
+        load_tile(more ? k0 + BK : k0, a_t, b_t_seg, b_t);
+        const float * a_k = &a_s[cur][8 * ty];
+        const float * b_k = &b_s[cur][4 + 4 * tx];
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a[TM], b[TN];
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const float4 v = *(const float4 *) &a_k[k * BM + 4 * g];
+                a[4 * g] = v.x, a[4 * g + 1] = v.y, a[4 * g + 2] = v.z, a[4 * g + 3] = v.w;
+            }
+            if (TM == 9) {
+                a[TM - 1] = a_s[cur][k * BM + 128 + ty];
+            }
+#pragma unroll
+            for (int g = 0; g < 2; ++g) {
+                const float4 v = *(const float4 *) &b_k[k * BS + g * (BS / 2)];
+                b[4 * g] = v.x, b[4 * g + 1] = v.y, b[4 * g + 2] = v.z, b[4 * g + 3] = v.w;
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += a[i] * b[j];
+                }
+            }
+        }
+        store_tile(cur ^ 1);
+        __syncthreads();
+        cur ^= 1;
+    }
+
+    if (end > k_total) {
+        // The reference's 0 * 0 products past k_total: -0 -> +0, every other value unchanged.
+#pragma unroll
+        for (int i = 0; i < TM; ++i) {
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                acc[i][j] = __int_as_float(__float_as_int(acc[i][j]) == int(0x80000000) ? 0 : __float_as_int(acc[i][j]));
+            }
+        }
+    }
+    float *    out_z = output + int64_t(blockIdx.z) * oc * npos;
+    const bool o_vec = npos % 4 == 0 && uintptr_t(output) % 16 == 0;
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int co = m0 + (i < 8 ? 8 * ty + i : 128 + ty);
+        if (co >= oc) {
+            continue;
+        }
+        float * o_row = out_z + int64_t(co) * npos;
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const int p = n0 + g * (BN / 2) + tx * 4;
+            if (o_vec) {
+                if (p < npos) {
+                    *(float4 *) &o_row[p] =
+                        make_float4(acc[i][4 * g], acc[i][4 * g + 1], acc[i][4 * g + 2], acc[i][4 * g + 3]);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (p + j < npos) {
+                        o_row[p + j] = acc[i][4 * g + j];
+                    }
+                }
+            }
+        }
+    }
+}
+
 static __global__ void conv2d_reduce_split_k(const float * __restrict__ partial,
                                              float * __restrict__ output,
                                              const int total,
@@ -326,6 +619,213 @@ static void conv2d_launch_implicit_gemm(const half *        input,
     }
 }
 
+// Few output channels (the Wan VAE's last conv: 4), 3x3, stride 1, dilation 1, split_k == 1: a thread computes OCB
+// channels x PT consecutive positions of one map row. Per input channel and kernel row it converts the PT + 2 input
+// values once and runs the 3 kx shifts over them; the weights (F32, [k][OCB]) sit in shared memory. Every output is the
+// same FFMA chain over k = (ci, ky, kx) in order as in the 64x64 kernel, and its -0 -> +0 at the end (see above).
+// EVEN: the rows start at even halves (even padded width and map size), loaded as 32-bit words.
+template <int OCB, int PT, bool EVEN>
+static __global__ void __launch_bounds__(128) conv2d_simt_narrow3x3(const half * __restrict__ input,
+                                                                    const half * __restrict__ weight,
+                                                                    float * __restrict__ output,
+                                                                    const conv_params P) {
+    extern __shared__ float w_s[];  // [k_total][OCB]
+    const int iw = int(P.IW), ih = int(P.IH), ow = int(P.OW), oh = int(P.OH);
+    const int ic = int(P.IC), oc = int(P.OC);
+    const int k_total = ic * 9, npos = ow * oh, ihw = ih * iw;
+    for (int i = threadIdx.x; i < k_total * OCB; i += blockDim.x) {
+        const int k = i / OCB, o = i - k * OCB;
+        w_s[i]      = o < oc ? __half2float(weight[int64_t(o) * k_total + k]) : 0.0f;
+    }
+    __syncthreads();
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g * PT >= npos) {
+        return;
+    }
+    const int    n = blockIdx.z, p0 = g * PT, y = p0 / ow, x = p0 - y * ow;
+    const half * src = input + int64_t(n) * ic * ihw + y * iw + x;
+    float        acc[OCB][PT] = {};
+    for (int ci = 0; ci < ic; ++ci) {
+#pragma unroll
+        for (int ky = 0; ky < 3; ++ky) {
+            const half * r = src + ci * ihw + ky * iw;
+            float        v[PT + 2];
+            if (EVEN) {
+#pragma unroll
+                for (int e = 0; e < PT + 2; e += 2) {
+                    const half2 h = *(const half2 *) (r + e);
+                    v[e]          = __low2float(h);
+                    v[e + 1]      = __high2float(h);
+                }
+            } else {
+#pragma unroll
+                for (int e = 0; e < PT + 2; ++e) {
+                    v[e] = __half2float(r[e]);
+                }
+            }
+            const float * wk = &w_s[(ci * 9 + ky * 3) * OCB];
+#pragma unroll
+            for (int kx = 0; kx < 3; ++kx) {
+                float wv[OCB];
+#pragma unroll
+                for (int o = 0; o < OCB; o += 4) {
+                    const float4 t = *(const float4 *) &wk[kx * OCB + o];
+                    wv[o] = t.x, wv[o + 1] = t.y, wv[o + 2] = t.z, wv[o + 3] = t.w;
+                }
+#pragma unroll
+                for (int o = 0; o < OCB; ++o) {
+#pragma unroll
+                    for (int j = 0; j < PT; ++j) {
+                        acc[o][j] += wv[o] * v[j + kx];
+                    }
+                }
+            }
+        }
+    }
+    const bool tail = k_total % 64 != 0;  // the reference's last 64-wide tile ends past k_total
+#pragma unroll
+    for (int o = 0; o < OCB; ++o) {
+        if (o >= oc) {
+            continue;
+        }
+        float * out = output + (int64_t(n) * oc + o) * npos + p0;
+#pragma unroll
+        for (int j = 0; j < PT; j += 4) {
+            float4 t;
+            t.x = acc[o][j], t.y = acc[o][j + 1], t.z = acc[o][j + 2], t.w = acc[o][j + 3];
+            if (tail) {
+                t.x = __int_as_float(__float_as_int(t.x) == int(0x80000000) ? 0 : __float_as_int(t.x));
+                t.y = __int_as_float(__float_as_int(t.y) == int(0x80000000) ? 0 : __float_as_int(t.y));
+                t.z = __int_as_float(__float_as_int(t.z) == int(0x80000000) ? 0 : __float_as_int(t.z));
+                t.w = __int_as_float(__float_as_int(t.w) == int(0x80000000) ? 0 : __float_as_int(t.w));
+            }
+            *(float4 *) &out[j] = t;
+        }
+    }
+}
+
+struct conv2d_simt_plan {
+    int     tm;        // channels a thread: 9 (144 a block) or 8 (128)
+    int     mode;      // conv2d_simt_mode
+    int     k_pad;     // k_total rounded up to the mode's k tile
+    int64_t wt_elems;  // the transposed weights (conv2d_simt_weights), halves
+};
+
+// P: the padded parameters (padding 0, IW/IH the padded input).
+static conv2d_simt_plan conv2d_simt_f32_plan(const conv_params & P,
+                                             const int           split_k,
+                                             const void *        input,
+                                             const void *        output) {
+    conv2d_simt_plan plan;
+    // 144 channels a block (the Wan VAE's channel counts are multiples of 144), 128 when that wastes less.
+    const int64_t    pad144 = (P.OC + 143) / 144 * 144 - P.OC, pad128 = (P.OC + 127) / 128 * 128 - P.OC;
+    plan.tm                 = pad128 * 144 < pad144 * 128 ? 8 : 9;
+    const int64_t npos      = P.OW * P.OH;
+    const bool    s1        = P.ST_X == 1 && P.ST_Y == 1;
+    const bool    s3        = P.KW == 3 && P.KH == 3 && s1 && P.DL_X == 1 && P.DL_Y == 1 && split_k == 1;
+    if (s3 && P.OC <= 8 && P.OW % 8 == 0 && P.IC * 9 * 8 * 4 <= 48 * 1024 && uintptr_t(output) % 16 == 0) {
+        plan.mode = CONV2D_SIMT_NARROW;
+    } else if (s3 && P.OW % 64 == 0 && npos % 128 == 0 && P.IW % 2 == 0 && uintptr_t(input) % 4 == 0) {
+        plan.mode = CONV2D_SIMT_SEG3;
+    } else if (P.KW == 1 && P.KH == 1 && s1 && P.IW == P.OW && P.IH == P.OH && npos % 128 == 0 &&
+               uintptr_t(input) % 8 == 0) {
+        plan.mode = CONV2D_SIMT_ROWS;
+    } else if (P.OC <= 16) {
+        plan.mode = CONV2D_SIMT_64;
+    } else {
+        plan.mode = CONV2D_SIMT_GATHER;
+    }
+    const int bk      = plan.mode == CONV2D_SIMT_SEG3 ? 9 : 8;
+    const int k_total = int(P.IC * P.KW * P.KH);
+    plan.k_pad        = (k_total + bk - 1) / bk * bk;
+    const int bm      = 16 * plan.tm;
+    plan.wt_elems     = plan.mode == CONV2D_SIMT_NARROW || plan.mode == CONV2D_SIMT_64 ? 0 :
+                                                                                 (P.OC + bm - 1) / bm * plan.k_pad * bm;
+    return plan;
+}
+
+template <int TM>
+static void conv2d_simt_f32_tm(const half *             input,
+                                const half *             weight,
+                                half *                   wt,
+                                float *                  output,
+                                const conv_params &      P,
+                                const int                split_k,
+                                const conv2d_simt_plan & plan,
+                                cudaStream_t             st) {
+    using T = conv2d_simt_tile<TM>;
+    conv2d_simt_weights<TM><<<dim3(unsigned((plan.k_pad + 31) / 32), unsigned((P.OC + T::BM - 1) / T::BM)), 256, 0, st>>>(
+        weight, wt, int(P.OC), int(P.IC * P.KW * P.KH), plan.k_pad);
+    const dim3 grid(unsigned((P.OW * P.OH + T::BN - 1) / T::BN), unsigned((P.OC + T::BM - 1) / T::BM),
+                    unsigned(P.B * split_k));
+    if (plan.mode == CONV2D_SIMT_SEG3) {
+        conv2d_implicit_gemm_simt_f32<3, 3, TM, CONV2D_SIMT_SEG3>
+            <<<grid, 256, 0, st>>>(input, wt, output, P, split_k, plan.k_pad);
+    } else if (plan.mode == CONV2D_SIMT_ROWS) {
+        conv2d_implicit_gemm_simt_f32<1, 1, TM, CONV2D_SIMT_ROWS>
+            <<<grid, 256, 0, st>>>(input, wt, output, P, split_k, plan.k_pad);
+    } else if (P.KW == 3 && P.KH == 3) {
+        conv2d_implicit_gemm_simt_f32<3, 3, TM, CONV2D_SIMT_GATHER>
+            <<<grid, 256, 0, st>>>(input, wt, output, P, split_k, plan.k_pad);
+    } else if (P.KW == 1 && P.KH == 1) {
+        conv2d_implicit_gemm_simt_f32<1, 1, TM, CONV2D_SIMT_GATHER>
+            <<<grid, 256, 0, st>>>(input, wt, output, P, split_k, plan.k_pad);
+    } else {
+        conv2d_implicit_gemm_simt_f32<0, 0, TM, CONV2D_SIMT_GATHER>
+            <<<grid, 256, 0, st>>>(input, wt, output, P, split_k, plan.k_pad);
+    }
+}
+
+// wt: plan.wt_elems halves of scratch.
+static void conv2d_simt_f32(const half *             input,
+                            const half *             weight,
+                            half *                   wt,
+                            float *                  output,
+                            const conv_params &      P,
+                            const int                split_k,
+                            const conv2d_simt_plan & plan,
+                            cudaStream_t             st) {
+    if (plan.mode == CONV2D_SIMT_64) {
+        const dim3 grid(unsigned((P.OW * P.OH + 63) / 64), unsigned((P.OC + 63) / 64), unsigned(P.B * split_k));
+        conv2d_launch_implicit_gemm<false>(input, weight, output, P, split_k, grid, dim3(32, 4), st);
+        return;
+    }
+    if (plan.mode == CONV2D_SIMT_NARROW) {
+        const int64_t npos = P.OW * P.OH;
+        const bool    even = P.IW % 2 == 0 && P.IH * P.IW % 2 == 0 && uintptr_t(input) % 4 == 0;
+        const size_t  smem = size_t(P.IC * 9) * (P.OC <= 4 ? 4 : 8) * sizeof(float);
+        if (P.OC <= 4 && P.OW % 16 == 0) {
+            const dim3 grid(unsigned((npos / 16 + 127) / 128), 1, unsigned(P.B));
+            if (even) {
+                conv2d_simt_narrow3x3<4, 16, true><<<grid, 128, smem, st>>>(input, weight, output, P);
+            } else {
+                conv2d_simt_narrow3x3<4, 16, false><<<grid, 128, smem, st>>>(input, weight, output, P);
+            }
+        } else {
+            const dim3 grid(unsigned((npos / 8 + 127) / 128), 1, unsigned(P.B));
+            if (P.OC <= 4) {
+                if (even) {
+                    conv2d_simt_narrow3x3<4, 8, true><<<grid, 128, smem, st>>>(input, weight, output, P);
+                } else {
+                    conv2d_simt_narrow3x3<4, 8, false><<<grid, 128, smem, st>>>(input, weight, output, P);
+                }
+            } else if (even) {
+                conv2d_simt_narrow3x3<8, 8, true><<<grid, 128, smem, st>>>(input, weight, output, P);
+            } else {
+                conv2d_simt_narrow3x3<8, 8, false><<<grid, 128, smem, st>>>(input, weight, output, P);
+            }
+        }
+        return;
+    }
+    if (plan.tm == 8) {
+        conv2d_simt_f32_tm<8>(input, weight, wt, output, P, split_k, plan, st);
+    } else {
+        conv2d_simt_f32_tm<9>(input, weight, wt, output, P, split_k, plan, st);
+    }
+}
+
+// Test programs (ggml/w8a8-tools/test_conv_simt.cu) include this file for its kernels alone.
+#ifndef GGML_CUDA_CONV2D_KERNELS_ONLY
 static void conv2d_cuda_f16(const float * X_D, const half * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
     conv2d_cuda<half>(X_D, K_D, Y_D, P, st);
 }
@@ -437,9 +937,19 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         float *                     result = split_k == 1 ? Y_D : partial.alloc(total * split_k);
         const dim3                  block(device.warp_size, 4);
         const dim3 grid(unsigned((OW * OH + 63) / 64), unsigned((OC + 63) / 64), unsigned(B * split_k));
+        // Spellcast3D: GGML_CUDA_CONV2D_PASCAL=0 takes the GTX 10xx back to the SIMT branch of the 64x64 kernel (the
+        // same output bit for bit; GTX 1070, the Wan VAE decode of a 1024x1024 picture: its convolutions 6.3 -> 3.4 s).
+        static const bool simt_pascal = [] {
+            const char * e = getenv("GGML_CUDA_CONV2D_PASCAL");
+            return e == nullptr || atoi(e) != 0;
+        }();
         if (use_mma) {
             conv2d_launch_implicit_gemm<true>(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid,
                                               block, st);
+        } else if (simt_pascal && GGML_CUDA_CC_IS_NVIDIA(device.cc)) {
+            const conv2d_simt_plan     plan = conv2d_simt_f32_plan(padded_params, split_k, x_half.get(), result);
+            ggml_cuda_pool_alloc<half> wt(ctx.pool(), std::max(plan.wt_elems, int64_t(1)));
+            conv2d_simt_f32(x_half.get(), (const half *) K_D, wt.get(), result, padded_params, split_k, plan, st);
         } else {
             conv2d_launch_implicit_gemm<false>(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid,
                                                block, st);
@@ -457,3 +967,4 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         conv2d_cuda_f32(X_D, K_D, Y_D, params, st);
     }
 }
+#endif // GGML_CUDA_CONV2D_KERNELS_ONLY
