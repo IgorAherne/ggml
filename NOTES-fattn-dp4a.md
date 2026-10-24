@@ -270,9 +270,12 @@ card (the F32 kernel unchanged; only the attention as plain matmuls, or only the
 
 | picture | dp4a | control: no flash attention | control: text encoder on the CPU |
 |---|---|---|---|
-| chest | 34.69 / 33.84 dB | 37.09 dB RGB (vs the shipped build) | 32.34 dB RGB |
+| chest | 34.69 / 33.84 dB | 39.31 dB RGB (*) | 33.19 dB RGB (*) |
 | knight | 30.34 / 28.28 dB | 31.44 / 23.70 dB | 29.69 / 23.73 dB |
 | potion | 38.03 / 33.59 dB | - | - |
+
+(*) The chest controls were drawn before the tile fix (decoded in 256-px tiles): they are measured against the shipped
+build's picture with the same decode; that decode alone differs from the 512-tile one by 40.8 dB.
 
 The real card diverges more than the emulation (chest 42 -> 35 dB): a 25-step sampler amplifies any rounding change,
 and the rounding-only controls move these pictures by as much or more. By eye: the same objects and quality; bistable
