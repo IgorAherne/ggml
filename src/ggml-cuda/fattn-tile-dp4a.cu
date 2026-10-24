@@ -395,6 +395,10 @@ static constexpr int FDP4A_PV_BLK = 32;                    // keys a P / V scale
 #ifndef FDP4A_PV8_F32_UNROLL
 #define FDP4A_PV8_F32_UNROLL 2   // the F32 P.V of outlier blocks (rare) over the 32 keys
 #endif
+// as constants: a macro inside #pragma unroll is expanded by MSVC's preprocessor but not by GCC's (Linux builds failed)
+static constexpr int FDP4A_PV8_SC_U  = FDP4A_PV8_SC_UNROLL;
+static constexpr int FDP4A_PV8_KW_U  = FDP4A_PV8_KW_UNROLL;
+static constexpr int FDP4A_PV8_F32_U = FDP4A_PV8_F32_UNROLL;
 
 enum fdp4a_pv_mode {
     FDP4A_PV_F32      = 0, // the F32 P.V kernel above
@@ -669,7 +673,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
         for (int i = 0; i < NB/4; ++i) {
             sacc[i] = 0x4B400000;
         }
-#pragma unroll FDP4A_PV8_SC_UNROLL
+#pragma unroll FDP4A_PV8_SC_U
         for (int kc = 0; kc < D/16; ++kc) {
             const int4 q = *(const int4 *) &Q8s[jc*QKS + kc*4];
 #pragma unroll
@@ -772,7 +776,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
         __syncthreads();
 
         if (flag_cur) {
-#pragma unroll FDP4A_PV8_F32_UNROLL
+#pragma unroll FDP4A_PV8_F32_U
             for (int t = 0; t < NB; ++t) {
                 const float4 v  = *(const float4 *) &VA[t*D + 4*lane];
                 const float4 p0 = *(const float4 *) &Ps[t*PS + 8*w + 0];
@@ -797,7 +801,7 @@ static __global__ void flash_attn_tile_dp4a_pv8(
                     isum[cc][d] = 0x4B400000;
                 }
             }
-#pragma unroll FDP4A_PV8_KW_UNROLL
+#pragma unroll FDP4A_PV8_KW_U
             for (int kw = 0; kw < KW; ++kw) {
                 const int4 v  = *(const int4 *) &V8s[kw*D + 4*lane];
                 const int4 p0 = *(const int4 *) &P8s[kw*NC + 8*w + 0];
