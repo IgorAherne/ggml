@@ -376,13 +376,20 @@ int main(int argc, char ** argv) {
     int n_flagged = 0;
     if (emu) {
         for (int h = 0; h < nkh * ns; ++h) {
-            std::vector<double> mean(D, 0.0);
-            for (int t = 0; t < nk; ++t) for (int d = 0; d < D; ++d) mean[d] += k[(size_t(h) * nk + t) * D + d];
+            // the key mean as flash_attn_dp4a_key_mean sums it: F32, keys t = r (mod 4) in order, then the 4 sums
+            std::vector<float> meanf(D);
+            for (int d = 0; d < D; ++d) {
+                float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int t = 0; t < nk; ++t) part[t % 4] += k[(size_t(h) * nk + t) * D + d];
+                float sum = part[0];
+                for (int r = 1; r < 4; ++r) sum += part[r];
+                meanf[d] = sum / nk;
+            }
             ek8[h].resize(size_t(nk) * D); eks[h].resize(nk);
             for (int t = 0; t < nk; ++t) {
                 float x[128], amax = 0.0f;
                 for (int d = 0; d < D; ++d) {
-                    x[d] = k[(size_t(h) * nk + t) * D + d] - float(mean[d] / nk);
+                    x[d] = k[(size_t(h) * nk + t) * D + d] - meanf[d];
                     amax = std::max(amax, std::fabs(x[d]));
                 }
                 const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
@@ -548,6 +555,14 @@ int main(int argc, char ** argv) {
     std::printf("  CPU Q,K as F16   : rel L2 per row  max %.3e  p99 %.3e  median %.3e\n", f.max_rel, f.p99_rel, f.median_rel);
     std::printf("  CPU sage-style   : rel L2 per row  max %.3e  p99 %.3e  median %.3e\n", sg.max_rel, sg.p99_rel, sg.median_rel);
     if (emu) {
+        if (getenv("PV8_DEBUG")) {
+            std::vector<size_t> idx(jobs.size());
+            for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b2) { return rel_emu[a] > rel_emu[b2]; });
+            for (int i = 0; i < 12 && i < (int) idx.size(); ++i) {
+                std::printf("    worst %d: head %d query %d  GPU vs emu %.3e\n", i, jobs[idx[i]].h, jobs[idx[i]].t, rel_emu[idx[i]]);
+            }
+        }
         const Stats ge = summarize(rel_emu, 0.0);
         const Stats er = summarize(rel_emu_ref, 0.0);
         std::printf("  GPU vs PV8 emu   : rel L2 per row  max %.3e  p99 %.3e  median %.3e   (outlier blocks %d of %d)\n",
