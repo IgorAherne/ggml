@@ -326,6 +326,136 @@ static void conv2d_launch_implicit_gemm(const half *        input,
     }
 }
 
+// Spellcast3D: conv2d_implicit_gemm_f16's SIMT branch for NVIDIA cards without its tensor-core path (Pascal, Volta),
+// with the same tiles (64 output channels x 64 positions x 64 reduction values a block of 4 warps), the same outputs
+// per thread (4 channels x 8 positions) and the same accumulation order - so the same results, bit for bit - but the
+// tiles converted to F32 once, as they enter shared memory: the weights transposed to [k][channel], so that a thread
+// reads its 4 weights and 8 inputs of one k with three 16-byte loads for 32 FMAs (the F16 branch: 12 scalar loads and
+// 12 conversions). On a GTX 10xx the F16 branch spent more issue slots on them than on the FMAs.
+#ifndef CONV2D_SIMT_F32_BK
+#define CONV2D_SIMT_F32_BK 32
+#endif
+template <int KW, int KH>
+static __global__ void __launch_bounds__(128) conv2d_implicit_gemm_simt_f32(const half * __restrict__ input,
+                                                                            const half * __restrict__ weight,
+                                                                            float * __restrict__ output,
+                                                                            const conv_params P,
+                                                                            const int         split_k) {
+    constexpr int nthreads = 128;
+    constexpr int BM = 64, BN = 64, BK = CONV2D_SIMT_F32_BK;   // BK 32: 17 KB of shared memory, 5 blocks per SM
+    constexpr int SA = BM + 4, SB = BN + 4;      // row strides in floats (16-byte rows, fewer bank conflicts)
+    __shared__ __align__(16) float a_t[BK][SA];  // weights [k][output channel]
+    __shared__ __align__(16) float b_s[BK][SB];  // inputs  [k][position]
+
+    const int tid = threadIdx.y * 32 + threadIdx.x;
+    const int iw = int(P.IW), ih = int(P.IH), ow = int(P.OW), oh = int(P.OH);
+    const int kw = KW ? KW : int(P.KW), kh = KH ? KH : int(P.KH);
+    const int ic = int(P.IC), oc = int(P.OC);
+    const int sx = int(P.ST_X), sy = int(P.ST_Y);
+    const int dx = int(P.DL_X), dy = int(P.DL_Y);
+    const int n = blockIdx.z / split_k, split = blockIdx.z % split_k;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+
+    const int k_total   = ic * kw * kh;
+    const int load_lane = threadIdx.x;   // positions n0 + 2*load_lane, +1
+    const int load_row  = threadIdx.y;   // k rows load_row, +4, ...
+    const int spatial   = n0 + 2 * load_lane;
+    const int spatial0 = min(spatial, ow * oh - 1), spatial1 = min(spatial + 1, ow * oh - 1);
+    const int y0 = spatial0 / ow, x0 = spatial0 % ow;
+    const int y1 = spatial1 / ow, x1 = spatial1 % ow;
+    const int pos0 = y0 * sy * iw + x0 * sx, pos1 = y1 * sy * iw + x1 * sx;
+
+    constexpr int RM = 4, RN = BM * BN / (nthreads * RM);
+    const int     simt_m = tid / (BN / RN) * RM, simt_n = tid % (BN / RN) * RN;
+    float         c[RM][RN] = {};
+    const int     tiles = (k_total + BK - 1) / BK;
+    const int     begin = int(int64_t(tiles) * split / split_k) * BK;
+    const int     end   = int(int64_t(tiles) * (split + 1) / split_k) * BK;
+    for (int k0 = begin; k0 < end; k0 += BK) {
+        if (k_total % 8 == 0 && uintptr_t(weight) % 16 == 0) {
+            // 8 weights of one channel per load; a warp covers 32 consecutive channels (conflict-free transposed stores)
+#pragma unroll
+            for (int s = 0; s < BM * BK / 8 / nthreads; ++s) {
+                const int  q = tid + nthreads * s, row = q % BM, col = 8 * (q / BM);
+                const int4 v = m0 + row < oc && k0 + col < k_total ?
+                                   ((const int4 *) weight)[((m0 + row) * k_total + k0 + col) / 8] :
+                                   make_int4(0, 0, 0, 0);
+                const half2 * h = (const half2 *) &v;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 f = __half22float2(h[i]);
+                    a_t[col + 2 * i + 0][row] = f.x;
+                    a_t[col + 2 * i + 1][row] = f.y;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int s = 0; s < BM * BK / nthreads; ++s) {
+                const int q = tid + nthreads * s, row = q % BM, col = q / BM;
+                a_t[col][row] = m0 + row < oc && k0 + col < k_total ? __half2float(weight[(m0 + row) * k_total + k0 + col]) : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int k = load_row; k < BK; k += nthreads / (BN / 2)) {
+            const int ki = k0 + k;
+            const int ci = ki / (kw * kh), ky = ki / kw % kh, kx = ki % kw;
+            const int offset = ki < k_total ? (n * ic + ci) * ih * iw + ky * dy * iw + kx * dx : 0;
+            float2    v      = make_float2(0.0f, 0.0f);
+            if (ki < k_total && spatial < ow * oh) {
+                v.x = __half2float(input[offset + pos0]);
+            }
+            if (ki < k_total && spatial + 1 < ow * oh) {
+                v.y = __half2float(input[offset + pos1]);
+            }
+            *(float2 *) &b_s[k][2 * load_lane] = v;
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int k = 0; k < BK; ++k) {
+            const float4 a  = *(const float4 *) &a_t[k][simt_m];
+            const float4 b0 = *(const float4 *) &b_s[k][simt_n];
+            const float4 b1 = *(const float4 *) &b_s[k][simt_n + 4];
+            const float  av[RM] = { a.x, a.y, a.z, a.w };
+            const float  bv[RN] = { b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w };
+#pragma unroll
+            for (int i = 0; i < RM; ++i) {
+#pragma unroll
+                for (int j = 0; j < RN; ++j) {
+                    c[i][j] += av[i] * bv[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < RM; ++i) {
+#pragma unroll
+        for (int j = 0; j < RN; ++j) {
+            const int co = m0 + simt_m + i, pos = n0 + simt_n + j;
+            if (co < oc && pos < ow * oh) {
+                output[(int64_t(blockIdx.z) * oc + co) * ow * oh + pos] = c[i][j];
+            }
+        }
+    }
+}
+
+static void conv2d_launch_implicit_gemm_simt_f32(const half *        input,
+                                                 const half *        weight,
+                                                 float *             output,
+                                                 const conv_params & params,
+                                                 int                 split_k,
+                                                 dim3                grid,
+                                                 cudaStream_t        stream) {
+    const dim3 block(32, 4);
+    if (params.KW == 3 && params.KH == 3) {
+        conv2d_implicit_gemm_simt_f32<3, 3><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
+    } else if (params.KW == 1 && params.KH == 1) {
+        conv2d_implicit_gemm_simt_f32<1, 1><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
+    } else {
+        conv2d_implicit_gemm_simt_f32<0, 0><<<grid, block, 0, stream>>>(input, weight, output, params, split_k);
+    }
+}
+
 static void conv2d_cuda_f16(const float * X_D, const half * K_D, float * Y_D, const conv_params P, cudaStream_t st) {
     conv2d_cuda<half>(X_D, K_D, Y_D, P, st);
 }
@@ -379,14 +509,15 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const bool   use_mma =
         turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
     // MUSA can share the tiling without a native fragment implementation in mma.cuh. Spellcast3D: so can NVIDIA cards
-    // without the tensor-core path (Pascal, Volta): their only other kernel is conv2d_kernel, one thread per output
-    // looping over every input (a GTX 1070 Ti decoded a 1024x1024 Qwen-Image picture in 139 s with it, 7.1 s through
-    // the tiled kernel's F32 SIMT path); GGML_CUDA_CONV2D_SIMT=0 restores it.
-    static const bool simt_nv = [] {
+    // without the tensor-core path (Pascal, Volta), through conv2d_implicit_gemm_simt_f32 (the SIMT branch with F32
+    // tiles): their only other kernel is conv2d_kernel, one thread per output looping over every input (a GTX 1070 Ti
+    // decoded a 1024x1024 Qwen-Image picture in 139 s with it, 7.1 s through the F16 SIMT branch).
+    // GGML_CUDA_CONV2D_SIMT: 2 (default) the F32-tile kernel, 1 the F16 SIMT branch, 0 the naive kernel.
+    static const int simt_mode = [] {
         const char * e = getenv("GGML_CUDA_CONV2D_SIMT");
-        return e == nullptr || atoi(e) != 0;
+        return e == nullptr ? 2 : atoi(e);
     }();
-    const bool use_simt   = GGML_CUDA_CC_IS_MTHREADS(device.cc) || (simt_nv && GGML_CUDA_CC_IS_NVIDIA(device.cc) && !use_mma);
+    const bool use_simt   = GGML_CUDA_CC_IS_MTHREADS(device.cc) || (simt_mode != 0 && GGML_CUDA_CC_IS_NVIDIA(device.cc) && !use_mma);
     const bool pointwise  = KW == 1 && KH == 1 && ST_X == 1 && ST_Y == 1 && PD_X == 0 && PD_Y == 0;
     const bool use_blas   = pointwise && fast_fp16_hardware_available(device.cc);
     // Short reductions on small maps do not amortize conversion and launch costs.
@@ -438,6 +569,8 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         if (use_mma) {
             conv2d_launch_implicit_gemm<true>(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid,
                                               block, st);
+        } else if (GGML_CUDA_CC_IS_NVIDIA(device.cc) && simt_mode == 2) {
+            conv2d_launch_implicit_gemm_simt_f32(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid, st);
         } else {
             conv2d_launch_implicit_gemm<false>(x_half.get(), (const half *) K_D, result, padded_params, split_k, grid,
                                                block, st);
