@@ -378,8 +378,15 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const auto & device = ggml_cuda_info().devices[ctx.device];
     const bool   use_mma =
         turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
-    // MUSA can share the tiling without a native fragment implementation in mma.cuh.
-    const bool use_simt   = GGML_CUDA_CC_IS_MTHREADS(device.cc);
+    // MUSA can share the tiling without a native fragment implementation in mma.cuh. Spellcast3D: so can NVIDIA cards
+    // without the tensor-core path (Pascal, Volta): their only other kernel is conv2d_kernel, one thread per output
+    // looping over every input (a GTX 1070 Ti decoded a 1024x1024 Qwen-Image picture in 139 s with it, 7.1 s through
+    // the tiled kernel's F32 SIMT path); GGML_CUDA_CONV2D_SIMT=0 restores it.
+    static const bool simt_nv = [] {
+        const char * e = getenv("GGML_CUDA_CONV2D_SIMT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const bool use_simt   = GGML_CUDA_CC_IS_MTHREADS(device.cc) || (simt_nv && GGML_CUDA_CC_IS_NVIDIA(device.cc) && !use_mma);
     const bool pointwise  = KW == 1 && KH == 1 && ST_X == 1 && ST_Y == 1 && PD_X == 0 && PD_Y == 0;
     const bool use_blas   = pointwise && fast_fp16_hardware_available(device.cc);
     // Short reductions on small maps do not amortize conversion and launch costs.

@@ -35,6 +35,13 @@
 #else
 #define W8A8_DEVICE_OK 0
 #endif
+// the weight conversion and the activation quantizer also serve the dp4a GEMM of cards without int8 tensor cores
+// (w8a8-dp4a.cuh, cc 6.1+)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+#define W8A8_DEVICE_PREP_OK 1
+#else
+#define W8A8_DEVICE_PREP_OK 0
+#endif
 
 #include "w8a8-format.cuh"
 
@@ -100,7 +107,7 @@ template <bool q5, bool glu>
 static __global__ void __launch_bounds__(256) w8a8_convert_weights(
         const void * __restrict__ vx, const int64_t row_bytes, int8_t * __restrict__ qw, float * __restrict__ dw,
         const int N, const int K) {
-#if W8A8_DEVICE_OK
+#if W8A8_DEVICE_PREP_OK
     const int n    = blockIdx.x * 8 + threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     if (n >= N) {
@@ -159,7 +166,7 @@ template <int NV, typename src_t, int pre>
 static __global__ void __launch_bounds__(256) w8a8_quantize_act(
         const src_t * __restrict__ x, const int64_t s01, int8_t * __restrict__ qx, uint8_t * __restrict__ sy,
         float * __restrict__ dt, const int T, const int K, const int M, const float scale, const float bias) {
-#if W8A8_DEVICE_OK
+#if W8A8_DEVICE_PREP_OK
     const int t   = blockIdx.x;
     const int tid = threadIdx.x;
     const int G   = K / 32;
