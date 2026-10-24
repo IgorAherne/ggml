@@ -416,3 +416,59 @@ the INT8 scores). Last column: two builds of the INT8 kernel that differ only in
   cc 8.6 and looks perfect. Call Git's `C:\Program Files\Git\usr\bin\bash.exe` by its full path.
 - Python string patches of C sources eat `\` + newline (macro continuations) and turn `\n` into a real newline.
 - From step 1 on Qwen-Image's V arrives as F16 (the prefix cache), at step 0 as the F32 strided view: test both.
+
+## Score loop register tile, 2026-10-24 (GTX 1070 pod)
+
+An Opus agent; built locally (Docker `sdlinux`, sm_61), measured on the rented GTX 1070 pod (GPU 0, under
+`flock /workspace/gpu.lock`). The INT8 P.V kernel's score loop is shared-memory bound on Pascal: a 16-byte shared load
+costs ~2.2 clocks of the SM's one shared-memory pipe whether 1, 4 or 8 distinct chunks are read (`lds_bench.cu`), and
+the 1 x 8 tile issued 9 LDS.128 per 32 dp4a (20 clocks of loads against 9.4 of dp4a).
+
+**Change** (`flash_attn_tile_dp4a_pv8` only; the comment block above its lane setup has the details):
+- A lane computes 2 queries x 4 keys: lane = 8*g + c, c = 2*qp + h; queries 8*w + 2*qp and + 1, keys 8*j + 4*h + g
+  (j = 0..3). Per 16-byte chunk 2 + 4 LDS.128 for 32 dp4a (not 64: the planning arithmetic was off by 2), conflict-free
+  (query chunks at banks 8*qp (+4), key chunks at 16*h + 4*g). 8 scores a lane are fixed by the block shape (64
+  queries x 32 keys, 256 threads); 2 x 4 and 4 x 2 both need 6 loads for them, the minimum, so the loop is still
+  shared-memory bound, 13.2 : 9.4 clocks (was 2.1 : 1).
+- Bit-identical by construction: exact int32 scores times the same two scales in the same expression; the maxima are
+  fmaxf (order-free); lane (c, g) still keeps query 8*w + c's denominator over its keys 4*i + g: the tile holds half of
+  them (i = 2*j + h), lane ^ 1 the other half - the u8 codes' integer sum is completed with one shuffle (exact), an
+  outlier block's F32 numerators are written to shared memory and summed back in today's order (8 LDS.32, rare);
+  the numerators land in the same bytes / floats. The SASS keeps today's FMUL + FFMA shapes of the denominator update.
+- The INT8 numerator rows padded to 72 words (`FDP4A_P8S`): the new byte stores were 2-way bank conflicts at 64.
+- The F32 P.V kernel (`GGML_CUDA_FATTN_DP4A_PV=f32`) is untouched: its sm_61 SASS is identical before / after (both
+  mask variants, `cuobjdump -sass`).
+- sm_61: 128 registers, 0 spill (unmasked; the masked variant 16 B of stack, was 40), 42,112 B static shared memory
+  (+256), 2 blocks per SM. Compiles for 61;70;75;80;86;89;90;100;120a (Linux nvcc 12.8) and with MSVC-hosted nvcc 12.8
+  (build-sm61's command line; its sm_61 SASS equals the Linux build's).
+
+**Measured** (GTX 1070, 15 SMs):
+
+| measure | before (838b2f2's kernel) | 2 x 4 tile |
+|---|---|---|
+| sd-cli per-node dump (`SD_EVAL_DUMP`, stats off), 2nd step, 32 attention calls: median per call (two runs) | 34.39 / 33.86 ms | **27.94 / 27.83 ms (-18 %)** |
+| the same, sum of the 32 calls; the whole step | 1104 / 1085 ms; 5.77 / 5.69 s | 896 / 895 ms; 5.49 / 5.45 s |
+| kernel alone (`w8a8-tools/bench_attn.cu`, synthetic Qwen size, median of 30, several runs) | 29.7 - 31.1 ms | 25.2 - 26.7 ms (-15 %) |
+| the same, masked variant (10 % -inf) | 37.8 ms | 30.1 ms |
+| 25-step chest (seed 4242, `--vae-conv-direct`), `sampling completed` | 141.64 s (the published engine's run: 142.30) | **135.61 s** |
+
+Where the kernel's time goes now (bench, 25.2 ms): without the score loop 16.1 ms (the loop ~9.1 ms; its dp4a alone
+~6.3 ms at the measured peak, its 48 LDS.128 at 2.2 clocks ~8.9 ms - the loads still set its pace), without the INT8 P.V
+dp4a loop 18.4 ms (P.V ~6.8 ms, near its dp4a bound of ~6.3), the rest ~9.3 ms (softmax, tile traffic, the 2 barriers
+per 32 keys, outlier blocks).
+
+Tried and dropped (bench): the score loop unrolled 4 instead of 8 (+0.9 - 1.3 ms); the 16-byte chunks as two LDS.64
+(+0.9 ms, an 8 B spill; plain 8-byte loads are re-merged into LDS.128 by ptxas even across the unrolled chunks, so
+they need `ld.volatile.shared`). A further lever would be one barrier per iteration with double-buffered K / V / P
+tiles; the shared-memory budget (the outlier blocks' F32 tiles) is the obstacle. Not tried.
+
+**Identity checks** (all byte / pixel comparisons, the unmodified kernel built in the same tree as the control):
+- the attention dump hook (`GGML_CUDA_FATTN_DUMP`, every query) of calls 0, 17 (step 0, V an F32 strided view), 32,
+  63 (step 1, V F16): inputs and outputs byte-identical;
+- the bench, 9 cases: INT8 P.V (with / without mask), `int8-f32` (every block on the F32 path), `int8-all`, the F32
+  P.V kernel (with / without mask), 1100 queries x 1001 keys with GQA 2:1 (with / without mask), `int8-f32` odd
+  sizes: outputs byte-identical;
+- pictures: 2 steps pixel-identical (and identical to the published engine's `b2_838b2f2.png`), 2 steps with
+  `GGML_CUDA_FATTN_DP4A_PV=f32` pixel-identical, 25 steps pixel-identical to the published engine's `new_direct.png`.
+Not checked: a real-data masked call (Qwen-Image passes no mask; the bench's synthetic masked cases are identical),
+other Pascal cards (GTX 1070 Ti / 1080 / 1060: same sm_61 code).

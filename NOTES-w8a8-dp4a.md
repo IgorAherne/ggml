@@ -84,3 +84,31 @@ exact mode byte-identical to the tensor-core kernel at T 1 / 100 / 129 / 257 / 1
 16384 / 24576, K 1024 / 3072 / 5120 / 12288, also as compute_61 code; sm_61: 241-243 registers, no spills, two blocks
 per SM). Fixed after it: the tiled SIMT convolution only before Volta (it had also taken Volta, never measured); the
 dp4a header guarded for research builds with other W8A8 tiles (its static_assert broke them).
+
+## Shared-memory load costs on Pascal (2026-10-24 afternoon, a real GTX 1070, `w8a8-tools/lds_bench.cu`)
+
+Clocks of the SM's one shared-memory pipe per warp instruction, 16 warps resident (the number the kernels above run
+with); dp4a issues at 3.4 warp instructions per clock per SM (4 = the limit):
+
+| pattern | clocks per warp instruction |
+|---|---|
+| LDS.128, every lane its own 16-byte chunk | 4.7 |
+| LDS.128, one chunk for the whole warp, or one per 4 or 8 lanes (broadcast) | 2.2 |
+| LDS.64, one chunk per 8 lanes | 0.55 |
+| LDS.32, one word per 8 lanes | 0.28 |
+| LDS.32, every lane its own word | 0.8 |
+
+So a 16-byte shared load costs about two clocks even when the lanes share it, while 4- and 8-byte broadcasts are
+nearly free - but ptxas re-merges adjacent `ld.shared.b32` / `.v2.b32` into LDS.128 (asm volatile does not stop it),
+so the way to pay less is fewer loads per dp4a (bigger register tiles), not narrower loads. What this says about the
+kernels: the dp4a GEMM's inner step (4 broadcast LDS.128 per 64 dp4a: ~9 clocks against 18.7 of issue) is not bound
+by its loads, as the what-if above found; the INT8 attention's score loop (1 + 8 LDS.128 per 32 dp4a: ~20 clocks
+against 9.4) is - the benchmark's copy of that mix runs at 39 % of the dp4a rate, and the real kernel's attention
+call on this card (33.4 ms) sits at ~35 % of the card's peak. A 2-query x 4-key lane tile (6 loads per 64 dp4a)
+is the fix being made (see `NOTES-fattn-dp4a.md`).
+
+Also measured the same day: the per-node timing dump (`SD_EVAL_DUMP`) computes nodes one at a time, outside the
+graph-level fusions, so it shows the VAE's permute copies around every RMS norm (1.5 s of a 7.7 s decode) that the
+real graph never runs (the fork fuses cont(permute) -> RMS_NORM -> MUL -> cont(permute) into one kernel). A tiled
+2D-transpose copy added to `cpy.cu` for permutes that merge into one transpose (bit-identical, ggml's CPY / CONT
+tests pass, the dump's copies 1,542 -> 557 ms) therefore changed the real decode by nothing measurable (8.5 s both).

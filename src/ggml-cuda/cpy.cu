@@ -98,6 +98,81 @@ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const 
         nb12, nb13);
 }
 
+// Spellcast3D: a same-type copy whose source is a permuted view of a contiguous tensor that amounts to ONE 2D
+// transpose once the dimensions that stay neighbours in both the source's memory and the destination are merged.
+// Wan's VAE moves its maps between channel-first and channel-last for every RMS norm: [c][y][x] -> [y][x][c] is a
+// 144 x 1,048,576 matrix transposed (and back). The generic kernel above reads such a source with a whole plane
+// between neighbouring lanes (28 GB/s on a GTX 1070: 1.5 s of a 7.7 s decode); the tiled transpose below runs at
+// the memory speed. The same bytes end up in the same places - a copy is a copy.
+template <typename T>
+static __global__ void cpy_transpose2d_tiled(const char * cx, char * cdst, const int64_t rows, const int64_t cols,
+                                             const int64_t tiles_x) {
+    // src: [rows][cols] row-major; dst: [cols][rows]
+    __shared__ T tile[CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D + 1];
+    ggml_cuda_pdl_lc();
+    const T * src = (const T *) cx;
+    T *       dst = (T *) cdst;
+    const int64_t t  = blockIdx.x;
+    const int64_t bx = (t % tiles_x) * CUDA_CPY_TILE_DIM_2D;   // first column of the source tile
+    const int64_t by = (t / tiles_x) * CUDA_CPY_TILE_DIM_2D;   // first row of the source tile
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
+        const int64_t r = by + threadIdx.y + j, c = bx + threadIdx.x;
+        if (r < rows && c < cols) {
+            tile[threadIdx.y + j][threadIdx.x] = src[r*cols + c];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < CUDA_CPY_TILE_DIM_2D; j += CUDA_CPY_BLOCK_ROWS) {
+        const int64_t c = bx + threadIdx.y + j, r = by + threadIdx.x;   // the destination's row is a source column
+        if (r < rows && c < cols) {
+            dst[c*rows + r] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+
+// true (with the source seen as a [rows][cols] row-major matrix) when the copy is that 2D transpose: same type,
+// a contiguous destination, and the source's non-unit dimensions, with logical neighbours that are also memory
+// neighbours merged, form exactly two groups, the logical inner one strided by the outer one's extent
+static bool ggml_cuda_cpy_as_transpose2d(const ggml_tensor * src0, const ggml_tensor * src1, int64_t & rows, int64_t & cols) {
+    if (src0->type != src1->type || ggml_blck_size(src0->type) != 1 || !ggml_is_contiguous(src1) || ggml_is_contiguous(src0)) {
+        return false;
+    }
+    const int64_t esize = (int64_t) ggml_type_size(src0->type);
+    int64_t gne[GGML_MAX_DIMS], gnb[GGML_MAX_DIMS];
+    int     g = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (src0->ne[i] <= 1) {
+            continue;
+        }
+        if (g > 0 && (int64_t) src0->nb[i] == gnb[g - 1]*gne[g - 1]) {
+            gne[g - 1] *= src0->ne[i];
+        } else {
+            gne[g] = src0->ne[i];
+            gnb[g] = (int64_t) src0->nb[i];
+            g++;
+        }
+    }
+    if (g != 2 || gnb[1] != esize || gnb[0] != esize*gne[1]) {
+        return false;
+    }
+    rows = gne[0];
+    cols = gne[1];
+    return true;
+}
+
+template <typename T>
+static void ggml_cpy_transpose2d_cuda(const char * cx, char * cdst, const int64_t rows, const int64_t cols, cudaStream_t stream) {
+    const int64_t tiles_x = (cols + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D;
+    const int64_t tiles   = tiles_x * ((rows + CUDA_CPY_TILE_DIM_2D - 1) / CUDA_CPY_TILE_DIM_2D);
+    GGML_ASSERT(tiles <= INT_MAX);
+    const dim3 block(CUDA_CPY_TILE_DIM_2D, CUDA_CPY_BLOCK_ROWS);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) (unsigned) tiles, block, 0, stream);
+    ggml_cuda_kernel_launch(cpy_transpose2d_tiled<T>, launch_params, cx, cdst, rows, cols, tiles_x);
+}
+
 static __device__ void cpy_blck_q8_0_f32(const char * cxi, char * cdsti) {
     float * cdstf = (float *)(cdsti);
 
@@ -463,6 +538,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+    int64_t t_rows = 0, t_cols = 0;
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
@@ -477,6 +553,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (ggml_cuda_cpy_as_transpose2d(src0, src1, t_rows, t_cols)) {
+        switch (ggml_type_size(src0->type)) {   // Spellcast3D: the permute that is a 2D transpose, by element size
+            case 1:  ggml_cpy_transpose2d_cuda<uint8_t> (src0_ddc, src1_ddc, t_rows, t_cols, main_stream); break;
+            case 2:  ggml_cpy_transpose2d_cuda<uint16_t>(src0_ddc, src1_ddc, t_rows, t_cols, main_stream); break;
+            case 4:  ggml_cpy_transpose2d_cuda<uint32_t>(src0_ddc, src1_ddc, t_rows, t_cols, main_stream); break;
+            case 8:  ggml_cpy_transpose2d_cuda<uint64_t>(src0_ddc, src1_ddc, t_rows, t_cols, main_stream); break;
+            default: GGML_ABORT("%s: unexpected element size %zu\n", __func__, ggml_type_size(src0->type));
+        }
     } else if (src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F16) {
         if (contiguous_srcs) {
             ggml_cpy_scalar_contiguous_cuda<ggml_fp8_e4m3_cuda, half>
