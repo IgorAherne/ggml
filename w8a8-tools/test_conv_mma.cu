@@ -13,7 +13,8 @@
 // usage: test_conv_mma                  the Qwen-Image 2.1 VAE decoder's shapes + odd ones (exactness + timing)
 //        test_conv_mma IW IH OC IC K [S [D [B [P]]]]   one shape (padding P, default (K-1)/2 * D)
 // env:   CONV_REPS=n   timed launches (default 10); CONV_SAMPLES=n F64 samples (default 3000); CONV_SET=decoder|odd|all
-//        CONV_NOOLD=1  skip the old kernel (timing); CONV_TURING=0 skip the Turing kernel
+//        CONV_NOOLD=1  skip the old kernel (timing); CONV_TURING=0 skip the Turing kernel; CONV_ASYNC=0 the Turing
+//        kernel in place of the cc >= 8.0 one (a compute_75-only build run on a newer card)
 #define GGML_CUDA_CONV2D_KERNELS_ONLY
 #include "conv2d.cu"
 
@@ -118,7 +119,7 @@ static cmp_result compare(const float * a, const float * b, int64_t n) {
 }
 
 static int g_reps = 10, g_samples = 3000;
-static bool g_old = true, g_turing = true;
+static bool g_old = true, g_turing = true, g_async = true;
 static double g_sum_old = 0, g_sum_new = 0, g_sum_path = 0, g_sum_kernel = 0, g_sum_flop = 0;
 
 static bool run_shape(const shape & s) {
@@ -156,7 +157,8 @@ static bool run_shape(const shape & s) {
         if (reorder) conv2d_mma_reorder_weights(w, wt, int(OC), int(IC), int(KW * KH), 0);
     };
     const half * wk = reorder ? wt : w;
-    auto run_new = [&]() { conv2d_mma_launch(xh, wk, y_new, p, true, 0); };
+    // CONV_ASYNC=0 (a compute_75-only build): "new" is the Turing kernel too
+    auto run_new = [&]() { conv2d_mma_launch(xh, wk, y_new, p, g_async, 0); };
     auto run_tur = [&]() { conv2d_mma_launch(xh, wk, y_tur, p, false, 0); };
     prep(); run_new(); if (g_turing) run_tur();
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
@@ -262,6 +264,7 @@ int main(int argc, char ** argv) {
     if (getenv("CONV_SAMPLES")) g_samples = atoi(getenv("CONV_SAMPLES"));
     if (getenv("CONV_NOOLD")) g_old = atoi(getenv("CONV_NOOLD")) == 0;
     if (getenv("CONV_TURING")) g_turing = atoi(getenv("CONV_TURING")) != 0;
+    if (getenv("CONV_ASYNC")) g_async = atoi(getenv("CONV_ASYNC")) != 0;
     std::vector<shape> shapes;
     if (argc >= 6) {
         shape s = { atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), argc > 6 ? atoi(argv[6]) : 1,

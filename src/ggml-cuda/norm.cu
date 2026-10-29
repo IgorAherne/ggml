@@ -529,6 +529,140 @@ static __global__ void __launch_bounds__(128) rms_norm_cf_f32(const float * x, c
     }
 }
 
+// Spellcast3D: rms_norm_cf_f32 reading the input once (it reads every value twice: for the sum, then for the output;
+// ~3 tensor sizes of traffic instead of 2 for a VAE's 400 MB - 1.2 GB activations). A block takes tp pixels, stages all
+// their channels in shared memory ([c][p], coalesced along the map), thread (p, q) replays rms_norm_cf_f32's chains for
+// the virtual warps wi = q, q + 4, ... of pixel p from there, thread (p, 0) its butterflies and scale, then the block
+// writes the outputs with the same multiplies, SiLU and FFMA: the same bits. dst may be x itself (a block reads all of
+// its pixels before writing them). nhwc: the output as F16 channels last, dst[pixel][c] (the input copy of the
+// tensor-core convolution, conv2d-mma.cuh), instead of F32 [c][pixel]. Plain CUDA: every architecture.
+static constexpr int RMS_CF_TILED_SMEM = 48 * 1024;
+
+static int rms_norm_cf_tiled_tp(const int ncols) {  // pixels a block, 0: the channels do not fit
+    for (int tp = 32; tp >= 8; tp /= 2) {
+        if ((int64_t(ncols) * (tp + 1) + tp * 33) * 4 <= RMS_CF_TILED_SMEM) {
+            return tp;
+        }
+    }
+    return 0;
+}
+
+template <int block_size, bool do_silu, bool do_scale, bool nhwc>
+static __global__ void __launch_bounds__(128) rms_norm_cf_tiled_f32(const float * x, const float * __restrict__ w,
+                                                                    void * dst, const int ncols, const int64_t npix,
+                                                                    const float eps, const float out_scale,
+                                                                    const float out_bias, const int tp) {
+    extern __shared__ float rms_cf_smem[];
+    const int  ls = tp + 1;                   // [c][p] rows
+    float *    s  = rms_cf_smem;              // ncols x ls
+    float *    ws = s + int64_t(ncols) * ls;  // [p][33]: the virtual warps' sums, then [p][32] = the scale
+    const int64_t p0 = int64_t(blockIdx.x) * tp;
+    const int     np = int(min(int64_t(tp), npix - p0));
+    const int     n  = ncols * tp;
+
+#pragma unroll 8
+    for (int i = threadIdx.x; i < n; i += 128) {
+        const int c = i / tp, p = i - c * tp;
+        if (p < np) {
+            s[c * ls + p] = x[int64_t(c) * npix + p0 + p];
+        }
+    }
+    __syncthreads();
+
+    constexpr int nwarps  = block_size / WARP_SIZE;
+    const int     nrounds = (ncols + block_size - 1) / block_size;
+    for (int t = threadIdx.x; t < tp * 4; t += 128) {
+        const int p = t % tp, q = t / tp;
+        if (p >= np) {
+            continue;
+        }
+        for (int wi = q; wi < nwarps; wi += 4) {
+            float v[WARP_SIZE];
+#pragma unroll
+            for (int l = 0; l < WARP_SIZE; ++l) {
+                v[l] = 0.0f;
+            }
+            for (int r = 0; r < nrounds; ++r) {
+#pragma unroll
+                for (int l = 0; l < WARP_SIZE; ++l) {
+                    const int col = r * block_size + wi * WARP_SIZE + l;
+                    if (col < ncols) {
+                        const float xi = s[col * ls + p];
+                        v[l]           = __fmaf_rn(xi, xi, v[l]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int l = 0; l < offset; ++l) {
+                    v[l] = __fadd_rn(v[l], v[l + offset]);
+                }
+            }
+            ws[p * 33 + wi] = v[0];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < np) {
+        const int p = threadIdx.x;
+        float     r[WARP_SIZE];
+#pragma unroll
+        for (int wi = 0; wi < WARP_SIZE; ++wi) {
+            r[wi] = wi < nwarps ? ws[p * 33 + wi] : 0.0f;
+        }
+        if constexpr (nwarps > 1) {
+#pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+                for (int l = 0; l < offset; ++l) {
+                    r[l] = __fadd_rn(r[l], r[l + offset]);
+                }
+            }
+        }
+        float scale;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        float rcp;
+        asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"((float) ncols));
+        scale = rsqrtf(__fmaf_rn(r[0], rcp, eps));
+#else
+        scale = rsqrtf(r[0] / ncols + eps);
+#endif
+        ws[p * 33 + 32] = scale;
+    }
+    __syncthreads();
+
+    auto out = [&](const int c, const int p) {
+        float r = __fmul_rn(__fmul_rn(ws[p * 33 + 32], s[c * ls + p]), w[c]);
+        if constexpr (do_silu) {
+            r = ggml_cuda_op_silu_single(r);
+        }
+        if constexpr (do_scale) {
+            r = __fmaf_rn(out_scale, r, out_bias);  // scale_f32's FFMA
+        }
+        return r;
+    };
+    if constexpr (!nhwc) {
+        float * d = (float *) dst;
+#pragma unroll 4
+        for (int i = threadIdx.x; i < n; i += 128) {
+            const int c = i / tp, p = i - c * tp;
+            if (p < np) {
+                d[int64_t(c) * npix + p0 + p] = out(c, p);
+            }
+        }
+    } else {
+        half2 *   d  = (half2 *) dst;  // ncols even
+        const int hc = ncols / 2;
+#pragma unroll 4
+        for (int i = threadIdx.x; i < hc * tp; i += 128) {
+            const int p = i / hc, c = 2 * (i - p * hc);
+            if (p < np) {
+                d[((p0 + p) * ncols + c) / 2] = __floats2half2_rn(out(c, p), out(c + 1, p));
+            }
+        }
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
@@ -1031,6 +1165,62 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
+// rms_norm_cf_tiled_f32 for x [W, H, T, C] (contiguous F32) into dst (F32 like x, or F16 channels last when nhwc);
+// false when a tile's channels do not fit in shared memory (or nhwc with odd C).
+static bool rms_norm_cf_tiled_f16_or_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
+                                         const float eps, void * dst, const bool nhwc, const bool silu,
+                                         const ggml_tensor * scale) {
+    const int     ncols = (int) x->ne[3];
+    const int64_t npix  = x->ne[0]*x->ne[1]*x->ne[2];
+    const int     tp    = rms_norm_cf_tiled_tp(ncols);
+    if (tp == 0 || (nhwc && ncols % 2 != 0) || (scale != nullptr && !silu)) {
+        return false;
+    }
+    const int64_t nblocks = (npix + tp - 1) / tp;
+    GGML_ASSERT(nblocks <= INT_MAX);
+    const size_t  smem = (size_t(ncols) * (tp + 1) + size_t(tp) * 33) * sizeof(float);
+    const float   sc   = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
+    const float   sb   = scale ? ggml_get_op_params_f32(scale, 1) : 0.0f;
+    const float * x_d  = (const float *) x->data;
+    const float * w_d  = (const float *) w->data;
+    cudaStream_t  st   = ctx.stream();
+#define RMS_CF_TILED(bs, si, sca, nh) \
+    rms_norm_cf_tiled_f32<bs, si, sca, nh><<<(int) nblocks, 128, smem, st>>>(x_d, w_d, dst, ncols, npix, eps, sc, sb, tp)
+#define RMS_CF_TILED_BS(bs, nh)            \
+    if (scale) {                           \
+        RMS_CF_TILED(bs, true, true, nh);  \
+    } else if (silu) {                     \
+        RMS_CF_TILED(bs, true, false, nh); \
+    } else {                               \
+        RMS_CF_TILED(bs, false, false, nh);\
+    }
+    // the block size rms_norm_f32_cuda would launch for rows of ncols
+    if (ncols < 1024) {
+        if (nhwc) {
+            RMS_CF_TILED_BS(256, true)
+        } else {
+            RMS_CF_TILED_BS(256, false)
+        }
+    } else {
+        if (nhwc) {
+            RMS_CF_TILED_BS(1024, true)
+        } else {
+            RMS_CF_TILED_BS(1024, false)
+        }
+    }
+#undef RMS_CF_TILED_BS
+#undef RMS_CF_TILED
+    return true;
+}
+
+bool ggml_cuda_op_rms_norm_cf_fused_nhwc_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x,
+                                             const ggml_tensor * w, const float eps, half * dst, const bool silu,
+                                             const ggml_tensor * scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(w) && ggml_nelements(w) == x->ne[3]);
+    return rms_norm_cf_tiled_f16_or_f32(ctx, x, w, eps, dst, true, silu, scale);
+}
+
 void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
                                     const float eps, ggml_tensor * dst, const bool silu, const ggml_tensor * scale) {
     GGML_ASSERT(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
@@ -1049,6 +1239,14 @@ void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_
     GGML_ASSERT(scale == nullptr || silu);
     const float sc = scale ? ggml_get_op_params_f32(scale, 0) : 1.0f;
     const float sb = scale ? ggml_get_op_params_f32(scale, 1) : 0.0f;
+    // Spellcast3D: the read-once kernel where a tile's channels fit (GGML_CUDA_RMS_CF_TILED=0: the kernel below)
+    static const bool tiled = [] {
+        const char * e = getenv("GGML_CUDA_RMS_CF_TILED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (tiled && rms_norm_cf_tiled_f16_or_f32(ctx, x, w, eps, dst_d, false, silu, scale)) {
+        return;
+    }
     // the block size rms_norm_f32_cuda would launch for rows of ncols
     if (ncols < 1024) {
         if (scale) {

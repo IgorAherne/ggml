@@ -6345,6 +6345,66 @@ struct test_conv_2d : public test_case {
     }
 };
 
+// Spellcast3D: the sd.cpp VAE's convolution chains, which the CUDA backend fuses (ggml-cuda.cu: the tensor-core
+// convolution with its input SCALE / UPSCALE and its output SCALE -> ADD(bias) -> ADD(residual), and the channel RMS
+// norm writing that convolution's input copy). mode 0: SCALE -> CONV_2D; 1: UPSCALE (nearest 2x) -> SCALE -> CONV_2D;
+// 2: cont(permute) -> RMS_NORM -> MUL -> cont(permute) -> SILU -> SCALE -> CONV_2D; then SCALE -> ADD(bias)
+// [-> ADD(residual) through a reshape, as Conv2dBut3d leaves it].
+struct test_conv_2d_vae_chain : public test_case {
+    const std::array<int64_t, 3> ne;  // the convolution's input W, H, C
+    const int64_t                oc;
+    const int                    k;
+    const int                    mode;
+    const bool                   residual;
+
+    std::string vars() override { return VARS_TO_STR5(ne, oc, k, mode, residual); }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+
+    test_conv_2d_vae_chain(std::array<int64_t, 3> ne = { 64, 32, 32 }, int64_t oc = 48, int k = 3, int mode = 0,
+                           bool residual = false) :
+        ne(ne), oc(oc), k(k), mode(mode), residual(residual) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t W = ne[0], H = ne[1], C = ne[2];
+        ggml_tensor * xs;
+        if (mode == 0) {
+            ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, C, 1);
+            ggml_set_name(x, "x");
+            xs = ggml_scale(ctx, x, 1.0f / 128);
+        } else if (mode == 1) {
+            ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W / 2, H / 2, C, 1);
+            ggml_set_name(x, "x");
+            xs = ggml_scale(ctx, ggml_upscale(ctx, x, 2, GGML_SCALE_MODE_NEAREST), 1.0f / 128);
+        } else {
+            ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, 1, C);
+            ggml_set_name(x, "x");
+            ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * h = ggml_cont(ctx, ggml_permute(ctx, x, 1, 2, 3, 0));
+            h               = ggml_mul(ctx, ggml_rms_norm(ctx, h, 1e-12f), gamma);
+            h               = ggml_silu(ctx, ggml_cont(ctx, ggml_permute(ctx, h, 3, 0, 1, 2)));
+            xs              = ggml_scale(ctx, ggml_reshape_4d(ctx, h, W, H, C, 1), 1.0f / 128);
+        }
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k, k, C, oc);
+        ggml_set_name(w, "w");
+        ggml_tensor * y = ggml_conv_2d_direct(ctx, w, xs, 1, 1, k / 2, k / 2, 1, 1);
+        y               = ggml_scale(ctx, y, 128.0f);
+        ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, oc);
+        ggml_set_name(b, "b");
+        y = ggml_add_inplace(ctx, y, ggml_reshape_4d(ctx, b, 1, 1, oc, 1));
+        if (residual) {
+            ggml_tensor * z = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, 1, oc);
+            ggml_set_name(z, "z");
+            y = ggml_add(ctx, ggml_reshape_4d(ctx, y, W, H, 1, oc), z);
+        }
+        ggml_set_name(y, "out");
+        return y;
+    }
+};
+
 // GGML_OP_CONV_2D_DW
 struct test_conv_2d_dw : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -9404,6 +9464,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d({ 19, 17, 16, 3 }, { 3, 3, 16, 33 }, GGML_TYPE_F16, 2, 3, 4, 2, 2, 1));
     test_cases.emplace_back(new test_conv_2d({ 13, 11, 16, 3 }, { 1, 1, 16, 33 }, GGML_TYPE_F16, 1, 1, 0, 0, 1, 1));
     test_cases.emplace_back(new test_conv_2d({ 19, 17, 8, 2 }, { 3, 3, 8, 17 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1, false, 1));
+    // Spellcast3D: the VAE decoder's channel counts and the convolution fusions' chains (odd sizes for the tile tails)
+    test_cases.emplace_back(new test_conv_2d({ 64, 40, 144, 1 }, { 3, 3, 144, 144 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 37, 29, 288, 1 }, { 1, 1, 288, 144 }, GGML_TYPE_F16, 1, 1, 0, 0, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 50, 30, 144, 1 }, { 3, 3, 144, 4 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 33, 31, 96, 2 }, { 3, 3, 96, 200 }, GGML_TYPE_F16, 2, 2, 0, 0, 1, 1));
+    for (int mode : { 0, 1, 2 }) {
+        for (bool residual : { false, true }) {
+            test_cases.emplace_back(new test_conv_2d_vae_chain({ 64, 32, 144 }, 144, 3, mode, residual));
+            test_cases.emplace_back(new test_conv_2d_vae_chain({ 38, 22, 96 }, 100, 3, mode, residual));
+            test_cases.emplace_back(new test_conv_2d_vae_chain({ 32, 16, 288 }, 144, 1, mode, residual));
+        }
+        test_cases.emplace_back(new test_conv_2d_vae_chain({ 64, 32, 144 }, 4, 3, mode, false));
+    }
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)

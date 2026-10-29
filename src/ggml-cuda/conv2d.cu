@@ -1414,12 +1414,17 @@ void ggml_cuda_conv2d_mma_fused(ggml_backend_cuda_context & ctx, const ggml_tens
     const int iw = int(input->ne[0]), ih = int(input->ne[1]), ic = int(input->ne[2]), b = int(input->ne[3]);
     const int kw = int(kernel->ne[0]), kh = int(kernel->ne[1]), oc = int(kernel->ne[3]);
     const int ow = int(conv->ne[0]), oh = int(conv->ne[1]);
-    GGML_ASSERT(f.x != nullptr && f.out != nullptr && (f.up == 1 || f.up == 2));
-    GGML_ASSERT(ggml_nelements(f.x) * f.up * f.up == ggml_nelements(input));
+    GGML_ASSERT(f.out != nullptr && (f.up == 1 || f.up == 2));
 
-    ggml_cuda_pool_alloc<half> xh(ctx.pool(), int64_t(b) * ih * iw * ic);
-    conv2d_mma_to_nhwc((const float *) f.x->data, xh.get(), ic, ih, iw, b, f.up, f.in_affine, f.in_scale, f.in_sbias,
-                       st);
+    ggml_cuda_pool_alloc<half> xbuf(ctx.pool());
+    const half *               xh = f.xh;
+    if (xh == nullptr) {
+        GGML_ASSERT(f.x != nullptr && ggml_nelements(f.x) * f.up * f.up == ggml_nelements(input));
+        xbuf.alloc(int64_t(b) * ih * iw * ic);
+        conv2d_mma_to_nhwc((const float *) f.x->data, xbuf.get(), ic, ih, iw, b, f.up, f.in_affine, f.in_scale,
+                           f.in_sbias, st);
+        xh = xbuf.get();
+    }
 
     const half *               w = (const half *) kernel->data;
     ggml_cuda_pool_alloc<half> wbuf(ctx.pool());
@@ -1436,7 +1441,7 @@ void ggml_cuda_conv2d_mma_fused(ggml_backend_cuda_context & ctx, const ggml_tens
     p.affine = f.out_affine, p.scale = f.out_scale, p.sbias = f.out_sbias;
     p.bias   = f.bias ? (const float *) f.bias->data : nullptr;
     p.z      = f.z ? (const float *) f.z->data : nullptr;
-    conv2d_mma_launch(xh.get(), w, (float *) f.out->data, p, cp_async_available(cc) && conv2d_mma_mode() != 2, st);
+    conv2d_mma_launch(xh, w, (float *) f.out->data, p, cp_async_available(cc) && conv2d_mma_mode() != 2, st);
 }
 
 void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

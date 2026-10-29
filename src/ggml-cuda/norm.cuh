@@ -29,6 +29,12 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 void ggml_cuda_op_rms_norm_cf_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * w,
                                     float eps, ggml_tensor * dst, bool silu, const ggml_tensor * scale = nullptr);
 
+// Spellcast3D: the same, written as F16 channels last, dst[pixel][c] (the tensor-core convolution's input copy, for a
+// CONV_2D that reads the result); false when the kernel does not take this channel count (nothing launched)
+bool ggml_cuda_op_rms_norm_cf_fused_nhwc_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * x,
+                                             const ggml_tensor * w, float eps, half * dst, bool silu,
+                                             const ggml_tensor * scale = nullptr);
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,

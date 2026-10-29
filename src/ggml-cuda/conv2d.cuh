@@ -20,6 +20,7 @@ struct ggml_cuda_conv2d_fusion {
     const ggml_tensor * bias       = nullptr;
     const ggml_tensor * z          = nullptr;
     ggml_tensor *       out        = nullptr;
+    const half *        xh         = nullptr;  // the F16 channels-last input made by the producer (x then unused)
 };
 
 bool ggml_cuda_conv2d_mma_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * conv);
