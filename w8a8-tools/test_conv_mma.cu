@@ -119,7 +119,7 @@ static cmp_result compare(const float * a, const float * b, int64_t n) {
 }
 
 static int g_reps = 10, g_samples = 3000;
-static bool g_old = true, g_turing = true, g_async = true;
+static bool g_old = true, g_turing = true, g_async = true, g_tur16 = false;
 static double g_sum_old = 0, g_sum_new = 0, g_sum_path = 0, g_sum_kernel = 0, g_sum_flop = 0;
 
 static bool run_shape(const shape & s) {
@@ -159,7 +159,8 @@ static bool run_shape(const shape & s) {
     const half * wk = reorder ? wt : w;
     // CONV_ASYNC=0 (a compute_75-only build): "new" is the Turing kernel too
     auto run_new = [&]() { conv2d_mma_launch(xh, wk, y_new, p, g_async, 0); };
-    auto run_tur = [&]() { conv2d_mma_launch(xh, wk, y_tur, p, false, 0); };
+    // CONV_TUR16=1: the "tur" column is the F16-accumulate sm_80 kernel instead
+    auto run_tur = [&]() { conv2d_mma_launch(xh, wk, y_tur, p, g_tur16 ? true : false, 0, g_tur16); };
     prep(); run_new(); if (g_turing) run_tur();
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
 
@@ -265,6 +266,7 @@ int main(int argc, char ** argv) {
     if (getenv("CONV_NOOLD")) g_old = atoi(getenv("CONV_NOOLD")) == 0;
     if (getenv("CONV_TURING")) g_turing = atoi(getenv("CONV_TURING")) != 0;
     if (getenv("CONV_ASYNC")) g_async = atoi(getenv("CONV_ASYNC")) != 0;
+    if (getenv("CONV_TUR16")) g_tur16 = atoi(getenv("CONV_TUR16")) != 0;
     std::vector<shape> shapes;
     if (argc >= 6) {
         shape s = { atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), argc > 6 ? atoi(argv[6]) : 1,

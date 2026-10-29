@@ -126,9 +126,43 @@ static __device__ __forceinline__ void conv2d_mma_mma(float (&d)[4], const uint3
 #endif
 }
 
+// The same with F16 accumulation (d: two half2 registers, rows g and g + 8); research option (GGML_CUDA_CONV2D_MMA_ACC=16).
+template <bool K16>
+static __device__ __forceinline__ void conv2d_mma_mma_h(uint32_t (&d)[2], const uint32_t (&a)[4], const uint32_t b0,
+                                                        const uint32_t b1) {
+#ifdef TURING_MMA_AVAILABLE
+    if constexpr (K16) {
+#    ifdef AMPERE_MMA_AVAILABLE
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+                     : "+r"(d[0]), "+r"(d[1])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#    else
+        GGML_UNUSED(d);
+        GGML_UNUSED(a);
+        GGML_UNUSED(b0);
+        GGML_UNUSED(b1);
+        NO_DEVICE_CODE;
+#    endif
+    } else {
+        asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3}, {%4}, {%0, %1};"
+                     : "+r"(d[0]), "+r"(d[1])
+                     : "r"(a[0]), "r"(a[1]), "r"(b0));
+        asm volatile("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3}, {%4}, {%0, %1};"
+                     : "+r"(d[0]), "+r"(d[1])
+                     : "r"(a[2]), "r"(a[3]), "r"(b1));
+    }
+#else
+    GGML_UNUSED(d);
+    GGML_UNUSED(a);
+    GGML_UNUSED(b0);
+    GGML_UNUSED(b1);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // ASYNC: the cc >= 8.0 kernel (cp.async pipeline of CFG::STAGES slots, m16n8k16); otherwise the Turing kernel (two
 // register-staged slots, m16n8k8), which also runs on newer cards (the test programs compare the two there).
-template <class CFG, bool ASYNC>
+template <class CFG, bool ASYNC, bool ACC16>
 static __global__ void __launch_bounds__(CFG::NT, ASYNC ? 2 : 1) conv2d_mma_f16(const half * __restrict__ x,
                                                                     const half * __restrict__ w,
                                                                     float * __restrict__ y,
@@ -219,14 +253,20 @@ static __global__ void __launch_bounds__(CFG::NT, ASYNC ? 2 : 1) conv2d_mma_f16(
             }
         };
 
-        float acc[MF][NF][4];
+        float    acc[MF][NF][ACC16 ? 1 : 4];
+        uint32_t acch[MF][NF][ACC16 ? 2 : 1];  // F16 accumulation: half2 (rows g, g + 8)
 #    pragma unroll
         for (int i = 0; i < MF; ++i) {
 #    pragma unroll
             for (int j = 0; j < NF; ++j) {
+                if constexpr (ACC16) {
+                    acch[i][j][0] = 0;
+                    acch[i][j][1] = 0;
+                } else {
 #    pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    acc[i][j][l] = 0.0f;
+                    for (int l = 0; l < 4; ++l) {
+                        acc[i][j][l] = 0.0f;
+                    }
                 }
             }
         }
@@ -263,7 +303,11 @@ static __global__ void __launch_bounds__(CFG::NT, ASYNC ? 2 : 1) conv2d_mma_f16(
                 for (int i = 0; i < MF; ++i) {
 #    pragma unroll
                     for (int j = 0; j < NF; ++j) {
-                        conv2d_mma_mma<ASYNC>(acc[i][j], a[i], b[j][0], b[j][1]);
+                        if constexpr (ACC16) {
+                            conv2d_mma_mma_h<ASYNC>(acch[i][j], a[i], b[j][0], b[j][1]);
+                        } else {
+                            conv2d_mma_mma<ASYNC>(acc[i][j], a[i], b[j][0], b[j][1]);
+                        }
                     }
                 }
             }
@@ -371,7 +415,13 @@ static __global__ void __launch_bounds__(CFG::NT, ASYNC ? 2 : 1) conv2d_mma_f16(
                         const int oc = n0 + wn + 8 * j + 2 * t + e;
                         if (oc < p.oc) {
                             const int64_t o = base + int64_t(oc) * p.ohw;
-                            float         v = acc[i][j][2 * h + e];
+                            float         v;
+                            if constexpr (ACC16) {
+                                const half2 hv = *(const half2 *) &acch[i][j][h];
+                                v              = __half2float(e ? __high2half(hv) : __low2half(hv));
+                            } else {
+                                v = acc[i][j][2 * h + e];
+                            }
                             if (p.affine) {
                                 v = __fmaf_rn(p.scale, v, p.sbias);
                             }
@@ -510,45 +560,54 @@ static int conv2d_mma_pick_tile(const int oc) {
     return pad128 <= pad64 ? CONV2D_MMA_T128 : CONV2D_MMA_T64;
 }
 
-// Whether the kernel takes this convolution: F16 weights, IC % 8 == 0 (16-byte chunks of channels), every index in
-// int32. (P: the convolution's own parameters, padding included; any kernel size, stride, dilation, padding.)
+// Whether the kernel takes this convolution: IC % 8 == 0 (16-byte chunks of channels), every index in int32 (the
+// padded map's too: a tap's offset is formed before its bounds test); any kernel size, stride, dilation, padding.
 static bool conv2d_mma_shape_ok(const int64_t IW, const int64_t IH, const int64_t OW, const int64_t OH, const int64_t KW,
                                 const int64_t KH, const int64_t IC, const int64_t OC, const int64_t B, const int ST_X,
                                 const int ST_Y, const int PD_X, const int PD_Y, const int DL_X, const int DL_Y) {
     const int64_t lim = INT_MAX - 1024;
     return IC % 8 == 0 && IC >= 8 && OC >= 1 && ST_X > 0 && ST_Y > 0 && DL_X > 0 && DL_Y > 0 && PD_X >= 0 && PD_Y >= 0 &&
            IW * IH * IC * B <= lim && OW * OH * OC * B <= lim && OW * OH * B <= lim && KW * KH * IC <= lim / 8 &&
-           OC * KW * KH * IC <= lim && IW <= 65535 * 8 && IH <= 65535 * 8 && B <= 65535;
+           OC * KW * KH * IC <= lim && (IW + 2 * PD_X + 1) * (IH + 2 * PD_Y + 1) * IC <= lim && B <= 65535 &&
+           OW >= 1 && OH >= 1;
 }
 
-template <class CFG, bool ASYNC>
+template <class CFG, bool ASYNC, bool ACC16>
 static void conv2d_mma_launch_cfg(const half * xh, const half * wt, float * y, conv2d_mma_params p, cudaStream_t st) {
     p.ntn              = (p.oc + CFG::BN - 1) / CFG::BN;
     const int64_t ntm  = (int64_t(p.npos) + CFG::BM - 1) / CFG::BM;
     const size_t  smem = CFG::smem(ASYNC);
-    CUDA_SET_SHARED_MEMORY_LIMIT((conv2d_mma_f16<CFG, ASYNC>), smem);
-    conv2d_mma_f16<CFG, ASYNC><<<dim3(unsigned(ntm * p.ntn)), CFG::NT, smem, st>>>(xh, wt, y, p);
+    CUDA_SET_SHARED_MEMORY_LIMIT((conv2d_mma_f16<CFG, ASYNC, ACC16>), smem);
+    conv2d_mma_f16<CFG, ASYNC, ACC16><<<dim3(unsigned(ntm * p.ntn)), CFG::NT, smem, st>>>(xh, wt, y, p);
 }
 
-// async: the cc >= 8.0 kernel, else the Turing one.
+template <class CFG>
+static void conv2d_mma_launch_tile(const half * xh, const half * wt, float * y, const conv2d_mma_params & p,
+                                   const bool async, const bool acc16, cudaStream_t st) {
+    if (acc16) {
+        async ? conv2d_mma_launch_cfg<CFG, true, true>(xh, wt, y, p, st) :
+                conv2d_mma_launch_cfg<CFG, false, true>(xh, wt, y, p, st);
+    } else {
+        async ? conv2d_mma_launch_cfg<CFG, true, false>(xh, wt, y, p, st) :
+                conv2d_mma_launch_cfg<CFG, false, false>(xh, wt, y, p, st);
+    }
+}
+
+// async: the cc >= 8.0 kernel, else the Turing one; acc16: F16 accumulation (research).
 static void conv2d_mma_launch(const half * xh, const half * wt, float * y, const conv2d_mma_params & p, const bool async,
-                              cudaStream_t st) {
+                              cudaStream_t st, const bool acc16 = false) {
     switch (conv2d_mma_pick_tile(p.oc)) {
         case CONV2D_MMA_T144:
-            async ? conv2d_mma_launch_cfg<conv2d_mma_cfg144, true>(xh, wt, y, p, st) :
-                    conv2d_mma_launch_cfg<conv2d_mma_cfg144, false>(xh, wt, y, p, st);
+            conv2d_mma_launch_tile<conv2d_mma_cfg144>(xh, wt, y, p, async, acc16, st);
             break;
         case CONV2D_MMA_T128:
-            async ? conv2d_mma_launch_cfg<conv2d_mma_cfg128, true>(xh, wt, y, p, st) :
-                    conv2d_mma_launch_cfg<conv2d_mma_cfg128, false>(xh, wt, y, p, st);
+            conv2d_mma_launch_tile<conv2d_mma_cfg128>(xh, wt, y, p, async, acc16, st);
             break;
         case CONV2D_MMA_T64:
-            async ? conv2d_mma_launch_cfg<conv2d_mma_cfg64, true>(xh, wt, y, p, st) :
-                    conv2d_mma_launch_cfg<conv2d_mma_cfg64, false>(xh, wt, y, p, st);
+            conv2d_mma_launch_tile<conv2d_mma_cfg64>(xh, wt, y, p, async, acc16, st);
             break;
         default:
-            async ? conv2d_mma_launch_cfg<conv2d_mma_cfg8, true>(xh, wt, y, p, st) :
-                    conv2d_mma_launch_cfg<conv2d_mma_cfg8, false>(xh, wt, y, p, st);
+            conv2d_mma_launch_tile<conv2d_mma_cfg8>(xh, wt, y, p, async, acc16, st);
             break;
     }
 }

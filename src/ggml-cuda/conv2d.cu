@@ -1441,7 +1441,12 @@ void ggml_cuda_conv2d_mma_fused(ggml_backend_cuda_context & ctx, const ggml_tens
     p.affine = f.out_affine, p.scale = f.out_scale, p.sbias = f.out_sbias;
     p.bias   = f.bias ? (const float *) f.bias->data : nullptr;
     p.z      = f.z ? (const float *) f.z->data : nullptr;
-    conv2d_mma_launch(xh, w, (float *) f.out->data, p, cp_async_available(cc) && conv2d_mma_mode() != 2, st);
+    // GGML_CUDA_CONV2D_MMA_ACC=16: F16 accumulation (research: twice the tensor rate of F32 accumulation on GeForce cards)
+    static const bool acc16 = [] {
+        const char * e = getenv("GGML_CUDA_CONV2D_MMA_ACC");
+        return e != nullptr && atoi(e) == 16;
+    }();
+    conv2d_mma_launch(xh, w, (float *) f.out->data, p, cp_async_available(cc) && conv2d_mma_mode() != 2, st, acc16);
 }
 
 void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
