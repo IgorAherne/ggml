@@ -4,6 +4,9 @@
 //   sub:<bits>                int8 activations per token with per-32 integer sub-scales of <bits> bits
 //                             (d_g = d_t * sy_g / M, sy_g = ceil(M * amax_g / amax_t), M = 2^bits - 1), int8 weights
 //                             per output channel
+//   sub:<bits>:ag:<A>         as sub, the activations' integer sub-scales per A values (32, 64 or 128; default 32 =
+//                             the shipped format): sy_g = ceil(M * amax_g / amax_t) over groups of A (format study
+//                             spellcast-actgroup, 2026-10-29)
 //   sub:<bits>:wg:<G>         as sub, the int8 weights with one scale per (row, G K-values) instead of per row
 //   sub:<bits>:bal:<beta>     as sub, the weights first divided per input channel by c_k = (max_n |w_nk|)^beta and the
 //                             activations multiplied by c_k (the balance folded into the quantizer)
@@ -29,6 +32,7 @@ struct w8a8_cfg {
     int     bits       = 8;
     float   beta       = 0.0f;  // 0 = no column balance
     int     wgroup     = 0;     // int8 weight scale per (row, wgroup K-values); 0 = per row
+    int     agroup     = 32;    // activation sub-scale group (sub mode): 32, 64 or 128 values
     int64_t min_tokens = 256;
     std::map<std::string, float *> cal;  // weight name -> device column maxima [K]
 };
@@ -57,6 +61,14 @@ static w8a8_cfg & w8a8_config() {
         const size_t wg = s.find(":wg:");
         if (wg != std::string::npos) {
             cfg.wgroup = atoi(s.c_str() + wg + 4);
+        }
+        const size_t ag = s.find(":ag:");
+        if (ag != std::string::npos) {
+            cfg.agroup = atoi(s.c_str() + ag + 4);
+            if (cfg.agroup != 32 && cfg.agroup != 64 && cfg.agroup != 128) {
+                fprintf(stderr, "w8a8 emulation: activation group %d not supported (32, 64, 128)\n", cfg.agroup);
+                GGML_ABORT("GGML_CUDA_W8A8 ag");
+            }
         }
     } else if (s.rfind("dyn:", 0) == 0) {
         cfg.mode  = w8a8_cfg::DYN;
@@ -91,6 +103,9 @@ static w8a8_cfg & w8a8_config() {
     }
     fprintf(stderr, "w8a8 emulation: mode %d alpha %g bits %d beta %g min tokens %lld\n",
             (int) cfg.mode, cfg.alpha, cfg.bits, cfg.beta, (long long) cfg.min_tokens);
+    if (cfg.agroup != 32) {
+        fprintf(stderr, "w8a8 emulation: activation sub-scale group %d\n", cfg.agroup);
+    }
     return cfg;
 }
 
@@ -139,9 +154,13 @@ static __global__ void w8a8_factors(const float * __restrict__ cmax, const float
 }
 
 // one block per row: y = the int8 rounding of x[r, :] * f, dequantized. bits == 0: one scale per row (max / 127);
-// bits > 0: per-32 integer sub-scales of that width under the row scale.
+// bits > 0: per-AG integer sub-scales of that width under the row scale (AG = 32: the shipped format; 64 / 128: the
+// format study - the same expressions, the group max over AG/4 lanes instead of 8; the instantiation AG = 32 is the
+// kernel as it was)
+template <int AG>
 static __global__ void w8a8_rowquant(const float * __restrict__ x, const int64_t K, const float * __restrict__ f,
                                      const int bits, float * __restrict__ y) {
+    static_assert(AG == 32 || AG == 64 || AG == 128, "activation group");
     const int64_t r  = blockIdx.x;
     const float * xr = x + r * K;
     float *       yr = y + r * K;
@@ -172,7 +191,7 @@ static __global__ void w8a8_rowquant(const float * __restrict__ x, const int64_t
         }
         return;
     }
-    // 8 consecutive lanes hold one group of 32 (4 values each)
+    // AG/4 consecutive lanes hold one group of AG (4 values each): 8 lanes for 32, 16 for 64, the warp for 128
     const int M = (1 << bits) - 1;
     for (int64_t base = (int64_t) threadIdx.x * 4; base < K; base += (int64_t) blockDim.x * 4) {
         float v[4];
@@ -183,7 +202,7 @@ static __global__ void w8a8_rowquant(const float * __restrict__ x, const int64_t
             g    = fmaxf(g, fabsf(v[i]));
         }
 #pragma unroll
-        for (int offset = 4; offset > 0; offset >>= 1) {
+        for (int offset = AG/8; offset > 0; offset >>= 1) {
             g = fmaxf(g, __shfl_xor_sync(0xFFFFFFFF, g, offset, WARP_SIZE));
         }
         const int   sy  = amax > 0.0f ? max(1, min(M, (int) ceilf((float) M * g / amax))) : 1;
@@ -283,12 +302,22 @@ bool ggml_cuda_w8a8_emu(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     ggml_cuda_pool_alloc<float> xq(pool, (size_t) T * K);
     ggml_cuda_pool_alloc<float> wq(pool, (size_t) N * K);
     const int bits = cfg.mode == w8a8_cfg::SUB ? cfg.bits : 0;
-    w8a8_rowquant<<<(unsigned) T, 256, 0, stream>>>((const float *) src1->data, K, factors ? fx : nullptr, bits, xq.get());
+    if (bits > 0 && cfg.agroup != 32) {
+        // every warp's 32 lanes in each pass of 1024 values (the group max is a warp shuffle)
+        GGML_ASSERT(K % 1024 == 0);
+        if (cfg.agroup == 64) {
+            w8a8_rowquant<64><<<(unsigned) T, 256, 0, stream>>>((const float *) src1->data, K, factors ? fx : nullptr, bits, xq.get());
+        } else {
+            w8a8_rowquant<128><<<(unsigned) T, 256, 0, stream>>>((const float *) src1->data, K, factors ? fx : nullptr, bits, xq.get());
+        }
+    } else {
+        w8a8_rowquant<32><<<(unsigned) T, 256, 0, stream>>>((const float *) src1->data, K, factors ? fx : nullptr, bits, xq.get());
+    }
     if (cfg.wgroup > 0 && !factors) {
         GGML_ASSERT(K % cfg.wgroup == 0 && cfg.wgroup % 32 == 0);
         w8a8_rowquant_grouped<<<(unsigned) N, 256, 0, stream>>>(w32.get(), K, cfg.wgroup, wq.get());
     } else {
-        w8a8_rowquant<<<(unsigned) N, 256, 0, stream>>>(w32.get(), K, factors ? fw : nullptr, 0, wq.get());
+        w8a8_rowquant<32><<<(unsigned) N, 256, 0, stream>>>(w32.get(), K, factors ? fw : nullptr, 0, wq.get());
     }
 
     // dst [N, T] (N contiguous) = wq [K, N]^T x xq [K, T] in column-major terms; exact f32 (no TF32)
