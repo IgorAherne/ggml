@@ -12,7 +12,8 @@
 // (GGML_CUDA_W8A8=sub:8, its name filter) and the W8A8 path (default name filter) both take the products.
 // Activations: N(0, 1), or the token rows of an engine dump (GGML_CUDA_ACT_DUMP file, W8A8BENCH_ACT=<file>, rows
 // repeated to T; K must match). Prints the median time per graph, T/s, an FNV-1a hash of the output; MMBENCH_DUMP=<file>
-// writes the output (f32) for comparisons (compare.py).
+// writes the output (f32) for comparisons (compare.py). W8A8BENCH_TYPES="<t2>,<t3>,<td>": other types for the second /
+// third / down weight (mixed-type models; see other_type).
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -43,6 +44,22 @@ static ggml_type type_of(const std::string& s) {
     }
     fprintf(stderr, "unknown type %s\n", s.c_str());
     exit(2);
+}
+
+// W8A8BENCH_TYPES="<t2>,<t3>,<td>": the types of the second and third weight (mm3, normmm3) and of the down weight
+// (glu, normglu) instead of <type>, for mixed-type models (e.g. q / k Q5_K and v Q8_0); "-" or nothing keeps <type>
+static ggml_type other_type(int i, ggml_type dflt) {
+    const char* e = getenv("W8A8BENCH_TYPES");
+    if (!e || !*e) return dflt;
+    std::string s(e), item;
+    size_t a = 0;
+    for (int k = 0; k <= i; ++k) {
+        const size_t b = s.find(',', a);
+        item = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
+        if (b == std::string::npos) { if (k < i) return dflt; break; }
+        a = b + 1;
+    }
+    return item.empty() || item == "-" ? dflt : type_of(item);
 }
 
 static void set_tensor(ggml_tensor* t, uint32_t seed, float scale) {
@@ -105,8 +122,8 @@ int main(int argc, char** argv) {
     } else if (op == "scalemm") {
         out = ggml_mul_mat(ctx, W, ggml_scale(ctx, X, 1.0f / 32));
     } else if (op == "mm3") {
-        ggml_tensor* W2 = ggml_new_tensor_2d(ctx, type, K, N);
-        ggml_tensor* W3 = ggml_new_tensor_2d(ctx, type, K, N);
+        ggml_tensor* W2 = ggml_new_tensor_2d(ctx, other_type(0, type), K, N);
+        ggml_tensor* W3 = ggml_new_tensor_2d(ctx, other_type(1, type), K, N);
         ggml_set_name(W2, "model.diffusion_model.transformer_blocks.0.test2.weight");
         ggml_set_name(W3, "model.diffusion_model.transformer_blocks.0.test3.weight");
         inputs.push_back(W2);
@@ -129,8 +146,8 @@ int main(int argc, char** argv) {
         ggml_tensor* h = ggml_mul(ctx, ggml_norm(ctx, res, 1e-6f), mv);    // layer norm without affine, modulated
         pre_expand.push_back(res);
         if (op == "normmm3") {
-            ggml_tensor* W2 = ggml_new_tensor_2d(ctx, type, K, N);
-            ggml_tensor* W3 = ggml_new_tensor_2d(ctx, type, K, N);
+            ggml_tensor* W2 = ggml_new_tensor_2d(ctx, other_type(0, type), K, N);
+            ggml_tensor* W3 = ggml_new_tensor_2d(ctx, other_type(1, type), K, N);
             ggml_set_name(W2, "model.diffusion_model.transformer_blocks.0.test2.weight");
             ggml_set_name(W3, "model.diffusion_model.transformer_blocks.0.test3.weight");
             inputs.push_back(W2);
@@ -145,7 +162,7 @@ int main(int argc, char** argv) {
             flops *= 3;
         } else {
             ggml_tensor* gu = ggml_mul_mat(ctx, W, h);
-            ggml_tensor* Wd = ggml_new_tensor_2d(ctx, type, N / 2, K);
+            ggml_tensor* Wd = ggml_new_tensor_2d(ctx, other_type(2, type), N / 2, K);
             ggml_set_name(Wd, "model.diffusion_model.transformer_blocks.0.test_down.weight");
             inputs.push_back(Wd);
             ggml_tensor* dn = ggml_mul_mat(ctx, Wd, ggml_swiglu(ctx, gu));
@@ -155,7 +172,7 @@ int main(int argc, char** argv) {
         }
     } else if (op == "glu") {
         out = ggml_mul_mat(ctx, W, X);
-        ggml_tensor* Wd = ggml_new_tensor_2d(ctx, type, N / 2, K);
+        ggml_tensor* Wd = ggml_new_tensor_2d(ctx, other_type(2, type), N / 2, K);
         ggml_set_name(Wd, "model.diffusion_model.transformer_blocks.0.test_down.weight");
         inputs.push_back(Wd);
         ggml_tensor* g = ggml_swiglu(ctx, out);

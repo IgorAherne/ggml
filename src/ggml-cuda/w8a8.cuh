@@ -1,6 +1,6 @@
 #pragma once
 
-// "W8 x A8-sub32": an int8 tensor-core matmul for Q4_K / Q5_K weights on sm_80+ (device code and launchers; the ggml
+// "W8 x A8-sub32": an int8 tensor-core matmul for k-quant / Q8_0 weights on sm_80+ (device code and launchers; the ggml
 // integration is w8a8.cu). Self-contained (CUDA headers only) so that the stand-alone tests in w8a8-tools/ compile the
 // very same kernels.
 //
@@ -10,7 +10,7 @@
 //     amax_t = max_k |x|, d_t = amax_t / 127; per group g of 32 values: amax_g = the group's max,
 //     sy = max(1, min(M, ceil(M * amax_g / amax_t))) (1 when amax_t == 0), M = W8A8_SY_MAX = 31 (5-bit sub-scales);
 //     d_g = d_t * sy / M, inv_g = 1 / d_g; q_x = clamp(rint(x * inv_g), -127, 127).
-//   weights W [N][K] = ggml's dequantized Q4_K / Q5_K values: amax_n = max_k |w|, dW_n = amax_n / 127,
+//   weights W [N][K] = ggml's dequantized Q2_K .. Q6_K / Q8_0 values: amax_n = max_k |w|, dW_n = amax_n / 127,
 //     q_w = clamp(rint(w * (127 / amax_n)), -127, 127).
 //   product: acc[t][n] = sum_g sy[t][g] * (sum_{k in g} q_x * q_w) (int32, exact), y = float(acc) * (d_t / M) * dW_n.
 // The GEMM issues every m16n8k32 MMA (one k step = one sub-scale group) with a zero C operand and adds sy * P to the
@@ -52,7 +52,23 @@
 static constexpr int w8a8_stage_bytes() { return W8A8_BM*W8A8_BK + W8A8_BN*W8A8_BK + 2*W8A8_BM; }
 static constexpr int w8a8_smem_bytes()  { return W8A8_STAGES*w8a8_stage_bytes(); }
 
-// ---- weights: Q4_K / Q5_K rows -> int8 rows with a per-row scale (single pass, the row max computed in the kernel) ----
+// ---- weights: k-quant / Q8_0 rows -> int8 rows with a per-row scale (single pass, the row max computed in the kernel) ----
+
+// The weight types the converter reads. A row is a sequence of 256-value units: one super-block of a k-quant, eight
+// 32-value blocks of Q8_0 (a re-quantization: the per-32 scales become the row's one scale).
+enum w8a8_wtype {
+    W8A8_W_Q4_K = 0,
+    W8A8_W_Q5_K = 1,
+    W8A8_W_Q6_K = 2,
+    W8A8_W_Q8_0 = 3,
+    W8A8_W_Q3_K = 4,
+    W8A8_W_Q2_K = 5,
+};
+
+static __host__ __device__ constexpr int w8a8_unit_bytes(const int wt) {
+    return wt == W8A8_W_Q4_K ? 144 : wt == W8A8_W_Q5_K ? 176 : wt == W8A8_W_Q6_K ? 210 : wt == W8A8_W_Q8_0 ? 8*34 :
+           wt == W8A8_W_Q3_K ? 110 : 84;
+}
 
 struct w8a8_block_q4_K { __half d, dmin; uint8_t scales[12]; uint8_t qs[128]; };
 struct w8a8_block_q5_K { __half d, dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; };
@@ -103,7 +119,104 @@ static __device__ __forceinline__ void w8a8_dequant8(const uint8_t * __restrict_
     }
 }
 
-template <bool q5, bool glu>
+// The other types, lane l making the values 8l .. 8l+7 of the unit with the f32 operations of ggml's CUDA dequantizers
+// (dequantize_q6_K, _q8_0, _q3_K, _q2_K). Their blocks of 210 / 34 / 110 bytes are 2-byte aligned in a row (84 for
+// Q2_K: 4-byte aligned), so the quants are read in 16-bit (32-bit) pieces.
+static __device__ __forceinline__ uint2 w8a8_load8_a2(const uint8_t * p) {
+    const uint16_t * h = (const uint16_t *) p;
+    return make_uint2((uint32_t) h[0] | ((uint32_t) h[1] << 16), (uint32_t) h[2] | ((uint32_t) h[3] << 16));
+}
+
+// Q6_K { ql[128], qh[64], int8 scales[16], d }: 128-value half ip = l/16, 32-value quarter s, il = 8*(l%4) + i;
+// w = d*sc * (q - 32) (two multiplies in that order)
+static __device__ __forceinline__ void w8a8_dequant8_q6_K(const uint8_t * __restrict__ blk, const int lane, float (&w)[8]) {
+    const int ip = lane / 16;
+    const int s  = (lane / 4) % 4;
+    const int il = 8 * (lane % 4);
+    const uint2 ql = w8a8_load8_a2(blk + 64*ip + 32*(s & 1) + il);
+    const uint2 qh = w8a8_load8_a2(blk + 128 + 32*ip + il);
+    const float d  = __half2float(*(const __half *) (blk + 208));
+    const int8_t sc = (int8_t) blk[192 + 8*ip + il/16 + 2*s];
+    const float dl = d * sc;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t lo = ((i < 4 ? ql.x : ql.y) >> (8*(i % 4) + 4*(s >> 1))) & 0xF;
+        const uint32_t hi = ((i < 4 ? qh.x : qh.y) >> (8*(i % 4) + 2*s)) & 3;
+        w[i] = dl * (float) ((int) (lo | (hi << 4)) - 32);
+    }
+}
+
+// Q8_0 { d, int8 qs[32] } x 8 per unit: lane l reads block l/4, values 8*(l%4) .. +7; w = q * d
+static __device__ __forceinline__ void w8a8_dequant8_q8_0(const uint8_t * __restrict__ unit, const int lane, float (&w)[8]) {
+    const uint8_t * blk = unit + 34*(lane / 4);
+    const float d = __half2float(*(const __half *) blk);
+    const uint2 q = w8a8_load8_a2(blk + 2 + 8*(lane % 4));
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        w[i] = (float) (int8_t) ((i < 4 ? q.x : q.y) >> (8*(i % 4))) * d;
+    }
+}
+
+// Q3_K { hmask[32], qs[64], 6-bit scales[12], d }: 128-value half n = l/16, 2-bit plane j, bytes 8*(l%4) .. +7 of
+// qs[32n ..] and hmask (bit 4n + j); w = d*(us - 32) * (q - (high bit ? 0 : 4))
+static __device__ __forceinline__ void w8a8_dequant8_q3_K(const uint8_t * __restrict__ blk, const int lane, float (&w)[8]) {
+    const int n  = lane / 16;
+    const int j  = (lane / 4) % 4;
+    const int l0 = 8 * (lane % 4);
+    const int is = 8*n + 2*j + (lane % 4) / 2;
+    const uint8_t * scales = blk + 96;
+    const int8_t us = is <  4 ? (scales[is-0] & 0xF) | (((scales[is+8] >> 0) & 3) << 4) :
+                      is <  8 ? (scales[is-0] & 0xF) | (((scales[is+4] >> 2) & 3) << 4) :
+                      is < 12 ? (scales[is-8] >>  4) | (((scales[is+0] >> 4) & 3) << 4) :
+                                (scales[is-8] >>  4) | (((scales[is-4] >> 6) & 3) << 4);
+    const float d_all = __half2float(*(const __half *) (blk + 108));
+    const float dl = d_all * (us - 32);
+    const uint2 q  = w8a8_load8_a2(blk + 32 + 32*n + l0);
+    const uint2 hm = w8a8_load8_a2(blk + l0);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int qq = ((i < 4 ? q.x : q.y) >> (8*(i % 4) + 2*j)) & 3;
+        const int hb = ((i < 4 ? hm.x : hm.y) >> (8*(i % 4) + 4*n + j)) & 1;
+        w[i] = dl * (float) (qq - (hb ? 0 : 4));
+    }
+}
+
+// Q2_K { scales[16] (scale | min << 4), qs[64], d, dmin }: as Q3_K's planes; w = d*sc * q - dmin*m, the subtraction
+// fused as nvcc contracts dequantize_q2_K's expression (one FMA)
+static __device__ __forceinline__ void w8a8_dequant8_q2_K(const uint8_t * __restrict__ blk, const int lane, float (&w)[8]) {
+    const int n  = lane / 16;
+    const int j  = (lane / 4) % 4;
+    const int l0 = 8 * (lane % 4);
+    const uint8_t sc = blk[8*n + 2*j + (lane % 4) / 2];
+    const __half2 dm = *(const __half2 *) (blk + 80);
+    const float dl = __low2float(dm) * (sc & 0xF);
+    const float ml = __high2float(dm) * (sc >> 4);
+    const uint32_t * qp = (const uint32_t *) (blk + 16 + 32*n + l0);
+    const uint2 q = make_uint2(qp[0], qp[1]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int qq = ((i < 4 ? q.x : q.y) >> (8*(i % 4) + 2*j)) & 3;
+        w[i] = __fmaf_rn(dl, (float) qq, -ml);
+    }
+}
+
+template <int wt>
+static __device__ __forceinline__ void w8a8_dequant_unit(const uint8_t * __restrict__ unit, const int lane, float (&w)[8]) {
+    if constexpr (wt == W8A8_W_Q4_K || wt == W8A8_W_Q5_K) {
+        w8a8_dequant8<wt == W8A8_W_Q5_K>(unit, lane, w);
+    } else if constexpr (wt == W8A8_W_Q6_K) {
+        w8a8_dequant8_q6_K(unit, lane, w);
+    } else if constexpr (wt == W8A8_W_Q8_0) {
+        w8a8_dequant8_q8_0(unit, lane, w);
+    } else if constexpr (wt == W8A8_W_Q3_K) {
+        w8a8_dequant8_q3_K(unit, lane, w);
+    } else {
+        static_assert(wt == W8A8_W_Q2_K, "weight type");
+        w8a8_dequant8_q2_K(unit, lane, w);
+    }
+}
+
+template <int wt, bool glu>
 static __global__ void __launch_bounds__(256) w8a8_convert_weights(
         const void * __restrict__ vx, const int64_t row_bytes, int8_t * __restrict__ qw, float * __restrict__ dw,
         const int N, const int K) {
@@ -113,13 +226,13 @@ static __global__ void __launch_bounds__(256) w8a8_convert_weights(
     if (n >= N) {
         return;
     }
-    constexpr int bsz = q5 ? (int) sizeof(w8a8_block_q5_K) : (int) sizeof(w8a8_block_q4_K);
+    constexpr int bsz = w8a8_unit_bytes(wt);
     const uint8_t * row = (const uint8_t *) vx + (int64_t) n * row_bytes;
     const int nb = K / 256;
     float amax = 0.0f;
     for (int b = 0; b < nb; ++b) {
         float w[8];
-        w8a8_dequant8<q5>(row + (int64_t) b*bsz, lane, w);
+        w8a8_dequant_unit<wt>(row + (int64_t) b*bsz, lane, w);
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             amax = fmaxf(amax, fabsf(w[i]));
@@ -139,7 +252,7 @@ static __global__ void __launch_bounds__(256) w8a8_convert_weights(
     const int j = lane / 4, pos = 8 * (lane % 4);
     for (int b = 0; b < nb; ++b) {
         float w[8];
-        w8a8_dequant8<q5>(row + (int64_t) b*bsz, lane, w);
+        w8a8_dequant_unit<wt>(row + (int64_t) b*bsz, lane, w);
         uint32_t o[2] = {0, 0};
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -579,16 +692,20 @@ static __global__ void __launch_bounds__(W8A8_NTHREADS, W8A8_MINBLOCKS) w8a8_gem
 
 // ---- launchers (raw pointers; stream-ordered, no synchronization) ----
 
-static inline void w8a8_convert_weights_cuda(const void * vx, const bool q5, const bool glu, const int64_t row_bytes,
+// wt: w8a8_wtype; K % 256 == 0. Returns false (nothing launched) for another type.
+static inline bool w8a8_convert_weights_cuda(const void * vx, const int wt, const bool glu, const int64_t row_bytes,
                                              int8_t * qw, float * dw, const int N, const int K, cudaStream_t stream) {
     const dim3 grid((unsigned) ((N + 7) / 8));
-    if (q5) {
-        if (glu) w8a8_convert_weights<true,  true ><<<grid, 256, 0, stream>>>(vx, row_bytes, qw, dw, N, K);
-        else     w8a8_convert_weights<true,  false><<<grid, 256, 0, stream>>>(vx, row_bytes, qw, dw, N, K);
-    } else {
-        if (glu) w8a8_convert_weights<false, true ><<<grid, 256, 0, stream>>>(vx, row_bytes, qw, dw, N, K);
-        else     w8a8_convert_weights<false, false><<<grid, 256, 0, stream>>>(vx, row_bytes, qw, dw, N, K);
+#define W8A8_CW(WT) case WT: \
+        if (glu) w8a8_convert_weights<WT, true ><<<grid, 256, 0, stream>>>(vx, row_bytes, qw, dw, N, K); \
+        else     w8a8_convert_weights<WT, false><<<grid, 256, 0, stream>>>(vx, row_bytes, qw, dw, N, K); \
+        return true;
+    switch (wt) {
+        W8A8_CW(W8A8_W_Q4_K) W8A8_CW(W8A8_W_Q5_K) W8A8_CW(W8A8_W_Q6_K) W8A8_CW(W8A8_W_Q8_0) W8A8_CW(W8A8_W_Q3_K)
+        W8A8_CW(W8A8_W_Q2_K)
+        default: return false;
     }
+#undef W8A8_CW
 }
 
 // The K values w8a8_quantize_act_cuda has a kernel for (K/1024 float4 or half4 per thread in registers).

@@ -9,7 +9,8 @@
 //                             activations multiplied by c_k (the balance folded into the quantizer)
 //   dyn:<alpha>               per token + SmoothQuant smoothing s_k = cmax_k^a / wmax_k^(1-a) from this call's column maxima
 //   static:<alpha>:<file>     as dyn with the column maxima from a calibration file ([i32 len][name][i32 K][K f32] records)
-// Applies to Q4_K / Q5_K weights of the diffusion transformer's blocks with at least GGML_CUDA_W8A8_MIN_TOKENS (256)
+// Applies to Q2_K .. Q6_K / Q8_0 weights (the W8A8 path's types; Q4_K / Q5_K only until 2026-10-29) of the diffusion
+// transformer's blocks with at least GGML_CUDA_W8A8_MIN_TOKENS (256)
 // tokens. The weights are dequantized to f32 per call; the GEMM runs without TF32 (slow by design).
 #include "w8a8-emu.cuh"
 #include "convert.cuh"
@@ -234,7 +235,9 @@ bool ggml_cuda_w8a8_emu(ggml_backend_cuda_context & ctx, const ggml_tensor * src
     if (cfg.mode == w8a8_cfg::OFF) {
         return false;
     }
-    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+    const bool wtype = src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
+                       src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q2_K;
+    if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || src0->ne[2] != 1 || src0->ne[3] != 1 ||
             src1->ne[2] != 1 || src1->ne[3] != 1 || src1->ne[1] < cfg.min_tokens || strstr(src0->name, "transformer_blocks") == nullptr) {
         return false;

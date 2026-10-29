@@ -97,6 +97,19 @@ bool w8a8_device_ok(const int device) {
         ggml_cuda_info().devices[device].smpbo >= (size_t) w8a8_smem_bytes();
 }
 
+// the weight types the converter reads (w8a8_wtype), -1 for the others
+int w8a8_weight_type(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K: return W8A8_W_Q4_K;
+        case GGML_TYPE_Q5_K: return W8A8_W_Q5_K;
+        case GGML_TYPE_Q6_K: return W8A8_W_Q6_K;
+        case GGML_TYPE_Q8_0: return W8A8_W_Q8_0;
+        case GGML_TYPE_Q3_K: return W8A8_W_Q3_K;
+        case GGML_TYPE_Q2_K: return W8A8_W_Q2_K;
+        default:             return -1;
+    }
+}
+
 void w8a8_log_once(const int device) {
     static bool logged = false;
     if (logged) {
@@ -106,7 +119,7 @@ void w8a8_log_once(const int device) {
     const w8a8_config & c = w8a8_cfg();
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    GGML_LOG_INFO("ggml_cuda: W8A8 int8 matmul path (W8 x A8-sub32, %s) on %s (cc %d): Q4_K/Q5_K products with >= %lld tokens%s%s%s, "
+    GGML_LOG_INFO("ggml_cuda: W8A8 int8 matmul path (W8 x A8-sub32, %s) on %s (cc %d): Q2_K..Q6_K/Q8_0 products with >= %lld tokens%s%s%s, "
                   "SwiGLU intermediate %s, norm writer %s%s, sub-scales 1..%d\n",
                   w8a8_dp4a_device(ggml_cuda_info().devices[device].cc) ? "dp4a" :
                   w8a8_turing_device(ggml_cuda_info().devices[device].cc) ? "int8 tensor cores, sm_75 kernel" : "int8 tensor cores",
@@ -126,7 +139,7 @@ bool ggml_cuda_w8a8_supported(const ggml_backend_cuda_context & ctx, const ggml_
     if (src1 == nullptr) {
         src1 = dst->src[1];
     }
-    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (w8a8_weight_type(src0->type) < 0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     const int64_t K = src0->ne[0], N = src0->ne[1], T = src1->ne[1];
@@ -229,8 +242,9 @@ static void w8a8_product(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     ggml_cuda_pool_alloc<int8_t> qw(ctx.pool(), N*K);
     ggml_cuda_pool_alloc<float>  dw(ctx.pool(), N);
     const bool glu = epi == W8A8_EPI_GLU_F16 || epi == W8A8_EPI_GLU_F32;
-    w8a8_convert_weights_cuda(src0->data, src0->type == GGML_TYPE_Q5_K, glu, (int64_t) src0->nb[1], qw.get(), dw.get(), (int) N, (int) K,
-                              stream);
+    const bool converted = w8a8_convert_weights_cuda(src0->data, w8a8_weight_type(src0->type), glu, (int64_t) src0->nb[1], qw.get(),
+                                                     dw.get(), (int) N, (int) K, stream);
+    GGML_ASSERT(converted);
     CUDA_CHECK(cudaGetLastError());
 #if W8A8_HAS_DP4A
     if (w8a8_dp4a_device(ggml_cuda_info().devices[ctx.device].cc)) {

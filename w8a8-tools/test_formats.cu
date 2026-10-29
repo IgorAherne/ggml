@@ -1,15 +1,18 @@
 // Bit-identity of the W8A8 format kernels (src/ggml-cuda/w8a8.cuh) with the research emulation (GGML_CUDA_W8A8=sub:5,
-// main tree src/ggml-cuda/w8a8-emu.cu) and ggml's Q4_K / Q5_K dequantizers, compiled here VERBATIM with the same nvcc
-// flags as ggml-cuda (-O3 -use_fast_math): same instructions -> any difference is a formula difference.
-//   weights:     ggml dequantize_q4_K / _q5_K (f32) -> emulation w8a8_rowquant(bits 0): q, d_row; ours: q_w, dW.
-//                Also our in-kernel dequantized values against ggml's (every value).
+// main tree src/ggml-cuda/w8a8-emu.cu) and ggml's Q4_K / Q5_K / Q6_K / Q8_0 / Q3_K / Q2_K dequantizers, compiled here
+// VERBATIM with the same nvcc flags as ggml-cuda (-O3 -use_fast_math): same instructions -> any difference is a formula
+// difference.
+//   weights:     ggml's to_fp32 of the type (f32) -> emulation w8a8_rowquant(bits 0): q, d_row; ours: q_w, dW (plain and
+//                glu-interleaved). Also our in-kernel dequantized values against ggml's (every value), and for Q6_K /
+//                Q8_0 / Q3_K / Q2_K ggml's CPU dequantizers (ggml-quants.c, verbatim) against both. Random blocks, or
+//                real rows of a model file (arguments w:<type>:<N>:<K>:<raw file>).
 //   activations: emulation w8a8_rowquant(bits = log2(W8A8_SY_MAX + 1) = 5): q, sy, d_row per row; ours: q_x, sy
 //                (tile-permuted), d_t;
 //                inputs: synthetic (gaussian, outlier channels, zero row, tiny rows, huge range) and real DiT
 //                activation rows (dumps of the engine, GGML_CUDA_ACT_DUMP); the SCALE pre-op (x/32 of to_out) against
 //                scale_f32's FMA then the emulation; the f16 input path against the emulation of the f16-rounded
 //                values (the SwiGLU output the gate|up epilogue stores).
-// usage: test_formats [dump.bin ...]
+// usage: test_formats [dump.bin ...] [w:<type>:<N>:<K>:<raw file> ...]   (W8A8_TEST_WEIGHTS_ONLY=1: the weights only)
 #include "w8a8.cuh"
 #include <algorithm>
 #include <cmath>
@@ -97,6 +100,227 @@ static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t
     const int64_t i = blockIdx.x;
     dequantize_q5_K(vx, i, yy + i*256, threadIdx.x);
 }
+// ---- verbatim from ggml: ggml-common.h's block_q2_K / _q3_K / _q6_K / _q8_0 (CUDA: ggml_half = half), dequantize.cuh
+// dequantize_q2_K / _q3_K / _q6_K / dequantize_q8_0 (ggml_cuda_cast<dst_t> written as a cast, as above), the
+// convert.cu kernels of to_fp32 (dequantize_block_q*_K: 64 threads per block; Q8_0: dequantize_block_cont_cuda's
+// dequantize_block, its index arithmetic for one contiguous row set) ----
+#define QK_K 256
+typedef struct { uint8_t scales[QK_K/16]; uint8_t qs[QK_K/4]; half2 dm; } block_q2_K;
+typedef struct { uint8_t hmask[QK_K/8]; uint8_t qs[QK_K/4]; uint8_t scales[12]; half d; } block_q3_K;
+typedef struct { uint8_t ql[QK_K/2]; uint8_t qh[QK_K/4]; int8_t scales[QK_K/16]; half d; } block_q6_K;
+typedef struct { half d; int8_t qs[32]; } block_q8_0;
+static_assert(sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34,
+              "block sizes");
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_q2_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_q2_K * x = (const block_q2_K *) vx;
+
+    const int64_t n   = tid/32;
+    const int64_t l   = tid - 32*n;
+    const int64_t is  = 8*n + l/16;
+
+    const uint8_t q = x[ib].qs[32*n + l];
+    dst_t * y = yy + 128*n;
+
+    float dall = __low2half(x[ib].dm);
+    float dmin = __high2half(x[ib].dm);
+    y[l+ 0] = (dst_t)(dall * (x[ib].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[ib].scales[is+0] >> 4));
+    y[l+32] = (dst_t)(dall * (x[ib].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[ib].scales[is+2] >> 4));
+    y[l+64] = (dst_t)(dall * (x[ib].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[ib].scales[is+4] >> 4));
+    y[l+96] = (dst_t)(dall * (x[ib].scales[is+6] & 0xF) * ((q >> 6) & 3) - dmin * (x[ib].scales[is+6] >> 4));
+}
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_q3_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_q3_K * x = (const block_q3_K *) vx;
+
+    const int64_t r = tid/4;
+    const int64_t t = r/2;
+    const int64_t is0 = r%2;
+    const int64_t l0 = 16*is0 + 4*(tid%4);
+    const int64_t n = t / 4;
+    const int64_t j = t - 4*n;
+
+    uint8_t m = 1 << (4*n + j);
+    int64_t is = 8*n + 2*j + is0;
+    int shift = 2*j;
+
+    int8_t us = is <  4 ? (x[ib].scales[is-0] & 0xF) | (((x[ib].scales[is+8] >> 0) & 3) << 4) :
+                is <  8 ? (x[ib].scales[is-0] & 0xF) | (((x[ib].scales[is+4] >> 2) & 3) << 4) :
+                is < 12 ? (x[ib].scales[is-8] >>  4) | (((x[ib].scales[is+0] >> 4) & 3) << 4) :
+                          (x[ib].scales[is-8] >>  4) | (((x[ib].scales[is-4] >> 6) & 3) << 4);
+    float d_all = x[ib].d;
+    float dl = d_all * (us - 32);
+
+    dst_t * y = yy + 128*n + 32*j;
+    const uint8_t * q = x[ib].qs + 32*n;
+    const uint8_t * hm = x[ib].hmask;
+
+    for (int l = l0; l < l0+4; ++l) {
+        y[l] = (dst_t)(dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+    }
+}
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_q6_K * x = (const block_q6_K *) vx;
+
+    // assume 64 threads - this is very slightly better than the one below
+    const int64_t ip  = tid/32;   // ip is 0 or 1
+    const int64_t il  = tid - 32*ip; // 0...32
+    const int64_t is  = 8*ip + il/16;
+
+    dst_t * y = yy + 128*ip + il;
+
+    const float d = x[ib].d;
+
+    const uint8_t * ql = x[ib].ql + 64*ip + il;
+    const uint8_t   qh = x[ib].qh[32*ip + il];
+    const int8_t  * sc = x[ib].scales + is;
+
+    y[ 0] = (dst_t)(d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+    y[32] = (dst_t)(d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+    y[64] = (dst_t)(d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+    y[96] = (dst_t)(d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+}
+static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+
+    const float d = x[ib].d;
+
+    v.x = x[ib].qs[iqs + 0];
+    v.y = x[ib].qs[iqs + 1];
+
+    v.x *= d;
+    v.y *= d;
+}
+template<typename dst_t>
+static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    dequantize_q2_K(vx, i, yy + i*QK_K, threadIdx.x);
+}
+template<typename dst_t>
+static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    dequantize_q3_K(vx, i, yy + i*QK_K, threadIdx.x);
+}
+template<typename dst_t>
+static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const int64_t i = blockIdx.x;
+    dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
+}
+static __global__ void dequantize_block_q8_0(const void * __restrict__ vx, float * __restrict__ y, const int64_t ne00) {
+    const int64_t i00 = 2 * (int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
+    if (i00 >= ne00) {
+        return;
+    }
+    const int64_t ib = i00/32; // block index
+    const int64_t iqs = (i00%32)/1; // quant index
+    const int64_t iybs = i00 - i00%32; // y block start index
+    const int64_t y_offset = 1;
+    float2 v;
+    dequantize_q8_0(vx, ib, iqs, v);
+    const int64_t iy0 = iybs + iqs;
+    y[iy0 + 0]        = v.x;
+    y[iy0 + y_offset] = v.y;
+}
+// ---- verbatim from ggml-quants.c (the CPU dequantizers; GGML_FP16_TO_FP32 = the exact f16 -> f32 conversion) ----
+#define GGML_FP16_TO_FP32(x) __half2float(x)
+#define GGML_RESTRICT __restrict
+static void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = 32;
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = x[i].qs[j]*d;
+        }
+    }
+}
+static void dequantize_row_q2_K(const block_q2_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    const int nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(__low2half(x[i].dm));
+        const float min = GGML_FP16_TO_FP32(__high2half(x[i].dm));
+        const uint8_t * q = x[i].qs;
+        int is = 0;
+        float dl, ml;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l] >> shift) & 3)) - ml;
+                sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+static void dequantize_row_q3_K(const block_q3_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    const int nb = k / QK_K;
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    uint32_t aux[4];
+    const int8_t * scales = (const int8_t*)aux;
+    for (int i = 0; i < nb; i++) {
+        const float d_all = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT q = x[i].qs;
+        const uint8_t * GGML_RESTRICT hm = x[i].hmask;
+        uint8_t m = 1;
+        memcpy(aux, x[i].scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        int is = 0;
+        float dl;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((int8_t)((q[l+ 0] >> shift) & 3) - ((hm[l+ 0] & m) ? 0 : 4));
+                }
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+static void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT ql = x[i].ql;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const int8_t  * GGML_RESTRICT sc = x[i].scales;
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l/16;
+                const int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
 // ---- verbatim from the main tree's w8a8-emu.cu (w8a8_rowquant), instrumented: the int8 values, the sub-scale of each
 // group and the row scale are stored as well (extra stores only; the arithmetic is unchanged) ----
 static __global__ void w8a8_rowquant(const float * __restrict__ x, const int64_t K, const float * __restrict__ f,
@@ -170,16 +394,52 @@ static __global__ void to_half_and_back(const float * x, __half * h, float * y, 
     const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
     if (i < n) { h[i] = __float2half(x[i]); y[i] = __half2float(h[i]); }
 }
-// our dequantization of every value (w8a8_dequant8), for the value-level comparison with ggml's
-template <bool q5>
-static __global__ void our_dequant(const void * vx, float * y, const int nblocks) {
+// our dequantization of every value (w8a8_dequant_unit), for the value-level comparison with ggml's
+template <int wt>
+static __global__ void our_dequant(const void * vx, float * y, const int nunits) {
     const int b = blockIdx.x * 8 + threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    if (b >= nblocks) return;
+    if (b >= nunits) return;
     float w[8];
-    w8a8_dequant8<q5>((const uint8_t *) vx + (int64_t) b * (q5 ? 176 : 144), lane, w);
-    const int j = lane / 4, pos = 8 * (lane % 4);
-    for (int i = 0; i < 8; ++i) y[(int64_t) b*256 + 32*j + pos + i] = w[i];
+    w8a8_dequant_unit<wt>((const uint8_t *) vx + (int64_t) b * w8a8_unit_bytes(wt), lane, w);
+    for (int i = 0; i < 8; ++i) y[(int64_t) b*256 + 8*lane + i] = w[i];
+}
+static void our_dequant_cuda(const int wt, const void * vx, float * y, const int nunits) {
+    const unsigned grid = (unsigned) ((nunits + 7) / 8);
+    switch (wt) {
+        case W8A8_W_Q4_K: our_dequant<W8A8_W_Q4_K><<<grid, 256>>>(vx, y, nunits); break;
+        case W8A8_W_Q5_K: our_dequant<W8A8_W_Q5_K><<<grid, 256>>>(vx, y, nunits); break;
+        case W8A8_W_Q6_K: our_dequant<W8A8_W_Q6_K><<<grid, 256>>>(vx, y, nunits); break;
+        case W8A8_W_Q8_0: our_dequant<W8A8_W_Q8_0><<<grid, 256>>>(vx, y, nunits); break;
+        case W8A8_W_Q3_K: our_dequant<W8A8_W_Q3_K><<<grid, 256>>>(vx, y, nunits); break;
+        case W8A8_W_Q2_K: our_dequant<W8A8_W_Q2_K><<<grid, 256>>>(vx, y, nunits); break;
+    }
+}
+static const char * wt_name(const int wt) {
+    static const char * names[] = {"Q4_K", "Q5_K", "Q6_K", "Q8_0", "Q3_K", "Q2_K"};
+    return names[wt];
+}
+// ggml's to_fp32 of the type (the emulation's dequantizer) on n = N*K values
+static void ggml_to_fp32_cuda(const int wt, const void * vx, float * y, const int64_t n) {
+    const unsigned nb = (unsigned) (n / 256);
+    switch (wt) {
+        case W8A8_W_Q4_K: dequantize_block_q4_K<float><<<nb, 32>>>(vx, y); break;
+        case W8A8_W_Q5_K: dequantize_block_q5_K<float><<<nb, 64>>>(vx, y); break;
+        case W8A8_W_Q6_K: dequantize_block_q6_K<float><<<nb, 64>>>(vx, y); break;
+        case W8A8_W_Q3_K: dequantize_block_q3_K<float><<<nb, 64>>>(vx, y); break;
+        case W8A8_W_Q2_K: dequantize_block_q2_K<float><<<nb, 64>>>(vx, y); break;
+        case W8A8_W_Q8_0: dequantize_block_q8_0<<<(unsigned) ((n/2 + 255) / 256), 256>>>(vx, y, n); break;
+    }
+}
+// ggml's CPU dequantizer of the type (false: none here - Q4_K / Q5_K were verified against the CUDA ones only)
+static bool ggml_to_fp32_cpu(const int wt, const void * vx, float * y, const int64_t n) {
+    switch (wt) {
+        case W8A8_W_Q6_K: dequantize_row_q6_K((const block_q6_K *) vx, y, n); return true;
+        case W8A8_W_Q8_0: dequantize_row_q8_0((const block_q8_0 *) vx, y, n); return true;
+        case W8A8_W_Q3_K: dequantize_row_q3_K((const block_q3_K *) vx, y, n); return true;
+        case W8A8_W_Q2_K: dequantize_row_q2_K((const block_q2_K *) vx, y, n); return true;
+        default: return false;
+    }
 }
 
 static long cmp_bytes(const void * a, const void * b, size_t n) {
@@ -188,31 +448,56 @@ static long cmp_bytes(const void * a, const void * b, size_t n) {
     return bad;
 }
 
-static void test_weights(bool q5, int N, int K, uint32_t seed) {
-    const int nb = K / 256, bsz = q5 ? 176 : 144;
-    std::vector<uint8_t> h((size_t) N * nb * bsz);
-    std::mt19937 rng(seed);
-    for (auto & c : h) c = (uint8_t) rng();
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    for (size_t b = 0; b < (size_t) N * nb; ++b) {  // realistic f16 d / dmin (random bytes could be inf / nan)
-        const float d = 2e-4f * std::exp(0.5f * nd(rng)), dm = 2e-4f * std::exp(0.5f * nd(rng));
-        __half hd = __float2half(d), hm = __float2half(dm);
-        memcpy(&h[b*bsz], &hd, 2); memcpy(&h[b*bsz + 2], &hm, 2);
+// the block layout of a type for the random test data: bytes per block, blocks per 256-value unit, the offsets of the
+// f16 d and dmin (-1: none)
+struct wt_layout { int bsz, per_unit, od, om; };
+static wt_layout layout_of(const int wt) {
+    switch (wt) {
+        case W8A8_W_Q4_K: return {144, 1,   0,  2};
+        case W8A8_W_Q5_K: return {176, 1,   0,  2};
+        case W8A8_W_Q6_K: return {210, 1, 208, -1};
+        case W8A8_W_Q8_0: return { 34, 8,   0, -1};
+        case W8A8_W_Q3_K: return {110, 1, 108, -1};
+        default:          return { 84, 1,  80, 82};   // Q2_K
     }
-    if (N > 3) {  // an all-zero row (amax = 0)
-        for (int b = 0; b < nb; ++b) memset(&h[((size_t) 3*nb + b)*bsz], 0, bsz);
+}
+
+// weights of type wt, N rows of K: random blocks (realistic f16 d / dmin, row 3 all zero), or `real` (raw rows of a
+// model file). ggml's dequantizer -> the emulation's w8a8_rowquant (bits 0) against our converter, plain and glu.
+static void test_weights(const int wt, int N, int K, uint32_t seed, const std::vector<uint8_t> * real = nullptr,
+                         const char * label = "random") {
+    const wt_layout L = layout_of(wt);
+    const int nb = K / 256 * L.per_unit, bsz = L.bsz;
+    std::vector<uint8_t> h((size_t) N * nb * bsz);
+    if (real) {
+        if (real->size() != h.size()) { printf("%s: %zu bytes, expected %zu\n", label, real->size(), h.size()); exit(1); }
+        h = *real;
+    } else {
+        std::mt19937 rng(seed);
+        for (auto & c : h) c = (uint8_t) rng();
+        std::normal_distribution<float> nd(0.0f, 1.0f);
+        for (size_t b = 0; b < (size_t) N * nb; ++b) {  // realistic f16 d / dmin (random bytes could be inf / nan)
+            const float d = 2e-4f * std::exp(0.5f * nd(rng)), dm = 2e-4f * std::exp(0.5f * nd(rng));
+            __half hd = __float2half(d), hm = __float2half(dm);
+            memcpy(&h[b*bsz + L.od], &hd, 2);
+            if (L.om >= 0) memcpy(&h[b*bsz + L.om], &hm, 2);
+        }
+        if (N > 3) {  // an all-zero row (amax = 0)
+            for (int b = 0; b < nb; ++b) memset(&h[((size_t) 3*nb + b)*bsz], 0, bsz);
+        }
     }
     void * dx; float * dwf; float * dwq; int8_t * deq; uint8_t * dsdummy; float * ddrow; int8_t * dqw; float * ddw; float * dours;
     CK(cudaMalloc(&dx, h.size())); CK(cudaMemcpy(dx, h.data(), h.size(), cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dwf, (size_t) N*K*4)); CK(cudaMalloc(&dwq, (size_t) N*K*4)); CK(cudaMalloc(&deq, (size_t) N*K));
     CK(cudaMalloc(&dsdummy, (size_t) N*K/32)); CK(cudaMalloc(&ddrow, N*4)); CK(cudaMalloc(&dqw, (size_t) N*K));
     CK(cudaMalloc(&ddw, N*4)); CK(cudaMalloc(&dours, (size_t) N*K*4));
-    if (q5) dequantize_block_q5_K<float><<<N*nb, 64>>>(dx, dwf); else dequantize_block_q4_K<float><<<N*nb, 32>>>(dx, dwf);
+    CK(cudaMemset(dqw, 0x55, (size_t) N*K)); CK(cudaMemset(ddw, 0x55, N*4));
+    ggml_to_fp32_cuda(wt, dx, dwf, (int64_t) N*K);
     w8a8_rowquant<<<N, 256>>>(dwf, K, nullptr, 0, dwq, deq, dsdummy, ddrow);
-    w8a8_convert_weights_cuda(dx, q5, false, (int64_t) nb*bsz, dqw, ddw, N, K, 0);
-    if (q5) our_dequant<true><<<(N*nb + 7)/8, 256>>>(dx, dours, N*nb); else our_dequant<false><<<(N*nb + 7)/8, 256>>>(dx, dours, N*nb);
+    if (!w8a8_convert_weights_cuda(dx, wt, false, (int64_t) nb*bsz, dqw, ddw, N, K, 0)) { printf("type %d not converted\n", wt); exit(1); }
+    our_dequant_cuda(wt, dx, dours, N*K/256);
     CK(cudaDeviceSynchronize());
-    std::vector<float> wf((size_t) N*K), wo((size_t) N*K), drow(N), dw(N);
+    std::vector<float> wf((size_t) N*K), wo((size_t) N*K), drow(N), dw(N), wc((size_t) N*K);
     std::vector<int8_t> qe((size_t) N*K), qo((size_t) N*K);
     CK(cudaMemcpy(wf.data(), dwf, wf.size()*4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(wo.data(), dours, wo.size()*4, cudaMemcpyDeviceToHost));
@@ -220,10 +505,19 @@ static void test_weights(bool q5, int N, int K, uint32_t seed) {
     CK(cudaMemcpy(qo.data(), dqw, qo.size(), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(drow.data(), ddrow, N*4, cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(dw.data(), ddw, N*4, cudaMemcpyDeviceToHost));
+    auto nbits_differ = [](const float * a, const float * b, size_t n) {
+        long c = 0; for (size_t i = 0; i < n; ++i) c += memcmp(&a[i], &b[i], 4) != 0; return c; };
+    // ggml's CPU dequantizer of the same blocks (every value against the CUDA one, and ours)
+    char cpu[96] = "CPU: -";
+    if (ggml_to_fp32_cpu(wt, h.data(), wc.data(), (int64_t) N*K)) {
+        snprintf(cpu, sizeof cpu, "CPU dequantizer vs ggml CUDA: %ld, vs ours: %ld", nbits_differ(wc.data(), wf.data(), wc.size()),
+                 nbits_differ(wc.data(), wo.data(), wc.size()));
+    }
     // glu interleaving: row n -> 2n (n < N/2) / 2(n - N/2) + 1
     int8_t * dqg; float * ddg;
     CK(cudaMalloc(&dqg, (size_t) N*K)); CK(cudaMalloc(&ddg, N*4));
-    w8a8_convert_weights_cuda(dx, q5, true, (int64_t) nb*bsz, dqg, ddg, N, K, 0);
+    CK(cudaMemset(dqg, 0x55, (size_t) N*K)); CK(cudaMemset(ddg, 0x55, N*4));
+    w8a8_convert_weights_cuda(dx, wt, true, (int64_t) nb*bsz, dqg, ddg, N, K, 0);
     std::vector<int8_t> qg((size_t) N*K); std::vector<float> dg(N);
     CK(cudaMemcpy(qg.data(), dqg, qg.size(), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(dg.data(), ddg, N*4, cudaMemcpyDeviceToHost));
@@ -232,13 +526,13 @@ static void test_weights(bool q5, int N, int K, uint32_t seed) {
         const int o = n < N/2 ? 2*n : 2*(n - N/2) + 1;
         badg += cmp_bytes(&qg[(size_t) o*K], &qe[(size_t) n*K], K) + (memcmp(&dg[o], &drow[n], 4) != 0);
     }
-    printf("weights %s %5d x %5d: dequantized values differ from ggml's: %ld of %zu | int8 differ from the emulation: %ld | "
-           "dW differ: %ld of %d | glu-interleaved rows/scales differ: %ld\n", q5 ? "Q5_K" : "Q4_K", N, K,
-           cmp_bytes(wf.data(), wo.data(), wf.size()*4) ? (long) std::count_if(wf.begin(), wf.end(), [&](const float & v) {
-               const size_t i = &v - wf.data(); return memcmp(&v, &wo[i], 4) != 0; }) : 0L, wf.size(),
-           cmp_bytes(qe.data(), qo.data(), qe.size()), cmp_bytes(drow.data(), dw.data(), N*4) ? (long) std::count_if(
-               drow.begin(), drow.end(), [&](const float & v) { const size_t i = &v - drow.data(); return memcmp(&v, &dw[i], 4) != 0; }) : 0L,
-           N, badg);
+    long zero_rows = 0, sat = 0;
+    for (int n = 0; n < N; ++n) zero_rows += drow[n] == 0.0f;
+    for (auto q : qe) sat += q == 127 || q == -127;
+    printf("weights %s %-6s %5d x %5d: dequantized values differ from ggml's: %ld of %zu | %s | int8 differ from the emulation: %ld"
+           " | dW differ: %ld of %d | glu-interleaved rows/scales differ: %ld | (zero rows %ld, +-127 values %ld)\n",
+           wt_name(wt), label, N, K, nbits_differ(wf.data(), wo.data(), wf.size()), wf.size(), cpu,
+           cmp_bytes(qe.data(), qo.data(), qe.size()), nbits_differ(drow.data(), dw.data(), N), N, badg, zero_rows, sat);
     CK(cudaFree(dx)); CK(cudaFree(dwf)); CK(cudaFree(dwq)); CK(cudaFree(deq)); CK(cudaFree(dsdummy)); CK(cudaFree(ddrow));
     CK(cudaFree(dqw)); CK(cudaFree(ddw)); CK(cudaFree(dours)); CK(cudaFree(dqg)); CK(cudaFree(ddg));
 }
@@ -315,10 +609,33 @@ static std::vector<float> synth(int T, int K, uint32_t seed) {
 }
 
 int main(int argc, char ** argv) {
-    test_weights(false, 4096, 4096, 1);
-    test_weights(false, 512, 12288, 2);
-    test_weights(true, 4096, 4096, 3);
-    test_weights(true, 512, 12288, 4);
+    test_weights(W8A8_W_Q4_K, 4096, 4096, 1);
+    test_weights(W8A8_W_Q4_K, 512, 12288, 2);
+    test_weights(W8A8_W_Q5_K, 4096, 4096, 3);
+    test_weights(W8A8_W_Q5_K, 512, 12288, 4);
+    uint32_t seed = 5;
+    for (int wt : {W8A8_W_Q6_K, W8A8_W_Q8_0, W8A8_W_Q3_K, W8A8_W_Q2_K}) {
+        test_weights(wt, 4096, 4096, seed++);
+        test_weights(wt, 512, 12288, seed++);
+        test_weights(wt, 384, 4096, seed++);
+    }
+    // real rows of a model file: w:<type>:<N>:<K>:<raw file> (the tensor's first N rows, as stored)
+    for (int a = 1; a < argc; ++a) {
+        if (strncmp(argv[a], "w:", 2) != 0) continue;
+        char tn[8] = {0}; int N = 0, K = 0, off = 0;
+        if (sscanf(argv[a], "w:%7[^:]:%d:%d:%n", tn, &N, &K, &off) != 3 || off == 0) { printf("bad %s\n", argv[a]); return 1; }
+        int wt = -1;
+        for (int t = 0; t < 6; ++t) if (strcmp(tn, wt_name(t)) == 0) wt = t;
+        FILE * f = fopen(argv[a] + off, "rb");
+        if (!f || wt < 0) { printf("cannot open %s / type %s\n", argv[a] + off, tn); return 1; }
+        const wt_layout L = layout_of(wt);
+        std::vector<uint8_t> raw((size_t) N * (K / 256 * L.per_unit) * L.bsz);
+        const size_t got = fread(raw.data(), 1, raw.size(), f); fclose(f);
+        if (got != raw.size()) { printf("%s: short file\n", argv[a] + off); return 1; }
+        const char * base = strrchr(argv[a] + off, '/') ? strrchr(argv[a] + off, '/') + 1 : argv[a] + off;
+        test_weights(wt, N, K, 0, &raw, base);
+    }
+    if (getenv("W8A8_TEST_WEIGHTS_ONLY")) return 0;
     for (int K : {4096, 12288}) {
         for (int T : {300, 1811}) {
             auto x = synth(T, K, 10 + T + K);
@@ -330,6 +647,7 @@ int main(int argc, char ** argv) {
         }
     }
     for (int a = 1; a < argc; ++a) {   // engine dumps: [magic K T nrows] cmax[K] csq[K] rows[nrows][K]
+        if (strncmp(argv[a], "w:", 2) == 0) continue;
         FILE * f = fopen(argv[a], "rb");
         if (!f) { printf("cannot open %s\n", argv[a]); continue; }
         int32_t hd[4]; fread(hd, 4, 4, f);
