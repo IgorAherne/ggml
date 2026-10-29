@@ -534,3 +534,106 @@ On the pod (cd /workspace/w8a8t; CUDA_VISIBLE_DEVICES=0):
       "--vae-tiling --vae-tile-size 512" on an 8 GB card), then --steps 25 once each for the drawing time.
 Decision rule: keep W8A8_TURING_DEFAULT = true if the drawing step is faster than with GGML_CUDA_W8A8_TURING=0; if the
 64 x 64 binary wins on the card, set W8A8T_WM 64 (its defaults follow).
+
+# Q6_K / Q8_0 / Q3_K weights (2026-10-29, branch spellcast-w8a8-kquants from spellcast-perf d1dbbf48)
+Brief: scratchpad brief_kquants.md (session 396c384d). Worktree C:\_myDrive\repos\spellcast3d\temp_code\ggml-kquants (built
+with build-w8a8.cmd, sm_86). Why: the Turbo's bigger sizes are mostly Q6_K / Q8_0 (Turbo Q5_K_M: 76 Q6_K + 98 Q5_K + 18
+Q8_0 of its 192 block matmuls; Q4_K_M: 163 Q4_K + 27 Q5_K + one Q6_K and one Q8_0 attn.to_v), and those fell back to MMQ.
+## What changed (commit 07adf412)
+- w8a8.cuh: the converter is templated on the weight type (enum w8a8_wtype: Q4_K 0, Q5_K 1, Q6_K 2, Q8_0 3, Q3_K 4,
+  Q2_K 5; w8a8_convert_weights<wt, glu>, w8a8_unit_bytes). A row is a sequence of 256-value units (a k-quant
+  super-block; eight 34-byte Q8_0 blocks), lane l makes the values 8l .. 8l+7 of each unit as before; the new types'
+  dequantizers repeat the f32 operations of ggml's CUDA ones (dequantize_q6_K: d*sc*(q-32); dequantize_q8_0: q*d;
+  dequantize_q3_K: d*(us-32)*(q - 4*(high bit clear)); dequantize_q2_K: fma(d*sc, q, -dmin*m)), their quants read in
+  16-bit pieces (210 / 34 / 110-byte blocks are only 2-byte aligned in a row; Q2_K's 84: 32-bit). The per-row int8 rule,
+  the GLU interleave, the GEMMs, the quantizer and the norm writer are untouched; Q4_K / Q5_K call the old
+  w8a8_dequant8<q5> unchanged. w8a8_convert_weights_cuda(vx, wt, glu, ...) returns false for another type.
+- w8a8-mm.cu: w8a8_weight_type(ggml_type) -> w8a8_wtype or -1; ggml_cuda_w8a8_supported asks it. Every gate goes through
+  ggml_cuda_w8a8_supported (the dispatch, ggml_cuda_mul_mat_uses_mmq_q8_1, ggml_cuda_try_fuse_w8a8's SCALE / shared-src1
+  / GLU-chain tests, ggml_cuda_w8a8_consumers of the norm writer), so they all admit the new types; nothing else tests the
+  type (the GGML_TYPE_Q4_K / Q5_K cases in ggml-cuda.cu near 6905 / 6944 are supports_op's lists of every type). The log
+  line now says "Q2_K..Q6_K/Q8_0 products". K / token / names gates and GGML_CUDA_W8A8_KERNEL=off unchanged.
+- w8a8-emu.cu: the research emulation takes the same types. CAUTION: GGML_CUDA_W8A8=sub:5 runs of a Q4_K_M file now
+  emulate its two Q6_K / Q8_0 to_v layers too (before: MMQ there).
+- Q2_K came for free (two more converter kernels). FLUX.3 Klein's UD file has Q2_K / Q3_K / Q6_K / Q8_0 blocks, but its
+  tensor names (single_blocks, content_mode_blocks...) never contain "transformer_blocks": the default names gate keeps
+  FLUX.3 on MMQ, as before.
+- Tools: test_formats.cu (the new types, CPU dequantizers, real rows), w8a8bench W8A8BENCH_TYPES="<t2>,<t3>,<td>"
+  (mixed-type q/k/v and GLU chains), verify_kq.sh (regress | emu [1|2|3] | norm [T]), sass_cmp.py (SASS_MAP renames,
+  saved .txt listings, the last function's trailing listing headers stripped), kt.py (KT_LOCK).
+## Exactness (test_formats; build_tool.cmd test_formats; run under the lock with the 6 activation dumps of Step 1 and
+## w:<type>:<N>:<K>:<file> raw rows dumped from the GGUFs by scratchpad kquants/dump_rows.py)
+Every line 0: dequantized values vs ggml's CUDA to_fp32 (verbatim copies, same flags), vs ggml-quants.c's CPU
+dequantizers (verbatim, Q6_K / Q8_0 / Q3_K / Q2_K: CPU = CUDA = ours on every value), int8 vs the emulation's
+w8a8_rowquant (bits 0), the row scales, the GLU-interleaved rows and scales:
+  random blocks (realistic f16 d / dmin, row 3 all zero) Q4_K / Q5_K 4096x4096 and 512x12288 (the old cases, same data);
+  Q6_K, Q8_0, Q3_K, Q2_K at 4096x4096, 512x12288, 384x4096;
+  real Turbo rows: Q5_K_M b0.attn.to_v Q6_K, b1.attn.to_out.0 Q6_K, b1.attn.to_v Q8_0, b1.img_mlp.out Q6_K (K 12288),
+  b23.img_mlp.gate_up Q6_K (24576 rows, GLU), b3.attn.to_out.0 Q8_0; Q4_K_M b27.attn.to_v Q6_K, b1.attn.to_v Q8_0.
+  The activation lines (synthetic, SCALE, f16, 6 dumps): 0 as before.
+(Why CPU = CUDA even for Q2_K's multiply-subtract: d*sc*q and dmin*m are exact in f32 for these small integers, the
+subtraction is the only rounding, so contraction cannot change a bit; Q6_K's d*sc*(q-32) can round but is two multiplies
+in the same order on both.) The CPU row rule is not reproduced: the emulation's 127/amax is a fast-math division.
+## Q4_K / Q5_K unchanged
+- SASS (cuobjdump -sass of both ggml-cuda.dll, sass_cmp.py with SASS_MAP=weightsILb0ELb0E=weightsILi0ELb0E,...):
+  6,508 of 6,508 kernels of the d1dbbf48 build identical in the new one (every GEMM, the quantizer, the norm writer,
+  every MMQ kernel; the Q4_K / Q5_K converters under their new names); only the 8 new converter kernels added.
+- verify_kq.sh regress (the d1dbbf48 DLL vs the new one, w8a8bench, fusion on): 19 of 19 hashes identical - verify1's
+  13 cases, verify_norm's normmm3 / normglu random + real, q5_K K 12288, a mixed Q4_K/Q5_K mm3 (7a9b31ec0f5211c9,
+  526839cf860f3fc1, ... = the Task 3 / Turing hashes of this file).
+- test_gemm (rebuilt with the changed header): 0 differences on the 9 default shapes.
+## ggml level against the emulation (verify_kq.sh emu 1|2|3; emu = GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:5,
+## same DLL; rel L2 | max |diff| / rms; k = fusion on, kn = off; MMQ = GGML_CUDA_W8A8_KERNEL=off)
+  mm q6_K 4096^2 T 4096 / 4145 / 1811 / 8360: 1.13e-06 / 7.99e-07 / 1.13e-06 / 1.13e-06 (max 1.7e-05); MMQ 1.13e-02
+  mm q6_K K 12288 T 4145 1.38e-06; real down input (dump 000257) 1.35e-06 (MMQ 1.47e-02); real to_q input 8.14e-07
+  mm q8_0 4096^2 T 4096 / 4145 / 8360: 1.14e-06 / 8.06e-07 / 1.14e-06; K 12288 1.39e-06; real to_q 8.20e-07; MMQ 1.14e-02
+  mm q3_K T 4145 7.22e-07, K 12288 1.25e-06; q2_K T 4145 8.07e-07 (MMQ 1.07e-02 / 1.45e-02)
+  SCALE x/32 + mm q6_K / q8_0: 7.99e-07 / 8.06e-07; mm3 q5_K + q5_K + q8_0 (one src1): 8.05e-07
+  glu q6_K / q8_0 / q6_K + q5_K down / q6_K real gate_up input: f16 2.05e-03 .. 2.07e-03; f32 = fusion off bit-identical
+  (e.g. 393ca11daf91b52e) 1.87e-04 .. 1.96e-04; MMQ 2.2e-02 .. 2.9e-02
+  -> the Q4_K class of Task 3 (8.0e-07 .. 1.97e-06; GLU 2.07e-03 / 1.88e-04); k = kn in every case.
+- Norm writer with mixed types (verify_kq.sh norm 4145 / 1811): normmm3 [q5_K, q5_K, q8_0], [q6_K, q6_K, q8_0], real
+  [q5_K, q5_K, q8_0]: fused = norm off = no fusion; normglu q6_K (down q5_K / real q6_K): fused = norm off (no fusion runs
+  ggml's f32 SWIGLU, as before), with GGML_CUDA_W8A8_GLU=f32 all three identical; GGML_CUDA_W8A8_CHECK_NORM: 0 bytes.
+## Kernel times (nsys, kt.py, w8a8bench T 4096, medians of 12 calls; KERNEL=off for MMQ)
+  converter 4096^2: Q4_K 108.0 us | Q6_K 140.5 | Q8_0 160.8 | Q3_K 155.1 | Q2_K 83.0; K 12288 Q6_K 434.6 (Q4_K 358);
+  GLU-interleaved Q6_K 4096x24576 824.0 (Q4_K 610)
+  per call q6_K 4096^2: W8A8 1798.9 + 253.0 + 140.5 = 2,192 us vs MMQ 4,267.1 + 258.1 = 4,525 (-52 %); q8_0: 2,212 vs
+  3,452.2 + 257.8 = 3,710 (-40 %); q6_K K 12288: 5,253 + 756 + 435 = 6,444 vs 12,602 + 841 = 13,443 (-52 %)
+  ggml level (verify_kq emu, median ms, MMQ in brackets): q6_K 4096^2 T 4096 2.21 [4.54]; q8_0 2.23 [3.74]; q6_K K 12288
+  6.62 [14.10]; q3_K 2.27 [4.77]; q2_K 2.20 [6.06]; glu q6_K 18.2 [43.4]
+- sd-cli census (scratchpad kquants/nsys_types.sh: nsys of 2 steps): Turbo Q5_K_M per step 71 Q6_K + 5 Q6_K GLU + 18
+  Q8_0 + 71 Q5_K + 27 Q5_K GLU conversions = all 192 block matmuls on the path; Q4_K_M: 131 + 32 Q4_K, 27 Q5_K, 1 Q6_K,
+  1 Q8_0 = 192.
+## Pictures (sd-cli 1024x1024, the Turbo's 8 sigmas, euler, cfg 1, --sage-attn, --diffusion-fa, transparent prompt;
+## scratchpad kquants/pics2.py; new = this branch, base = the d1dbbf48 build, off = new with GGML_CUDA_W8A8_KERNEL=off,
+## ctl = new with GGML_CUDA_W8A8_GLU=f32: a rounding-only control); PSNR rgb dB (LPIPS)
+  Turbo Q5_K_M     chest 4242     knight 1234    well 31        robot 77
+  new vs off       36.85 (.006)   29.26 (.032)   28.25 (.020)   37.04 (.005)    <- the whole format change
+  base vs off      34.64 (.011)   30.90 (.025)   28.57 (.020)   32.92 (.009)    <- the 2026-10-23 engine against MMQ
+  new vs base      33.26 (.014)   37.38 (.009)   36.63 (.006)   35.47 (.006)    <- this branch's change
+  new vs ctl       43.39 (.002)   31.95 (.021)   38.97 (.004)   38.67 (.004)    <- rounding only
+  Turbo Q4_K_M (only the two to_v layers change)
+  new vs base      34.95 (.007)   39.95 (.006)   31.26 (.019)   34.75 (.009)
+  new vs ctl       37.40 (.004)   39.04 (.006)   33.90 (.017)   42.79 (.002)    <- rounding only
+  base vs ctl      39.40 (.003)   40.43 (.006)   34.03 (.009)   33.74 (.009)
+  new vs off       30.37 (.021)   27.68 (.040)   30.59 (.020)   35.64 (.009)
+Reading: every change is in the rounding class of its seed (the knight moves to 32 dB and the well to 34 dB with a
+rounding-only change); same compositions and materials, the well's crank / handle drawn a little differently (side by
+side sheets: scratchpad kquants/sheet_q5.png, sheet_q4.png, diffsheet_*_base_vs_new.png). Repeats of a configuration
+are pixel-identical (chest x3 new, x2 base: PSNR inf).
+## Speed (sd-cli progress bar, steady s/it = median of steps 2..8; every run of the picture set plus chest repeats;
+## busy SM clock 1,785-1,882 MHz at the 168-170 W cap: the int8 runs ~1,790-1,820, MMQ ~1,845-1,880)
+  Turbo Q5_K_M: new 1.10 / 1.11 / 1.12 (chest x3), 1.15 / 1.11 / 1.15 (knight / well / robot) -> 1.10 s
+                base 1.51 / 1.48 / 1.51, 1.47 / 1.47 / 1.52 -> 1.47 s;  MMQ 1.78 / 1.71, 1.70 / 1.73 / 1.76 -> 1.70 s
+                -> -25 % a step against the d1dbbf48 engine, -35 % against MMQ
+  Turbo Q4_K_M: new 1.13 / 1.09 / 1.11, 1.13 / 1.12 / 1.14 -> 1.09 s; base 1.13 / 1.10 / 1.10, 1.12 / 1.11 / 1.11 ->
+                1.10 s (the same: two layers); MMQ 1.51 / 1.48, 1.48 / 1.47 / 1.49 -> 1.47 s
+## Release architectures (relcheck.py: w8a8-mm.cu, ggml-cuda.cu, w8a8-emu.cu, norm.cu x sm_61 / 70 / 75 / 80 / 86 / 89 /
+## 90 / 100 / 120): 36 of 36 compiled; the 12 converter kernels real code on every arch (30-47 registers, no stack, no
+## local memory). The dp4a and Turing GEMMs read the same converted weights: compiled only, not run here.
+## Not verified
+Pascal (dp4a) and Turing cards with the new types (compiled only; the coordinator's GTX 1070 pod); sm_80 / 89 / 90 /
+100 / 120 hardware; the Q3_K_M / Q6_K / Q8_0 Turbo files (not on disk: the Q3_K / Q6_K / Q8_0 products themselves are
+verified at ggml level and through the Q5_K_M file); the hub's 8 GB plan with these sizes (the path's pool memory per
+product is the Q4_K one: N*K int8 + the activations); Linux (gcc) compile of the changed files.

@@ -19,7 +19,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 bin_dir = str(Path(sys.argv[1]).resolve())
 tag = os.environ.get("KT_TAG", "r")
 env = dict(os.environ, PATH=bin_dir + os.pathsep + os.environ["PATH"])
-with gpu_lock.gpu_lock("QS4", "w8a8 nsys kernel times", expected_minutes=5):
+with gpu_lock.gpu_lock(os.environ.get("KT_LOCK", "QS4"), "w8a8 nsys kernel times", expected_minutes=5):
     for k, a in enumerate(sys.argv[2:]):
         rep = OUT / f"{tag}{k}"
         for ext in (".nsys-rep", ".sqlite"):

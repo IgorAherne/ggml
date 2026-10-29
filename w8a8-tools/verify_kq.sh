@@ -5,7 +5,7 @@
 #   verify_kq.sh emu [part]
 #       the new types against the research emulation in the same DLL (GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_W8A8=sub:5),
 #       the path fused (k) and unfused (kn), MMQ (GGML_CUDA_W8A8_KERNEL=off) for scale; out/kq_<case>_*.bin, compare.py
-#   verify_kq.sh norm
+#   verify_kq.sh norm [T ...]
 #       mixed-type q/k/v and GLU chains behind the fused norm writer: fused = norm off = no fusion, the byte check
 # A backend dir holds ggml-cuda.dll (+ ggml-cpu-*.dll); ggml.dll / ggml-base.dll / the CUDA runtime come from
 # ../build-sm86/bin (PATH). Run each mode under the GPU lock.
@@ -117,15 +117,15 @@ norm_case() { # label act types op type K N T
   echo "$label [$types] $*: fused $x1 ($t1 ms) | norm off $x2 ($t2 ms) | no fusion $x3 ($t3 ms) -> $same | check: $chk"
 }
 
-norm() {
-  for T in 4145 1811; do
+norm() {  # [T ...] (default 4145 1811); the GLU f32 case with T 4145
+  for T in ${@:-4145 1811}; do
     norm_case random - q5_K,q8_0 normmm3 q5_K 4096 4096 $T
     norm_case random - q6_K,q8_0 normmm3 q6_K 4096 4096 $T
     norm_case real $D/dump_knight/000252.bin q5_K,q8_0 normmm3 q5_K 4096 4096 $T
     norm_case random - -,-,q5_K normglu q6_K 4096 24576 $T
     norm_case real $D/dump_knight/000256.bin -,-,q6_K normglu q6_K 4096 24576 $T
   done
-  GGML_CUDA_W8A8_GLU=f32 norm_case glu_f32 - -,-,q5_K normglu q6_K 4096 24576 4145
+  case " ${*:-4145} " in *" 4145 "*) GGML_CUDA_W8A8_GLU=f32 norm_case glu_f32 - -,-,q5_K normglu q6_K 4096 24576 4145;; esac
 }
 
 mode=$1; shift
