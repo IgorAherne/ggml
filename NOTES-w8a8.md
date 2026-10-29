@@ -633,7 +633,13 @@ are pixel-identical (chest x3 new, x2 base: PSNR inf).
 ## 90 / 100 / 120): 36 of 36 compiled; the 12 converter kernels real code on every arch (30-47 registers, no stack, no
 ## local memory). The dp4a and Turing GEMMs read the same converted weights: compiled only, not run here.
 ## Not verified
-Pascal (dp4a) and Turing cards with the new types (compiled only; the coordinator's GTX 1070 pod); sm_80 / 89 / 90 /
-100 / 120 hardware; the Q3_K_M / Q6_K / Q8_0 Turbo files (not on disk: the Q3_K / Q6_K / Q8_0 products themselves are
-verified at ggml level and through the Q5_K_M file); the hub's 8 GB plan with these sizes (the path's pool memory per
-product is the Q4_K one: N*K int8 + the activations); Linux (gcc) compile of the changed files.
+Turing cards with the new types (compiled only); sm_80 / 89 / 90 / 100 / 120 hardware; the Q3_K_M / Q6_K / Q8_0 Turbo
+files (not on disk: the Q3_K / Q6_K / Q8_0 products themselves are verified at ggml level and through the Q5_K_M file);
+the hub's 8 GB plan with these sizes (the path's pool memory per product is the Q4_K one: N*K int8 + the activations).
+## Pascal, real card (the coordinator, 2026-10-30: GTX 1070 8 GB pod, the Linux build of 1cf21616, sd-cli, the chest at
+## seed 4242, the Turbo's 8 sigmas, 1024x1024, --diffusion-fa --vae-conv-direct; scratch pod_kq.sh / pod_kq/)
+Turbo Q5_K_M: dp4a kernel on 5.05-5.09 s/it (sampling 47.9 s) vs GGML_CUDA_W8A8_KERNEL=off 8.43-8.48 s/it (74.9 s):
+-40 %, the same speed as the Q4_K_M (5.10-5.16 s/it on, 7.84-7.87 off); the 5.4 GB file fit the 8 GB card in one piece
+(no segments). Pictures on vs off: Q5_K_M 31.4 dB rgb / LPIPS 0.016 / SSIM 0.978, Q4_K_M 30.8 dB / 0.020 / 0.966 - the
+class of the dp4a path's own int8-vs-MMQ change of 2026-10-24 (chest 30.8 dB); the same chest, the lock's rings the
+known bistable detail. The Linux (gcc) compile of the changed files passed in that build.
