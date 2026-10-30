@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
-rem Standalone compute_75 build (the Turing paths, run on newer cards with GGML_CUDA_FAKE_CC=750) of this ggml worktree (flags as stable-diffusion.cpp\build-sm75.cmd), tests configured
-rem (build test-backend-ops by name: build-vaeconv.cmd test-backend-ops). Default target: ggml-cuda.
+rem Standalone compute_75 build (the Turing paths, run on newer cards with GGML_CUDA_FAKE_CC=750) of this ggml worktree (flags as stable-diffusion.cpp\build-sm75.cmd) (tests off)
+rem Default target: ggml-cuda.
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
 set "PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;C:\_myDrive\repos\spellcast3d\code\venvs\pixal3d\Scripts;%PATH%"
 set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
