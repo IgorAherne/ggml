@@ -1,6 +1,7 @@
 #include "conv2d.cuh"
 #include "convert.cuh"
 #include "mma.cuh"
+#include "conv2d-mma.cuh"
 
 struct conv_params {
     const int64_t IW, IH;
@@ -1369,6 +1370,85 @@ static bool conv2d_i8_input_ok(const ggml_tensor * t) {
     return false;
 }
 
+// Spellcast3D: the tensor-core implicit GEMM (conv2d-mma.cuh) for NVIDIA cards with Turing MMA (cc >= 7.5), in place
+// of conv2d_implicit_gemm_f16<.., true> and of cuBLAS for 1x1 (RTX 3060, the Qwen-Image 2.1 VAE decode at 1024x1024:
+// see ggml/NOTES-conv2d-mma.md). Volta, the GTX 10xx (their F32 and int8 kernels above), AMD and MooreThreads keep
+// their paths. GGML_CUDA_CONV2D_MMA=0: the old kernels; 2: the Turing kernel (register-staged, m16n8k8) on every
+// card that has it (research).
+static int conv2d_mma_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_CUDA_CONV2D_MMA");
+        return e == nullptr ? 1 : atoi(e);
+    }();
+    return mode;
+}
+
+bool ggml_cuda_conv2d_mma_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * conv) {
+    if (conv->op != GGML_OP_CONV_2D || conv2d_mma_mode() == 0) {
+        return false;
+    }
+    const ggml_tensor * kernel = conv->src[0];
+    const ggml_tensor * input  = conv->src[1];
+    const int           cc     = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) || kernel->type != GGML_TYPE_F16 ||
+        input->type != GGML_TYPE_F32 || conv->type != GGML_TYPE_F32 || !ggml_is_contiguous(kernel) ||
+        !ggml_is_contiguous(input) || !ggml_is_contiguous(conv) || input->ne[2] != kernel->ne[2]) {
+        return false;
+    }
+    const int32_t * p = (const int32_t *) conv->op_params;
+    if (p[6] != 0) {  // cwhn
+        return false;
+    }
+    return conv2d_mma_shape_ok(input->ne[0], input->ne[1], conv->ne[0], conv->ne[1], kernel->ne[0], kernel->ne[1],
+                               input->ne[2], kernel->ne[3], input->ne[3], p[0], p[1], p[2], p[3], p[4], p[5]);
+}
+
+void ggml_cuda_conv2d_mma_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * conv,
+                                const ggml_cuda_conv2d_fusion & f) {
+    const ggml_tensor * kernel = conv->src[0];
+    const ggml_tensor * input  = conv->src[1];
+    const int32_t *     op     = (const int32_t *) conv->op_params;
+    const int           cc     = ggml_cuda_info().devices[ctx.device].cc;
+    cudaStream_t        st     = ctx.stream();
+
+    const int iw = int(input->ne[0]), ih = int(input->ne[1]), ic = int(input->ne[2]), b = int(input->ne[3]);
+    const int kw = int(kernel->ne[0]), kh = int(kernel->ne[1]), oc = int(kernel->ne[3]);
+    const int ow = int(conv->ne[0]), oh = int(conv->ne[1]);
+    GGML_ASSERT(f.out != nullptr && (f.up == 1 || f.up == 2));
+
+    ggml_cuda_pool_alloc<half> xbuf(ctx.pool());
+    const half *               xh = f.xh;
+    if (xh == nullptr) {
+        GGML_ASSERT(f.x != nullptr && ggml_nelements(f.x) * f.up * f.up == ggml_nelements(input));
+        xbuf.alloc(int64_t(b) * ih * iw * ic);
+        conv2d_mma_to_nhwc((const float *) f.x->data, xbuf.get(), ic, ih, iw, b, f.up, f.in_affine, f.in_scale,
+                           f.in_sbias, st);
+        xh = xbuf.get();
+    }
+
+    const half *               w = (const half *) kernel->data;
+    ggml_cuda_pool_alloc<half> wbuf(ctx.pool());
+    if (kw * kh > 1 || uintptr_t(w) % 16 != 0) {
+        wbuf.alloc(int64_t(oc) * kw * kh * ic);
+        conv2d_mma_reorder_weights(w, wbuf.get(), oc, ic, kw * kh, st);
+        w = wbuf.get();
+    }
+
+    conv2d_mma_params p = {};
+    p.iw = iw, p.ih = ih, p.ic = ic, p.ow = ow, p.oh = oh, p.oc = oc, p.kw = kw, p.kh = kh;
+    p.sx = op[0], p.sy = op[1], p.px = op[2], p.py = op[3], p.dx = op[4], p.dy = op[5];
+    p.k = kw * kh * ic, p.ohw = ow * oh, p.npos = b * ow * oh;
+    p.affine = f.out_affine, p.scale = f.out_scale, p.sbias = f.out_sbias;
+    p.bias   = f.bias ? (const float *) f.bias->data : nullptr;
+    p.z      = f.z ? (const float *) f.z->data : nullptr;
+    // GGML_CUDA_CONV2D_MMA_ACC=16: F16 accumulation (research: twice the tensor rate of F32 accumulation on GeForce cards)
+    static const bool acc16 = [] {
+        const char * e = getenv("GGML_CUDA_CONV2D_MMA_ACC");
+        return e != nullptr && atoi(e) == 16;
+    }();
+    conv2d_mma_launch(xh, w, (float *) f.out->data, p, cp_async_available(cc) && conv2d_mma_mode() != 2, st, acc16);
+}
+
 void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
@@ -1411,6 +1491,13 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
 
     const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (ggml_cuda_conv2d_mma_supported(ctx, dst)) {
+        ggml_cuda_conv2d_fusion f;
+        f.x   = input;
+        f.out = dst;
+        ggml_cuda_conv2d_mma_fused(ctx, dst, f);
+        return;
+    }
     const bool   use_mma =
         turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
     // MUSA can share the tiling without a native fragment implementation in mma.cuh. Spellcast3D: so can the NVIDIA

@@ -215,11 +215,44 @@ static __global__ void upscale_f32_bicubic(const float * x, float * dst,
     dst[index] = result;
 }
 
+// Spellcast3D: nearest upscaling by integer factors k0 x k1 in the first two dims only (e.g. the VAE decoders' 2x), four
+// consecutive outputs of a row a thread with one 16-byte store; the source indices are upscale_f32's (i / k equals its
+// int(i / sf) for these sizes: exact float quotients of integers below 2^16). Any source strides. ne10 % 4 == 0.
+static __global__ void upscale_f32_nearest_int(const float * x, float * dst, const int nb00, const int nb01,
+                                               const int nb02, const int nb03, const int ne10, const int ne11,
+                                               const int ne12, const int k0, const int k1, const int64_t n4) {
+    const int64_t i4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i4 >= n4) {
+        return;
+    }
+    const int64_t i   = 4 * i4;
+    const int     i10 = int(i % ne10);
+    const int64_t r   = i / ne10;
+    const int     i11 = int(r % ne11);
+    const int64_t r2  = r / ne11;
+    const int     i12 = int(r2 % ne12);
+    const int     i13 = int(r2 / ne12);
+    const char *  row = (const char *) x + int64_t(i13) * nb03 + int64_t(i12) * nb02 + int64_t(i11 / k1) * nb01;
+    float4        v;
+    v.x = *(const float *) (row + int64_t((i10 + 0) / k0) * nb00);
+    v.y = *(const float *) (row + int64_t((i10 + 1) / k0) * nb00);
+    v.z = *(const float *) (row + int64_t((i10 + 2) / k0) * nb00);
+    v.w = *(const float *) (row + int64_t((i10 + 3) / k0) * nb00);
+    *(float4 *) (dst + i) = v;
+}
+
 static void upscale_f32_cuda(const float * x, float * dst,
         const int nb00, const int nb01, const int nb02, const int nb03,
         const int ne10, const int ne11, const int ne12, const int ne13,
         const float sf0, const float sf1, const float sf2, const float sf3,
         cudaStream_t stream) {
+    if (sf2 == 1.0f && sf3 == 1.0f && sf0 == float(int(sf0)) && sf1 == float(int(sf1)) && sf0 >= 1.0f && sf1 >= 1.0f &&
+        ne10 % 4 == 0 && ne10 < 65536 && ne11 < 65536 && uintptr_t(dst) % 16 == 0) {
+        const int64_t n4 = int64_t(ne10) * ne11 * ne12 * ne13 / 4;
+        upscale_f32_nearest_int<<<(n4 + 255) / 256, 256, 0, stream>>>(x, dst, nb00, nb01, nb02, nb03, ne10, ne11, ne12,
+                                                                      int(sf0), int(sf1), n4);
+        return;
+    }
     const int64_t dst_size   = ne10 * ne11 * ne12 * ne13;
     const int64_t num_blocks = (dst_size + CUDA_UPSCALE_BLOCK_SIZE - 1) / CUDA_UPSCALE_BLOCK_SIZE;
 

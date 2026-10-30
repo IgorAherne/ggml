@@ -4644,6 +4644,111 @@ static int ggml_cuda_try_mul_mat_glu(ggml_backend_cuda_context * cuda_ctx, ggml_
     return jo;
 }
 
+// Spellcast3D: GGML_CUDA_CONV2D_FUSE=0 turns the convolution fusions below off (the nodes run one by one)
+static bool ggml_cuda_conv2d_fuse_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_CONV2D_FUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+// Spellcast3D: graph walking for the convolution fusions below (ggml_cuda_try_fuse_conv2d, and the RMS norm writing a
+// convolution's input copy in ggml_cuda_try_fuse_rms_norm_cf).
+struct ggml_cuda_fuse_walk {
+    const ggml_cgraph * cgraph;
+
+    int next_compute(int j) const {  // the next node that is not a view
+        for (++j; j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]); ++j) {
+        }
+        return j;
+    }
+    bool only_use(const ggml_tensor * t, const int j_t) const {  // nodes[j_t] = t feeds one node and is no output
+        return ggml_node_get_use_count(cgraph, j_t) == 1 && (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0;
+    }
+    // src is t, or a contiguous view of all of t (a reshape) made between nodes jt and jr that only one node reads; a
+    // view of a view (e.g. a reshape of an in-place ADD) has the root tensor as its view_src
+    bool reads(const ggml_tensor * src, const ggml_tensor * t, const int jt, const int jr) const {
+        if (src == t) {
+            return true;
+        }
+        if (src == nullptr || (src->view_src != t && (t->view_src == nullptr || src->view_src != t->view_src)) ||
+            src->data != t->data || src->type != t->type || !ggml_is_contiguous(src) ||
+            ggml_nelements(src) != ggml_nelements(t)) {
+            return false;
+        }
+        for (int k = jt + 1; k < jr; ++k) {
+            if (cgraph->nodes[k] == src) {
+                return only_use(src, k);
+            }
+        }
+        return false;
+    }
+    static bool overlaps(const ggml_tensor * p, const ggml_tensor * q) {
+        const char * p0 = (const char *) p->data;
+        const char * q0 = (const char *) q->data;
+        return p0 < q0 + ggml_nbytes(q) && q0 < p0 + ggml_nbytes(p);
+    }
+    static bool f32c(const ggml_tensor * t) { return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); }
+};
+
+// The output side of a fused convolution at nodes[j]: a SCALE of it, then an ADD of a [1, 1, OC, 1] bias, then an
+// ADD of a same-size tensor, each reading the one before (or a reshape of all of it), as far as the graph has them;
+// fills f (out_*, bias, z, out) and returns the last node folded in (j when none).
+static int ggml_cuda_conv2d_fuse_output(const ggml_cuda_fuse_walk & g, const int j, ggml_cuda_conv2d_fusion & f) {
+    ggml_tensor * const * nodes = g.cgraph->nodes;
+    const int             n     = g.cgraph->n_nodes;
+    ggml_tensor *         conv  = nodes[j];
+    f.out                       = conv;
+    int           last          = j;
+    const int64_t oc            = conv->ne[2];
+    const int     js            = g.next_compute(j);
+    if (js >= n || !g.only_use(conv, j) || nodes[js]->op != GGML_OP_SCALE || !g.reads(nodes[js]->src[0], conv, j, js) ||
+        !g.f32c(nodes[js]) || ggml_nelements(nodes[js]) != ggml_nelements(conv) ||
+        (nodes[js]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return last;
+    }
+    ggml_tensor * s2 = nodes[js];
+    f.out_affine     = true;
+    f.out_scale      = ggml_get_op_params_f32(s2, 0);
+    f.out_sbias      = ggml_get_op_params_f32(s2, 1);
+    f.out            = s2;
+    last             = js;
+    const int ja     = g.next_compute(js);
+    if (ja >= n || !g.only_use(s2, js) || nodes[ja]->op != GGML_OP_ADD ||
+        (nodes[ja]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !g.f32c(nodes[ja]) ||
+        !ggml_are_same_shape(nodes[ja], s2) || (nodes[ja]->src[0] == s2) == (nodes[ja]->src[1] == s2)) {
+        return last;
+    }
+    ggml_tensor *       a = nodes[ja];
+    const ggml_tensor * y = a->src[0] == s2 ? a->src[1] : a->src[0];
+    if (!g.f32c(y) || y->ne[0] != 1 || y->ne[1] != 1 || y->ne[2] != oc || y->ne[3] != 1 ||
+        ggml_cuda_fuse_walk::overlaps(a, y)) {
+        return last;
+    }
+    f.bias       = y;
+    f.out        = a;
+    last         = ja;
+    const int jb = g.next_compute(ja);
+    if (jb >= n || !g.only_use(a, ja) || nodes[jb]->op != GGML_OP_ADD ||
+        (nodes[jb]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !g.f32c(nodes[jb]) ||
+        ggml_nelements(nodes[jb]) != ggml_nelements(a)) {
+        return last;
+    }
+    ggml_tensor * b = nodes[jb];
+    for (int side = 0; side < 2; ++side) {
+        const ggml_tensor * z = b->src[1 - side];
+        if (g.reads(b->src[side], a, ja, jb) && z != nullptr && z != b->src[side] && g.f32c(z) &&
+            ggml_are_same_shape(z, b) && (!ggml_cuda_fuse_walk::overlaps(b, z) || b->data == z->data) &&
+            !ggml_cuda_fuse_walk::overlaps(b, y)) {
+            f.z  = z;
+            f.out = b;
+            return jb;
+        }
+    }
+    return last;
+}
+
 // cont(permute x) -> RMS_NORM -> MUL (gamma) -> cont(permute back) [-> SILU]: an RMS norm over the channels (dim 3)
 // of a contiguous F32 x (e.g. the Wan VAE's RMS_norm block on [W, H, T, C]), as one kernel that reads x in place and
 // writes the last node (ggml_cuda_op_rms_norm_cf_fused, same bits). View nodes between them (the gamma reshape, the
@@ -4779,7 +4884,100 @@ static int ggml_cuda_try_fuse_rms_norm_cf(ggml_backend_cuda_context * cuda_ctx, 
         return 0;
     }
 
+    // Spellcast3D: when the result's only reader is a CONV_2D on the tensor-core path (through a reshape of all of it),
+    // the norm writes that convolution's F16 channels-last input copy instead of the F32 result (the values the
+    // convolution's own copy would hold: the same bits), and the convolution follows with its output side fused
+    // (ggml_cuda_conv2d_fuse_output); the F32 result is never written.
+    if (silu && ggml_cuda_conv2d_fuse_enabled()) {
+        const ggml_cuda_fuse_walk walk = { cgraph };
+        const int                 jc   = walk.next_compute(last);
+        ggml_tensor *             conv = jc < cgraph->n_nodes ? cgraph->nodes[jc] : nullptr;
+        if (conv != nullptr && conv->op == GGML_OP_CONV_2D && (conv->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            walk.only_use(out, last) && walk.reads(conv->src[1], out, last, jc) &&
+            ggml_cuda_conv2d_mma_supported(*cuda_ctx, conv) && x->ne[2] == 1 && conv->src[1]->ne[0] == x->ne[0] &&
+            conv->src[1]->ne[1] == x->ne[1] && conv->src[1]->ne[2] == x->ne[3] && conv->src[1]->ne[3] == 1) {
+            ggml_cuda_pool_alloc<half> xh(cuda_ctx->pool(), ggml_nelements(x));
+            if (ggml_cuda_op_rms_norm_cf_fused_nhwc_f16(*cuda_ctx, x, g, ggml_get_op_params_f32(b, 0), xh.get(), silu,
+                                                        scale)) {
+                ggml_cuda_conv2d_fusion f;
+                f.x             = conv->src[1];
+                f.xh            = xh.get();
+                const int lastc = ggml_cuda_conv2d_fuse_output(walk, jc, f);
+                ggml_cuda_conv2d_mma_fused(*cuda_ctx, conv, f);
+                return lastc - i;
+            }
+        }
+    }
+
     ggml_cuda_op_rms_norm_cf_fused(*cuda_ctx, x, g, ggml_get_op_params_f32(b, 0), out, silu, scale);
+    return last - i;
+}
+
+// Spellcast3D: the tensor-core convolution (conv2d-mma.cuh) with its neighbours folded in. At a SCALE whose only reader
+// is a CONV_2D (a nearest 2x UPSCALE before it too), or at the CONV_2D itself: the input SCALE (and the UPSCALE) go into
+// the convolution's F16 copy of its input, and a SCALE of the result, an ADD of a [1, 1, OC, 1] bias and an ADD of a
+// same-size tensor (a residual), as far as the graph has them in that order, into its epilogue (sd.cpp wraps every
+// convolution in SCALE(x, s) -> CONV_2D -> SCALE(1 / s) -> ADD(bias) against F16 overflow in im2col). The arithmetic is
+// the unfused kernels' (scale_f32's FFMA, the ADDs' FADDs, in the graph's order), so the result is the same bits; the
+// fused intermediates are never written. GGML_CUDA_CONV2D_FUSE=0 turns it off. Returns the nodes skipped (0: none).
+static int ggml_cuda_try_fuse_conv2d(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const int i) {
+    if (!ggml_cuda_conv2d_fuse_enabled()) {
+        return 0;
+    }
+    const ggml_cuda_fuse_walk g     = { cgraph };
+    ggml_tensor * const *     nodes = cgraph->nodes;
+    const int                 n     = cgraph->n_nodes;
+
+    const ggml_tensor * up = nullptr;
+    const ggml_tensor * sc = nullptr;
+    int                 j  = i;
+    if (nodes[i]->op == GGML_OP_UPSCALE) {
+        up                    = nodes[i];
+        const ggml_tensor * s = up->src[0];
+        if (ggml_get_op_params_i32(up, 0) != GGML_SCALE_MODE_NEAREST || !g.f32c(up) || !g.f32c(s) ||
+            up->ne[0] != 2 * s->ne[0] || up->ne[1] != 2 * s->ne[1] || up->ne[2] != s->ne[2] || up->ne[3] != s->ne[3] ||
+            !g.only_use(up, i)) {
+            return 0;
+        }
+        j = g.next_compute(i);
+        if (j >= n || nodes[j]->op != GGML_OP_SCALE || !g.reads(nodes[j]->src[0], up, i, j)) {
+            return 0;
+        }
+    }
+    if (nodes[j]->op == GGML_OP_SCALE) {
+        sc = nodes[j];
+        if (!g.f32c(sc) || !g.f32c(sc->src[0]) || ggml_nelements(sc) != ggml_nelements(sc->src[0]) ||
+            !g.only_use(sc, j) || (sc->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return 0;
+        }
+        const int jc = g.next_compute(j);
+        if (jc >= n || !g.reads(nodes[jc]->src[1], sc, j, jc)) {
+            return 0;
+        }
+        j = jc;
+    }
+    ggml_tensor * conv = nodes[j];
+    if (conv->op != GGML_OP_CONV_2D || (conv->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        !ggml_cuda_conv2d_mma_supported(*cuda_ctx, conv)) {
+        return 0;
+    }
+    if (up && !ggml_are_same_shape(conv->src[1], up)) {  // the conv reads the upscaled map as it is
+        return 0;
+    }
+
+    ggml_cuda_conv2d_fusion f;
+    f.x  = up ? up->src[0] : sc ? sc->src[0] : conv->src[1];
+    f.up = up ? 2 : 1;
+    if (sc) {
+        f.in_affine = true;
+        f.in_scale  = ggml_get_op_params_f32(sc, 0);
+        f.in_sbias  = ggml_get_op_params_f32(sc, 1);
+    }
+    const int last = ggml_cuda_conv2d_fuse_output(g, j, f);
+    if (last == i) {
+        return 0;  // nothing to fold: the CONV_2D runs as itself
+    }
+    ggml_cuda_conv2d_mma_fused(*cuda_ctx, conv, f);
     return last - i;
 }
 
@@ -4791,6 +4989,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CONV_2D || node->op == GGML_OP_SCALE || node->op == GGML_OP_UPSCALE) {
+        const int n_fused = ggml_cuda_try_fuse_conv2d(cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused;
+        }
+    }
 
     if (node->op == GGML_OP_CONT) {
         const int n_fused = ggml_cuda_try_fuse_rms_norm_cf(cuda_ctx, cgraph, i);
